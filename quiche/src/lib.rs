@@ -1581,6 +1581,32 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// Whether multipath was successfully negotiated.
+    #[cfg(feature = "multipath")]
+    multipath_enabled: bool,
+
+    /// The scheduler instance (created from Config's factory).
+    #[cfg(feature = "multipath")]
+    scheduler: Option<Box<dyn multipath::scheduler::Scheduler>>,
+
+    /// The reinjection controller instance.
+    #[cfg(feature = "multipath")]
+    reinjection_controller:
+        Option<Box<dyn multipath::reinjection::ReinjectionController>>,
+
+    /// Reinjection mode.
+    #[cfg(feature = "multipath")]
+    reinjection_mode: multipath::reinjection::ReinjectionMode,
+
+    /// Pre-allocated buffer for PathInfo (refreshed each scheduling round).
+    #[cfg(feature = "multipath")]
+    path_info_buf: Vec<multipath::scheduler::PathInfo>,
+
+    /// QoS hints per stream.
+    #[cfg(feature = "multipath")]
+    stream_qos_hints:
+        std::collections::HashMap<u64, multipath::reinjection::StreamQosHint>,
 }
 
 /// Creates a new server-side connection.
@@ -2201,6 +2227,22 @@ impl<F: BufFactory> Connection<F> {
             streams_blocked_uni_recv_count: 0,
 
             max_amplification_factor: config.max_amplification_factor,
+
+            #[cfg(feature = "multipath")]
+            multipath_enabled: false,
+            #[cfg(feature = "multipath")]
+            scheduler: config.scheduler_factory.as_ref().map(|f| f.create()),
+            #[cfg(feature = "multipath")]
+            reinjection_controller: config
+                .reinjection_controller_factory
+                .as_ref()
+                .map(|f| f.create()),
+            #[cfg(feature = "multipath")]
+            reinjection_mode: config.reinjection_mode,
+            #[cfg(feature = "multipath")]
+            path_info_buf: Vec::new(),
+            #[cfg(feature = "multipath")]
+            stream_qos_hints: std::collections::HashMap::new(),
         };
 
         if let Some(retry_cids) = retry_cids {
@@ -2216,6 +2258,12 @@ impl<F: BufFactory> Connection<F> {
 
         conn.local_transport_params.initial_source_connection_id =
             Some(conn.ids.get_scid(0)?.cid.to_vec().into());
+
+        #[cfg(feature = "multipath")]
+        {
+            conn.local_transport_params.initial_max_path_id =
+                config.initial_max_path_id;
+        }
 
         conn.handshake.init(is_server)?;
 
@@ -7549,6 +7597,28 @@ impl<F: BufFactory> Connection<F> {
         self.is_server
     }
 
+    /// Returns true if multipath was negotiated for this connection.
+    #[cfg(feature = "multipath")]
+    pub fn is_multipath(&self) -> bool {
+        self.multipath_enabled
+    }
+
+    /// Sets a QoS hint for the given stream.
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath has not been
+    /// negotiated for this connection.
+    #[cfg(feature = "multipath")]
+    pub fn set_stream_qos_hint(
+        &mut self, stream_id: u64,
+        hint: multipath::reinjection::StreamQosHint,
+    ) -> Result<()> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+        self.stream_qos_hints.insert(stream_id, hint);
+        Ok(())
+    }
+
     fn encode_transport_params(&mut self) -> Result<()> {
         self.handshake.set_quic_transport_params(
             &self.local_transport_params,
@@ -7653,6 +7723,32 @@ impl<F: BufFactory> Connection<F> {
         // Record the max_active_conn_id parameter advertised by the peer.
         self.ids
             .set_source_conn_id_limit(peer_params.active_conn_id_limit);
+
+        #[cfg(feature = "multipath")]
+        {
+            if let (Some(local_max), Some(peer_max)) = (
+                self.local_transport_params.initial_max_path_id,
+                peer_params.initial_max_path_id,
+            ) {
+                if local_max > 0 && peer_max > 0 {
+                    self.multipath_enabled = true;
+                    self.paths.peer_max_path_id = peer_max as u64;
+                    self.paths.local_max_path_id = local_max as u64;
+                    // Set initial path's path_id to 0
+                    let active_pid =
+                        self.paths.get_active_path_id().unwrap_or(0);
+                    if let Ok(path) = self.paths.get_mut(active_pid) {
+                        path.path_id = 0;
+                    }
+                    // Create default scheduler if none was configured
+                    if self.scheduler.is_none() {
+                        self.scheduler = Some(Box::new(
+                            multipath::schedulers::MinRttScheduler,
+                        ));
+                    }
+                }
+            }
+        }
 
         self.peer_transport_params = peer_params;
 

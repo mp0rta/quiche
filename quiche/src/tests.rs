@@ -12143,9 +12143,52 @@ fn connect_custom_client_dcid_too_short() {
 #[cfg(feature = "multipath")]
 #[test]
 fn config_multipath_settings() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
     config.set_initial_max_path_id(4);
     config.set_multipath_scheduler(
         multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_negotiation_both_enable() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(pipe.client.is_multipath(), "client should have multipath enabled");
+    assert!(pipe.server.is_multipath(), "server should have multipath enabled");
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_negotiation_one_side_disabled() {
+    // Only client enables multipath; server uses default config (no
+    // initial_max_path_id).
+    let mut client_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(4);
+
+    let mut server_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    // Server does not call set_initial_max_path_id, so multipath stays off.
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(
+        !pipe.client.is_multipath(),
+        "client should NOT have multipath enabled when server does not enable it"
+    );
+    assert!(
+        !pipe.server.is_multipath(),
+        "server should NOT have multipath enabled when it did not advertise it"
     );
 }

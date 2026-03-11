@@ -48,7 +48,7 @@ pub struct ReinjectionContext<'a> {
 }
 
 /// Implement this trait to create custom reinjection strategies.
-pub trait ReinjectionController: Send {
+pub trait ReinjectionController: Send + Sync {
     fn should_reinject(
         &mut self,
         candidate: &ReinjectionCandidate,

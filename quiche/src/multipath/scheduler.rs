@@ -70,7 +70,7 @@ pub enum SchedulerDecision {
 }
 
 /// Core scheduler trait. Implement this to create custom schedulers.
-pub trait Scheduler: Send {
+pub trait Scheduler: Send + Sync {
     fn select_path(
         &mut self,
         paths: &[PathInfo],
