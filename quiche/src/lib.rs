@@ -8478,6 +8478,35 @@ impl<F: BufFactory> Connection<F> {
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
+
+            // Multipath frames — placeholder handling; proper processing added
+            // in later tasks.
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathAck { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathAbandon { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathStatusAvailable { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathStatusBackup { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::MaxPathId { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathsBlocked { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathNewConnectionId { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathRetireConnectionId { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            frame::Frame::PathCidsBlocked { .. } => (),
         }
 
         Ok(())

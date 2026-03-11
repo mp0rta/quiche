@@ -184,6 +184,63 @@ pub enum Frame {
     DatagramHeader {
         length: usize,
     },
+
+    #[cfg(feature = "multipath")]
+    PathAck {
+        path_id: u64,
+        ack_delay: u64,
+        ranges: ranges::RangeSet,
+        ecn_counts: Option<EcnCounts>,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathAbandon {
+        path_id: u64,
+        error_code: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathStatusAvailable {
+        path_id: u64,
+        seq_num: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathStatusBackup {
+        path_id: u64,
+        seq_num: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    MaxPathId {
+        path_id: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathsBlocked {
+        path_id: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathNewConnectionId {
+        path_id: u64,
+        seq_num: u64,
+        retire_prior_to: u64,
+        conn_id: Vec<u8>,
+        reset_token: u128,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathRetireConnectionId {
+        path_id: u64,
+        seq_num: u64,
+    },
+
+    #[cfg(feature = "multipath")]
+    PathCidsBlocked {
+        path_id: u64,
+        seq_num: u64,
+    },
 }
 
 impl Frame {
@@ -330,6 +387,59 @@ impl Frame {
             0x1e => Frame::HandshakeDone,
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
+
+            #[cfg(feature = "multipath")]
+            ty if crate::multipath::frames::is_multipath_frame_type(ty) => {
+                use crate::multipath::frames::*;
+                match ty {
+                    PATH_ACK_TYPE | PATH_ACK_ECN_TYPE => {
+                        let has_ecn = ty == PATH_ACK_ECN_TYPE;
+                        let (path_id, ack_delay, ranges, ecn_counts) =
+                            parse_path_ack(b, has_ecn)?;
+                        Frame::PathAck { path_id, ack_delay, ranges, ecn_counts }
+                    }
+                    PATH_ABANDON_TYPE => {
+                        let (path_id, error_code) = parse_path_abandon(b)?;
+                        Frame::PathAbandon { path_id, error_code }
+                    }
+                    PATH_STATUS_AVAILABLE_TYPE => {
+                        let (path_id, seq_num) = parse_path_status(b)?;
+                        Frame::PathStatusAvailable { path_id, seq_num }
+                    }
+                    PATH_STATUS_BACKUP_TYPE => {
+                        let (path_id, seq_num) = parse_path_status(b)?;
+                        Frame::PathStatusBackup { path_id, seq_num }
+                    }
+                    MAX_PATH_ID_TYPE => {
+                        let path_id = parse_max_path_id(b)?;
+                        Frame::MaxPathId { path_id }
+                    }
+                    PATHS_BLOCKED_TYPE => {
+                        let path_id = parse_paths_blocked(b)?;
+                        Frame::PathsBlocked { path_id }
+                    }
+                    PATH_NEW_CONNECTION_ID_TYPE => {
+                        let (path_id, seq_num, retire_prior_to, _cid_len, conn_id, reset_token) =
+                            parse_path_new_connection_id(b)?;
+                        Frame::PathNewConnectionId {
+                            path_id,
+                            seq_num,
+                            retire_prior_to,
+                            conn_id,
+                            reset_token,
+                        }
+                    }
+                    PATH_RETIRE_CONNECTION_ID_TYPE => {
+                        let (path_id, seq_num) = parse_path_retire_connection_id(b)?;
+                        Frame::PathRetireConnectionId { path_id, seq_num }
+                    }
+                    PATH_CIDS_BLOCKED_TYPE => {
+                        let (path_id, seq_num) = parse_path_cids_blocked(b)?;
+                        Frame::PathCidsBlocked { path_id, seq_num }
+                    }
+                    _ => return Err(Error::InvalidFrame),
+                }
+            }
 
             _ => return Err(Error::InvalidFrame),
         };
@@ -593,6 +703,53 @@ impl Frame {
             },
 
             Frame::DatagramHeader { .. } => (),
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAck { path_id, ack_delay, ref ranges, ref ecn_counts } => {
+                crate::multipath::frames::encode_path_ack(b, *path_id, *ack_delay, ranges, ecn_counts)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAbandon { path_id, error_code } => {
+                crate::multipath::frames::encode_path_abandon(b, *path_id, *error_code)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusAvailable { path_id, seq_num } => {
+                crate::multipath::frames::encode_path_status_available(b, *path_id, *seq_num)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusBackup { path_id, seq_num } => {
+                crate::multipath::frames::encode_path_status_backup(b, *path_id, *seq_num)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::MaxPathId { path_id } => {
+                crate::multipath::frames::encode_max_path_id(b, *path_id)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathsBlocked { path_id } => {
+                crate::multipath::frames::encode_paths_blocked(b, *path_id)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathNewConnectionId { path_id, seq_num, retire_prior_to, ref conn_id, reset_token } => {
+                crate::multipath::frames::encode_path_new_connection_id(
+                    b, *path_id, *seq_num, *retire_prior_to, conn_id.as_ref(), *reset_token,
+                )?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
+                crate::multipath::frames::encode_path_retire_connection_id(b, *path_id, *seq_num)?;
+            }
+
+            #[cfg(feature = "multipath")]
+            Frame::PathCidsBlocked { path_id, seq_num } => {
+                crate::multipath::frames::encode_path_cids_blocked(b, *path_id, *seq_num)?;
+            }
         }
 
         Ok(before - b.cap())
@@ -807,6 +964,67 @@ impl Frame {
                 1 + // frame type
                 2 + // length, always encode as 2-byte varint
                 *length // data
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAck { .. } => 0, // placeholder; actual length computed at encode time
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAbandon { path_id, error_code } => {
+                octets::varint_len(0x3e75_u64) + // frame type (varint)
+                octets::varint_len(*path_id) +
+                octets::varint_len(*error_code)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusAvailable { path_id, seq_num } => {
+                octets::varint_len(0x3e77_u64) +
+                octets::varint_len(*path_id) +
+                octets::varint_len(*seq_num)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusBackup { path_id, seq_num } => {
+                octets::varint_len(0x3e76_u64) +
+                octets::varint_len(*path_id) +
+                octets::varint_len(*seq_num)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::MaxPathId { path_id } => {
+                octets::varint_len(0x3e7a_u64) +
+                octets::varint_len(*path_id)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathsBlocked { path_id } => {
+                octets::varint_len(0x3e7b_u64) +
+                octets::varint_len(*path_id)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathNewConnectionId { path_id, seq_num, retire_prior_to, conn_id, .. } => {
+                octets::varint_len(0x3e78_u64) +
+                octets::varint_len(*path_id) +
+                octets::varint_len(*seq_num) +
+                octets::varint_len(*retire_prior_to) +
+                1 + // conn_id length byte
+                conn_id.len() +
+                16 // reset_token
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
+                octets::varint_len(0x3e79_u64) +
+                octets::varint_len(*path_id) +
+                octets::varint_len(*seq_num)
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathCidsBlocked { path_id, seq_num } => {
+                octets::varint_len(0x3e7c_u64) +
+                octets::varint_len(*path_id) +
+                octets::varint_len(*seq_num)
             },
         }
     }
@@ -1033,6 +1251,69 @@ impl Frame {
                 length: *length as u64,
                 raw: None,
             },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAck { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e),
+                raw_frame_type: 0x3e,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAbandon { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e75),
+                raw_frame_type: 0x3e75,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusAvailable { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e77),
+                raw_frame_type: 0x3e77,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusBackup { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e76),
+                raw_frame_type: 0x3e76,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::MaxPathId { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e7a),
+                raw_frame_type: 0x3e7a,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathsBlocked { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e7b),
+                raw_frame_type: 0x3e7b,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathNewConnectionId { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e78),
+                raw_frame_type: 0x3e78,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathRetireConnectionId { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e79),
+                raw_frame_type: 0x3e79,
+                raw: None,
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathCidsBlocked { .. } => QuicFrame::Unknown {
+                frame_type_value: Some(0x3e7c),
+                raw_frame_type: 0x3e7c,
+                raw: None,
+            },
         }
     }
 }
@@ -1199,6 +1480,57 @@ impl std::fmt::Debug for Frame {
 
             Frame::DatagramHeader { length } => {
                 write!(f, "DATAGRAM len={length}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAck { path_id, ack_delay, ranges, ecn_counts } => {
+                write!(
+                    f,
+                    "PATH_ACK path_id={path_id} delay={ack_delay} blocks={ranges:?} ecn_counts={ecn_counts:?}"
+                )?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathAbandon { path_id, error_code } => {
+                write!(f, "PATH_ABANDON path_id={path_id} err={error_code:x}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusAvailable { path_id, seq_num } => {
+                write!(f, "PATH_STATUS_AVAILABLE path_id={path_id} seq_num={seq_num}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathStatusBackup { path_id, seq_num } => {
+                write!(f, "PATH_STATUS_BACKUP path_id={path_id} seq_num={seq_num}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::MaxPathId { path_id } => {
+                write!(f, "MAX_PATH_ID path_id={path_id}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathsBlocked { path_id } => {
+                write!(f, "PATHS_BLOCKED path_id={path_id}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathNewConnectionId { path_id, seq_num, retire_prior_to, conn_id, reset_token } => {
+                write!(
+                    f,
+                    "PATH_NEW_CONNECTION_ID path_id={path_id} seq_num={seq_num} retire_prior_to={retire_prior_to} conn_id={conn_id:02x?} reset_token={reset_token:032x}",
+                )?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
+                write!(f, "PATH_RETIRE_CONNECTION_ID path_id={path_id} seq_num={seq_num}")?;
+            },
+
+            #[cfg(feature = "multipath")]
+            Frame::PathCidsBlocked { path_id, seq_num } => {
+                write!(f, "PATH_CIDS_BLOCKED path_id={path_id} seq_num={seq_num}")?;
             },
         }
 
