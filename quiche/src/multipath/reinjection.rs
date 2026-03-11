@@ -148,3 +148,103 @@ impl ReinjectionControllerFactory for DefaultReinjectionControllerFactory {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_path(id: u64, srtt_ms: u64) -> PathInfo {
+        use crate::path::{PathAppStatus, PathState};
+        PathInfo {
+            path_id: id,
+            local_addr: "127.0.0.1:1234".parse().unwrap(),
+            peer_addr: "127.0.0.1:5678".parse().unwrap(),
+            state: PathState::Validated,
+            app_status: PathAppStatus::Available,
+            srtt: Duration::from_millis(srtt_ms),
+            rttvar: Duration::from_millis(5),
+            min_rtt: Some(Duration::from_millis(srtt_ms)),
+            cwnd: 65535,
+            cwnd_available: 10000,
+            bytes_in_flight: 0,
+            est_bandwidth_bps: None,
+            loss_rate: 0.0,
+            mtu: 1200,
+        }
+    }
+
+    fn make_candidate(path_id: u64, elapsed_ms: u64) -> ReinjectionCandidate {
+        ReinjectionCandidate {
+            packet_number: 42,
+            original_path_id: path_id,
+            sent_time: Instant::now() - Duration::from_millis(elapsed_ms),
+            size: 1200,
+            content_type: PacketContentType::Stream,
+            is_already_reinjected: false,
+        }
+    }
+
+    #[test]
+    fn no_reinject_when_under_threshold() {
+        let mut ctrl = DefaultReinjectionController::default();
+        let paths = vec![make_path(0, 100), make_path(1, 50)];
+        let candidate = make_candidate(0, 100);
+        let ctx = ReinjectionContext {
+            original_path: &paths[0],
+            all_paths: &paths,
+            elapsed_since_sent: Duration::from_millis(100),
+            qos_hint: None,
+        };
+        assert!(!ctrl.should_reinject(&candidate, &ctx));
+    }
+
+    #[test]
+    fn reinject_when_over_threshold() {
+        let mut ctrl = DefaultReinjectionController::default();
+        let paths = vec![make_path(0, 100), make_path(1, 50)];
+        let candidate = make_candidate(0, 200);
+        let ctx = ReinjectionContext {
+            original_path: &paths[0],
+            all_paths: &paths,
+            elapsed_since_sent: Duration::from_millis(200),
+            qos_hint: None,
+        };
+        assert!(ctrl.should_reinject(&candidate, &ctx));
+    }
+
+    #[test]
+    fn no_reinject_already_reinjected() {
+        let mut ctrl = DefaultReinjectionController::default();
+        let paths = vec![make_path(0, 100), make_path(1, 50)];
+        let mut candidate = make_candidate(0, 200);
+        candidate.is_already_reinjected = true;
+        let ctx = ReinjectionContext {
+            original_path: &paths[0],
+            all_paths: &paths,
+            elapsed_since_sent: Duration::from_millis(200),
+            qos_hint: None,
+        };
+        assert!(!ctrl.should_reinject(&candidate, &ctx));
+    }
+
+    #[test]
+    fn redundant_stream_always_reinjects() {
+        let mut ctrl = DefaultReinjectionController::default();
+        let paths = vec![make_path(0, 100), make_path(1, 50)];
+        let candidate = make_candidate(0, 1);
+        let hint = StreamQosHint {
+            stream_id: 0,
+            deadline: None,
+            priority: 0,
+            redundant: true,
+        };
+        let ctx = ReinjectionContext {
+            original_path: &paths[0],
+            all_paths: &paths,
+            elapsed_since_sent: Duration::from_millis(1),
+            qos_hint: Some(&hint),
+        };
+        assert!(ctrl.should_reinject(&candidate, &ctx));
+    }
+}

@@ -73,3 +73,77 @@ impl SchedulerFactory for RoundRobinSchedulerFactory {
         Box::new(RoundRobinScheduler::default())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_path(id: u64, srtt_ms: u64, cwnd_avail: usize,
+                 status: PathAppStatus) -> PathInfo {
+        PathInfo {
+            path_id: id,
+            local_addr: "127.0.0.1:1234".parse().unwrap(),
+            peer_addr: "127.0.0.1:5678".parse().unwrap(),
+            state: PathState::Validated,
+            app_status: status,
+            srtt: Duration::from_millis(srtt_ms),
+            rttvar: Duration::from_millis(5),
+            min_rtt: Some(Duration::from_millis(srtt_ms)),
+            cwnd: 65535,
+            cwnd_available: cwnd_avail,
+            bytes_in_flight: 0,
+            est_bandwidth_bps: None,
+            loss_rate: 0.0,
+            mtu: 1200,
+        }
+    }
+
+    fn default_packet() -> PacketMeta {
+        PacketMeta {
+            packet_type: PacketContentType::Stream,
+            size_estimate: 1200,
+            is_retransmission: false,
+            is_reinjection: false,
+            original_path_id: None,
+        }
+    }
+
+    #[test]
+    fn round_robin_distributes_evenly() {
+        let mut sched = RoundRobinScheduler::default();
+        let paths = vec![
+            make_path(0, 50, 10000, PathAppStatus::Available),
+            make_path(1, 50, 10000, PathAppStatus::Available),
+            make_path(2, 50, 10000, PathAppStatus::Available),
+        ];
+        let pkt = default_packet();
+
+        assert_eq!(sched.select_path(&paths, &pkt), SchedulerDecision::Send(0));
+        assert_eq!(sched.select_path(&paths, &pkt), SchedulerDecision::Send(1));
+        assert_eq!(sched.select_path(&paths, &pkt), SchedulerDecision::Send(2));
+        assert_eq!(sched.select_path(&paths, &pkt), SchedulerDecision::Send(0));
+    }
+
+    #[test]
+    fn skips_blocked_paths() {
+        let mut sched = RoundRobinScheduler::default();
+        let paths = vec![
+            make_path(0, 50, 0, PathAppStatus::Available),
+            make_path(1, 50, 10000, PathAppStatus::Available),
+        ];
+        assert_eq!(
+            sched.select_path(&paths, &default_packet()),
+            SchedulerDecision::Send(1),
+        );
+    }
+
+    #[test]
+    fn empty_returns_no_available() {
+        let mut sched = RoundRobinScheduler::default();
+        assert_eq!(
+            sched.select_path(&[], &default_packet()),
+            SchedulerDecision::NoAvailablePath,
+        );
+    }
+}
