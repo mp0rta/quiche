@@ -188,6 +188,9 @@ pub struct TransportParams {
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
+    /// The initial maximum path ID for multipath QUIC (draft-ietf-quic-multipath).
+    #[cfg(feature = "multipath")]
+    pub initial_max_path_id: Option<u32>,
 }
 
 impl Default for TransportParams {
@@ -211,6 +214,8 @@ impl Default for TransportParams {
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
             unknown_params: Default::default(),
+            #[cfg(feature = "multipath")]
+            initial_max_path_id: None,
         }
     }
 }
@@ -368,6 +373,17 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                #[cfg(feature = "multipath")]
+                0x003e => {
+                    let max_path_id = val.get_varint()?;
+
+                    if max_path_id > u32::MAX as u64 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.initial_max_path_id = Some(max_path_id as u32);
                 },
 
                 // Track unknown transport parameters specially.
@@ -553,6 +569,18 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        #[cfg(feature = "multipath")]
+        if let Some(initial_max_path_id) = tp.initial_max_path_id {
+            let val = initial_max_path_id as u64;
+            assert!(val <= u32::MAX as u64);
+            TransportParams::encode_param(
+                &mut b,
+                0x003e,
+                octets::varint_len(val),
+            )?;
+            b.put_varint(val)?;
         }
 
         let out_len = b.off();

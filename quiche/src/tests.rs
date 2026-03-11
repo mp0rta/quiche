@@ -54,6 +54,8 @@ fn transport_params() {
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        #[cfg(feature = "multipath")]
+        initial_max_path_id: None,
     };
 
     let mut raw_params = [42; 256];
@@ -84,6 +86,8 @@ fn transport_params() {
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        #[cfg(feature = "multipath")]
+        initial_max_path_id: None,
     };
 
     let mut raw_params = [42; 256];
@@ -216,6 +220,30 @@ fn transport_params_unknown_is_reserved() {
     assert!(reserved_unknown_param.is_reserved());
     assert!(!not_reserved_unknown_param.is_reserved());
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_transport_param_roundtrip() {
+    let mut tp = TransportParams::default();
+    tp.initial_max_path_id = Some(4);
+
+    let mut raw_params = [0u8; 256];
+    let encoded =
+        TransportParams::encode(&tp, false, &mut raw_params).unwrap();
+    let len = encoded.len();
+
+    let decoded =
+        TransportParams::decode(&raw_params[..len], true, None).unwrap();
+    assert_eq!(decoded.initial_max_path_id, Some(4));
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_transport_param_absent_means_disabled() {
+    let tp = TransportParams::default();
+    assert_eq!(tp.initial_max_path_id, None);
+}
+
 #[test]
 fn unknown_version() {
     let mut config = Config::new(0xbabababa).unwrap();
