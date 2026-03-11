@@ -80,6 +80,17 @@ impl PathState {
     }
 }
 
+/// Application-level path status for multipath scheduling.
+#[cfg(feature = "multipath")]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum PathAppStatus {
+    /// Normal operation — scheduler considers this path.
+    #[default]
+    Available,
+    /// Backup only — used when other paths are unavailable.
+    Backup,
+}
+
 /// A path-specific event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathEvent {
@@ -220,6 +231,26 @@ pub struct Path {
 
     /// Whether or not we should force eliciting of an ACK (e.g. via PING frame)
     pub needs_ack_eliciting: bool,
+
+    /// Protocol-level path ID (0 for initial path, then 1, 2, ...).
+    #[cfg(feature = "multipath")]
+    pub(crate) path_id: u64,
+
+    /// Application-level path status.
+    #[cfg(feature = "multipath")]
+    pub(crate) app_status: PathAppStatus,
+
+    /// PATH_ABANDON sent, draining in-flight packets.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_closing: bool,
+
+    /// Fully closed, resources can be freed.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_closed: bool,
+
+    /// Per-path packet number counter.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_next_pkt_num: u64,
 }
 
 impl Path {
@@ -287,6 +318,16 @@ impl Path {
             failure_notified: false,
             migrating: false,
             needs_ack_eliciting: false,
+            #[cfg(feature = "multipath")]
+            path_id: 0,
+            #[cfg(feature = "multipath")]
+            app_status: PathAppStatus::Available,
+            #[cfg(feature = "multipath")]
+            mp_closing: false,
+            #[cfg(feature = "multipath")]
+            mp_closed: false,
+            #[cfg(feature = "multipath")]
+            mp_next_pkt_num: 0,
         }
     }
 
@@ -626,6 +667,18 @@ pub struct PathMap {
 
     /// Whether this manager serves a connection as a server.
     is_server: bool,
+
+    #[cfg(feature = "multipath")]
+    pub(crate) active_path_count: usize,
+
+    #[cfg(feature = "multipath")]
+    pub(crate) next_path_id: u64, // starts at 1 (0 is initial path)
+
+    #[cfg(feature = "multipath")]
+    pub(crate) local_max_path_id: u64,
+
+    #[cfg(feature = "multipath")]
+    pub(crate) peer_max_path_id: u64,
 }
 
 impl PathMap {
@@ -652,6 +705,14 @@ impl PathMap {
             addrs_to_paths,
             events: VecDeque::new(),
             is_server,
+            #[cfg(feature = "multipath")]
+            active_path_count: 1,
+            #[cfg(feature = "multipath")]
+            next_path_id: 1,
+            #[cfg(feature = "multipath")]
+            local_max_path_id: 0,
+            #[cfg(feature = "multipath")]
+            peer_max_path_id: 0,
         }
     }
 
@@ -1057,6 +1118,20 @@ mod tests {
     use crate::Config;
 
     use super::*;
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn path_app_status_default_is_available() {
+        let status = PathAppStatus::default();
+        assert_eq!(status, PathAppStatus::Available);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn path_multipath_fields_exist() {
+        let status = PathAppStatus::Backup;
+        assert_eq!(status, PathAppStatus::Backup);
+    }
 
     #[test]
     fn path_validation_limited_mtu() {
