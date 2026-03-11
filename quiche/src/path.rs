@@ -384,6 +384,12 @@ impl Path {
         }
     }
 
+    /// Returns the current validation state of the path.
+    #[inline]
+    pub fn state(&self) -> PathState {
+        self.state
+    }
+
     /// Returns whether the path is validated.
     #[inline]
     pub fn validated(&self) -> bool {

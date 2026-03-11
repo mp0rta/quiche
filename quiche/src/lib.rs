@@ -4280,11 +4280,45 @@ impl<F: BufFactory> Connection<F> {
             b.cap()
         };
 
-        if pkt_num_manager.should_skip_pn(self.handshake_completed) {
-            pkt_num_manager.set_skip_pn(Some(self.next_pkt_num));
-            self.next_pkt_num += 1;
+        // Task 16: Per-path packet number space for multipath.
+        // When multipath is enabled and we are sending an Application Data
+        // (Short header) packet, use the per-path counter instead of the
+        // shared connection-level counter.  Only activate when there are
+        // multiple paths so that single-path (initial) operation continues
+        // to use the shared counter (which the receiver can decode without
+        // per-path state).
+        //
+        // n_paths was computed before the mutable borrow of `path` so
+        // the borrow checker permits its use here.
+        //
+        // `use_per_path_pn` tracks whether the per-path counter was used so
+        // the post-send shared counter increment can be skipped.
+        #[cfg(feature = "multipath")]
+        let (pn, use_per_path_pn) = if self.multipath_enabled &&
+            pkt_type == Type::Short &&
+            n_paths > 1
+        {
+            // Grab the per-path packet number and increment it immediately so
+            // the post-send increment of `self.next_pkt_num` is skipped.
+            let per_path_pn = path.mp_next_pkt_num;
+            path.mp_next_pkt_num += 1;
+            (per_path_pn, true)
+        } else {
+            if pkt_num_manager.should_skip_pn(self.handshake_completed) {
+                pkt_num_manager.set_skip_pn(Some(self.next_pkt_num));
+                self.next_pkt_num += 1;
+            };
+            (self.next_pkt_num, false)
         };
-        let pn = self.next_pkt_num;
+
+        #[cfg(not(feature = "multipath"))]
+        let (pn, use_per_path_pn) = {
+            if pkt_num_manager.should_skip_pn(self.handshake_completed) {
+                pkt_num_manager.set_skip_pn(Some(self.next_pkt_num));
+                self.next_pkt_num += 1;
+            };
+            (self.next_pkt_num, false)
+        };
 
         let largest_acked_pkt =
             path.recovery.get_largest_acked_on_epoch(epoch).unwrap_or(0);
@@ -5312,7 +5346,11 @@ impl<F: BufFactory> Connection<F> {
             path.recovery.delivery_rate_update_app_limited(true);
         }
 
-        self.next_pkt_num += 1;
+        // Only advance the shared packet number counter when we are NOT using
+        // the per-path counter (which was already incremented above).
+        if !use_per_path_pn {
+            self.next_pkt_num += 1;
+        }
 
         let handshake_status = recovery::HandshakeStatus {
             has_handshake_keys: self.crypto_ctx[packet::Epoch::Handshake]
@@ -8695,34 +8733,124 @@ impl<F: BufFactory> Connection<F> {
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
 
-            // Multipath frames — placeholder handling; proper processing added
-            // in later tasks.
+            // Multipath frames — Task 17 implementation.
             #[cfg(feature = "multipath")]
-            frame::Frame::PathAck { .. } => (),
+            frame::Frame::PathAck {
+                path_id,
+                ack_delay,
+                ..
+            } => {
+                // TODO: Implement full PATH_ACK processing feeding ack ranges
+                // into the per-path recovery state. For now just log receipt.
+                trace!(
+                    "{} received PATH_ACK for path_id={} ack_delay={}",
+                    self.trace_id,
+                    path_id,
+                    ack_delay,
+                );
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathAbandon { .. } => (),
+            frame::Frame::PathAbandon { path_id, error_code } => {
+                // Mark the path identified by multipath path_id as closing.
+                for (_, p) in self.paths.iter_mut() {
+                    if p.path_id == path_id {
+                        p.mp_closing = true;
+                        trace!(
+                            "{} PATH_ABANDON path_id={} error_code={}",
+                            self.trace_id,
+                            path_id,
+                            error_code,
+                        );
+                        break;
+                    }
+                }
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathStatusAvailable { .. } => (),
+            frame::Frame::PathStatusAvailable { path_id, seq_num } => {
+                for (_, p) in self.paths.iter_mut() {
+                    if p.path_id == path_id {
+                        p.app_status = path::PathAppStatus::Available;
+                        trace!(
+                            "{} PATH_STATUS Available path_id={} seq={}",
+                            self.trace_id,
+                            path_id,
+                            seq_num,
+                        );
+                        break;
+                    }
+                }
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathStatusBackup { .. } => (),
+            frame::Frame::PathStatusBackup { path_id, seq_num } => {
+                for (_, p) in self.paths.iter_mut() {
+                    if p.path_id == path_id {
+                        p.app_status = path::PathAppStatus::Backup;
+                        trace!(
+                            "{} PATH_STATUS Backup path_id={} seq={}",
+                            self.trace_id,
+                            path_id,
+                            seq_num,
+                        );
+                        break;
+                    }
+                }
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::MaxPathId { .. } => (),
+            frame::Frame::MaxPathId { path_id } => {
+                self.paths.peer_max_path_id = path_id;
+                trace!(
+                    "{} MAX_PATH_ID path_id={}",
+                    self.trace_id,
+                    path_id,
+                );
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathsBlocked { .. } => (),
+            frame::Frame::PathsBlocked { path_id } => {
+                // Peer cannot open more paths beyond path_id. No local action
+                // required; just acknowledge receipt.
+                trace!(
+                    "{} PATHS_BLOCKED path_id={}",
+                    self.trace_id,
+                    path_id,
+                );
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathNewConnectionId { .. } => (),
+            frame::Frame::PathNewConnectionId { path_id, .. } => {
+                // TODO: Handle path-specific connection ID management.
+                trace!(
+                    "{} PATH_NEW_CONNECTION_ID path_id={}",
+                    self.trace_id,
+                    path_id,
+                );
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathRetireConnectionId { .. } => (),
+            frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
+                // TODO: Handle path-specific connection ID retirement.
+                trace!(
+                    "{} PATH_RETIRE_CONNECTION_ID path_id={} seq={}",
+                    self.trace_id,
+                    path_id,
+                    seq_num,
+                );
+            },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathCidsBlocked { .. } => (),
+            frame::Frame::PathCidsBlocked { path_id, seq_num } => {
+                // Peer cannot provide more path CIDs. Just acknowledge.
+                trace!(
+                    "{} PATH_CIDS_BLOCKED path_id={} seq={}",
+                    self.trace_id,
+                    path_id,
+                    seq_num,
+                );
+            },
         }
 
         Ok(())
