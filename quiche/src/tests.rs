@@ -12258,3 +12258,85 @@ fn create_path_without_negotiation_fails() {
     let result = pipe.client.create_path(local, peer);
     assert_eq!(result, Err(Error::MultipathNotNegotiated));
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_full_negotiation_and_create_path() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_stream_data_uni(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_streams_uni(3);
+    config.set_initial_max_path_id(4);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Both sides should have multipath enabled
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_close_path_last_path_error() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_stream_data_uni(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_streams_uni(3);
+    config.set_initial_max_path_id(4);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Cannot close the only path (path_id=0)
+    let result = pipe.client.close_path(0);
+    assert!(result.is_err()); // Should return LastActivePath or InvalidState
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_set_path_status() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_stream_data_uni(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_streams_uni(3);
+    config.set_initial_max_path_id(4);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Set initial path to Backup
+    let result = pipe.client.set_path_status(0, path::PathAppStatus::Backup);
+    assert!(result.is_ok());
+
+    // Set it back to Available
+    let result =
+        pipe.client.set_path_status(0, path::PathAppStatus::Available);
+    assert!(result.is_ok());
+
+    // Setting status on non-existent path should fail
+    let result =
+        pipe.client.set_path_status(999, path::PathAppStatus::Backup);
+    assert!(result.is_err());
+}

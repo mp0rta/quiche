@@ -237,6 +237,14 @@ pub struct ConnectionIdentifiers {
 
     /// Does the host use zero-length destination Connection ID.
     zero_length_dcid: bool,
+
+    /// Per-path source CID sequences: maps path_id -> list of SCID seqs.
+    #[cfg(feature = "multipath")]
+    pub(crate) path_scid_map: std::collections::HashMap<u64, Vec<u64>>,
+
+    /// Per-path destination CID sequences: maps path_id -> list of DCID seqs.
+    #[cfg(feature = "multipath")]
+    pub(crate) path_dcid_map: std::collections::HashMap<u64, Vec<u64>>,
 }
 
 impl ConnectionIdentifiers {

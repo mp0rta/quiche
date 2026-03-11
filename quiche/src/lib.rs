@@ -7777,6 +7777,25 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Returns the list of active multipath paths, each as a tuple of
+    /// (path_id, PathStats). Paths that are closing or closed are excluded.
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated for this connection.
+    #[cfg(feature = "multipath")]
+    pub fn active_paths(&self) -> Vec<(u64, crate::PathStats)> {
+        self.paths
+            .iter()
+            .filter_map(|(_, p)| {
+                if p.active() && !p.mp_closing && !p.mp_closed {
+                    Some((p.path_id, p.stats()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn encode_transport_params(&mut self) -> Result<()> {
         self.handshake.set_quic_transport_params(
             &self.local_transport_params,

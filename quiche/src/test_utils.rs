@@ -38,6 +38,26 @@ where
     pub server: Connection<F>,
 }
 
+#[cfg(feature = "multipath")]
+impl<F: BufFactory> Pipe<F> {
+    /// Create a Pipe with multipath enabled on both sides.
+    pub fn with_multipath(max_path_id: u32) -> Result<Self> {
+        let mut config = Config::new(crate::PROTOCOL_VERSION)?;
+        config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+        config.load_priv_key_from_pem_file("examples/cert.key")?;
+        config.set_application_protos(&[b"proto1"])?;
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(15);
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_streams_uni(3);
+        config.set_initial_max_path_id(max_path_id);
+        config.verify_peer(false);
+        Pipe::with_config_and_buf(&mut config)
+    }
+}
+
 impl Pipe {
     pub fn default_config(cc_algorithm_name: &str) -> Result<Config> {
         let mut config = Config::new(PROTOCOL_VERSION)?;
