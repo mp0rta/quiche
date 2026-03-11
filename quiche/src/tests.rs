@@ -12139,3 +12139,13 @@ fn connect_custom_client_dcid_too_short() {
     );
     assert_eq!(client.err().unwrap(), Error::InvalidDcidInitialization);
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn config_multipath_settings() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.set_initial_max_path_id(4);
+    config.set_multipath_scheduler(
+        multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+    );
+}

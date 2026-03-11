@@ -605,6 +605,19 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
+
+    #[cfg(feature = "multipath")]
+    initial_max_path_id: Option<u32>,
+
+    #[cfg(feature = "multipath")]
+    scheduler_factory: Option<Box<dyn multipath::scheduler::SchedulerFactory>>,
+
+    #[cfg(feature = "multipath")]
+    reinjection_controller_factory:
+        Option<Box<dyn multipath::reinjection::ReinjectionControllerFactory>>,
+
+    #[cfg(feature = "multipath")]
+    reinjection_mode: multipath::reinjection::ReinjectionMode,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -681,6 +694,18 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+
+            #[cfg(feature = "multipath")]
+            initial_max_path_id: None,
+
+            #[cfg(feature = "multipath")]
+            scheduler_factory: None,
+
+            #[cfg(feature = "multipath")]
+            reinjection_controller_factory: None,
+
+            #[cfg(feature = "multipath")]
+            reinjection_mode: multipath::reinjection::ReinjectionMode::default(),
         })
     }
 
@@ -1219,6 +1244,52 @@ impl Config {
     /// The default is that the feature is disabled.
     pub fn enable_track_unknown_transport_parameters(&mut self, size: usize) {
         self.track_unknown_transport_params = Some(size);
+    }
+}
+
+#[cfg(feature = "multipath")]
+impl Config {
+    /// Set the initial maximum path ID for multipath QUIC.
+    /// A non-zero value enables multipath negotiation.
+    pub fn set_initial_max_path_id(&mut self, max_path_id: u32) {
+        self.initial_max_path_id = Some(max_path_id);
+    }
+
+    /// Set a built-in scheduler algorithm.
+    pub fn set_multipath_scheduler(
+        &mut self,
+        algo: multipath::scheduler::MultipathSchedulerAlgorithm,
+    ) {
+        use multipath::scheduler::MultipathSchedulerAlgorithm::*;
+        use multipath::schedulers::*;
+        self.scheduler_factory = Some(match algo {
+            MinRtt => Box::new(MinRttSchedulerFactory),
+            RoundRobin => Box::new(RoundRobinSchedulerFactory),
+        });
+    }
+
+    /// Set a custom scheduler factory.
+    pub fn set_scheduler_factory(
+        &mut self,
+        factory: Box<dyn multipath::scheduler::SchedulerFactory>,
+    ) {
+        self.scheduler_factory = Some(factory);
+    }
+
+    /// Set a custom reinjection controller factory.
+    pub fn set_reinjection_controller_factory(
+        &mut self,
+        factory: Box<dyn multipath::reinjection::ReinjectionControllerFactory>,
+    ) {
+        self.reinjection_controller_factory = Some(factory);
+    }
+
+    /// Set the reinjection mode.
+    pub fn set_reinjection_mode(
+        &mut self,
+        mode: multipath::reinjection::ReinjectionMode,
+    ) {
+        self.reinjection_mode = mode;
     }
 }
 
