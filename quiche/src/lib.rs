@@ -9097,6 +9097,8 @@ mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;
+#[cfg(feature = "multipath")]
+pub mod multipath;
 mod packet;
 mod path;
 mod pmtud;
