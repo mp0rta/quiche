@@ -12192,3 +12192,69 @@ fn multipath_negotiation_one_side_disabled() {
         "server should NOT have multipath enabled when it did not advertise it"
     );
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn create_path_client_only() {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_stream_data_uni(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_streams_uni(3);
+    config.set_initial_max_path_id(4);
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Exchange additional CIDs so that new paths can use fresh DCIDs.
+    let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset_token, true).unwrap();
+
+    let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset_token, true).unwrap();
+
+    // Exchange NEW_CONNECTION_ID frames so each side knows the other's new CID.
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Client can create paths
+    let local: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:6666".parse().unwrap();
+    let path_id = pipe.client.create_path(local, peer);
+    assert!(path_id.is_ok());
+    assert!(path_id.unwrap() > 0);
+
+    // Server cannot create paths
+    let result = pipe.server.create_path(local, peer);
+    assert_eq!(result, Err(Error::InvalidState));
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn create_path_without_negotiation_fails() {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_stream_data_uni(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_streams_uni(3);
+    // NOTE: NOT setting initial_max_path_id
+    config.verify_peer(false);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let local: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer: SocketAddr = "127.0.0.1:6666".parse().unwrap();
+    let result = pipe.client.create_path(local, peer);
+    assert_eq!(result, Err(Error::MultipathNotNegotiated));
+}

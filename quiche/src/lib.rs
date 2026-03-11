@@ -7619,6 +7619,126 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Creates a new network path for multipath QUIC.
+    ///
+    /// This method is only valid on client-side connections where multipath
+    /// has been negotiated. Returns the multipath path ID assigned to the new
+    /// path on success.
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated, [`Error::InvalidState`] if called on a server, or
+    /// [`Error::PathLimitExceeded`] if the peer's path limit has been reached.
+    #[cfg(feature = "multipath")]
+    pub fn create_path(
+        &mut self, local: SocketAddr, peer: SocketAddr,
+    ) -> Result<u64> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+        if self.is_server {
+            return Err(Error::InvalidState);
+        }
+
+        let next_id = self.paths.next_path_id;
+        if next_id > self.paths.peer_max_path_id {
+            return Err(Error::PathLimitExceeded);
+        }
+
+        // Build the new path similarly to create_path_on_client, but assign
+        // the multipath path_id.
+        let dcid_seq = if self.ids.zero_length_dcid() {
+            0
+        } else {
+            self.ids
+                .lowest_available_dcid_seq()
+                .ok_or(Error::OutOfIdentifiers)?
+        };
+
+        let mut path = path::Path::new(
+            local,
+            peer,
+            &self.recovery_config,
+            self.path_challenge_recv_max_queue_len,
+            false,
+            None,
+        );
+        path.active_dcid_seq = Some(dcid_seq);
+        path.path_id = next_id;
+        // New paths start in Validating state (PATH_CHALLENGE will be sent).
+        path.request_validation();
+
+        let pid = self
+            .paths
+            .insert_path(path, false)
+            .map_err(|_| Error::PathLimitExceeded)?;
+
+        if !self.ids.zero_length_dcid() {
+            self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
+        }
+
+        self.paths.next_path_id += 1;
+        self.paths.active_path_count += 1;
+
+        Ok(next_id)
+    }
+
+    /// Closes the multipath path identified by `path_id`.
+    ///
+    /// Marks the path for closing (mp_closing = true). At least one active
+    /// path must remain; if this is the only active path, returns
+    /// [`Error::InvalidState`].
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated, or [`Error::PathNotFound`] if no path with the given ID
+    /// exists.
+    #[cfg(feature = "multipath")]
+    pub fn close_path(&mut self, path_id: u64) -> Result<()> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+
+        let idx = self
+            .paths
+            .iter()
+            .find_map(|(i, p)| if p.path_id == path_id { Some(i) } else { None })
+            .ok_or(Error::PathNotFound)?;
+
+        if self.paths.active_path_count <= 1 {
+            return Err(Error::InvalidState);
+        }
+
+        let path = self.paths.get_mut(idx)?;
+        path.mp_closing = true;
+        self.paths.active_path_count -= 1;
+
+        Ok(())
+    }
+
+    /// Sets the application-level status of the multipath path identified by
+    /// `path_id`.
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated, or [`Error::PathNotFound`] if no path with the given ID
+    /// exists.
+    #[cfg(feature = "multipath")]
+    pub fn set_path_status(
+        &mut self, path_id: u64, status: path::PathAppStatus,
+    ) -> Result<()> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+
+        let idx = self
+            .paths
+            .iter()
+            .find_map(|(i, p)| if p.path_id == path_id { Some(i) } else { None })
+            .ok_or(Error::PathNotFound)?;
+
+        self.paths.get_mut(idx)?.app_status = status;
+
+        Ok(())
+    }
+
     fn encode_transport_params(&mut self) -> Result<()> {
         self.handshake.set_quic_transport_params(
             &self.local_transport_params,
