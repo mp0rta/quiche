@@ -12304,7 +12304,7 @@ fn multipath_close_path_last_path_error() {
 
     // Cannot close the only path (path_id=0)
     let result = pipe.client.close_path(0);
-    assert!(result.is_err()); // Should return LastActivePath or InvalidState
+    assert_eq!(result, Err(Error::LastActivePath));
 }
 
 #[cfg(feature = "multipath")]

@@ -861,6 +861,7 @@ pub struct KeyUpdate {
     pub timer: Instant,
 }
 
+#[derive(Debug)]
 pub struct PktNumSpace {
     /// The largest packet number received.
     pub largest_rx_pkt_num: u64,
@@ -1010,6 +1011,7 @@ impl CryptoContext {
 /// [faster ACK]: https://www.rfc-editor.org/rfc/rfc9002.html#section-6.2.4
 /// [optimistic ACK attack]: https://www.rfc-editor.org/rfc/rfc9000.html#section-21.4
 /// [PROTOCOL_VIOLATION]: https://www.rfc-editor.org/rfc/rfc9000#section-13.1
+#[derive(Debug)]
 pub struct PktNumManager {
     // TODO:
     // Defer including next_pkt_num in order to reduce the size of this patch
@@ -1121,7 +1123,7 @@ impl PktNumManager {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct PktNumWindow {
     lower: u64,
     window: u128,

@@ -7745,11 +7745,12 @@ impl<F: BufFactory> Connection<F> {
             .ok_or(Error::PathNotFound)?;
 
         if self.paths.active_path_count <= 1 {
-            return Err(Error::InvalidState);
+            return Err(Error::LastActivePath);
         }
 
         let path = self.paths.get_mut(idx)?;
         path.mp_closing = true;
+        // TODO: Queue PATH_ABANDON frame { path_id, error_code: 0 } for transmission
         self.paths.active_path_count -= 1;
 
         Ok(())
@@ -7776,6 +7777,7 @@ impl<F: BufFactory> Connection<F> {
             .ok_or(Error::PathNotFound)?;
 
         self.paths.get_mut(idx)?.app_status = status;
+        // TODO: Queue PATH_STATUS frame for transmission to peer
 
         Ok(())
     }
@@ -8775,9 +8777,11 @@ impl<F: BufFactory> Connection<F> {
             #[cfg(feature = "multipath")]
             frame::Frame::PathAbandon { path_id, error_code } => {
                 // Mark the path identified by multipath path_id as closing.
+                let mut found = false;
                 for (_, p) in self.paths.iter_mut() {
-                    if p.path_id == path_id {
+                    if p.path_id == path_id && !p.mp_closing {
                         p.mp_closing = true;
+                        found = true;
                         trace!(
                             "{} PATH_ABANDON path_id={} error_code={}",
                             self.trace_id,
@@ -8786,6 +8790,10 @@ impl<F: BufFactory> Connection<F> {
                         );
                         break;
                     }
+                }
+                if found {
+                    self.paths.active_path_count =
+                        self.paths.active_path_count.saturating_sub(1);
                 }
             },
 
@@ -8823,7 +8831,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::MaxPathId { path_id } => {
-                self.paths.peer_max_path_id = path_id;
+                if path_id > self.paths.peer_max_path_id {
+                    self.paths.peer_max_path_id = path_id;
+                }
                 trace!(
                     "{} MAX_PATH_ID path_id={}",
                     self.trace_id,

@@ -251,6 +251,16 @@ pub struct Path {
     /// Per-path packet number counter.
     #[cfg(feature = "multipath")]
     pub(crate) mp_next_pkt_num: u64,
+
+    /// Per-path packet number space for Application Data epoch.
+    #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
+    pub(crate) app_pkt_num_space: crate::packet::PktNumSpace,
+
+    /// Per-path packet number skip logic.
+    #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
+    pub(crate) mp_pkt_num_manager: crate::packet::PktNumManager,
 }
 
 impl Path {
@@ -328,6 +338,10 @@ impl Path {
             mp_closed: false,
             #[cfg(feature = "multipath")]
             mp_next_pkt_num: 0,
+            #[cfg(feature = "multipath")]
+            app_pkt_num_space: crate::packet::PktNumSpace::new(),
+            #[cfg(feature = "multipath")]
+            mp_pkt_num_manager: crate::packet::PktNumManager::new(),
         }
     }
 
