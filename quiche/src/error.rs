@@ -115,6 +115,26 @@ pub enum Error {
 
     /// An invalid DCID was used when connecting to a remote peer.
     InvalidDcidInitialization,
+
+    /// Maximum number of paths exceeded.
+    #[cfg(feature = "multipath")]
+    PathLimitExceeded,
+
+    /// Path ID not found.
+    #[cfg(feature = "multipath")]
+    PathNotFound,
+
+    /// Path not yet validated.
+    #[cfg(feature = "multipath")]
+    PathNotValidated,
+
+    /// Multipath was not negotiated for this connection.
+    #[cfg(feature = "multipath")]
+    MultipathNotNegotiated,
+
+    /// Cannot close the last active path.
+    #[cfg(feature = "multipath")]
+    LastActivePath,
 }
 
 /// QUIC error codes sent on the wire.
@@ -197,6 +217,16 @@ impl Error {
             Error::CryptoBufferExceeded =>
                 WireErrorCode::CryptoBufferExceeded as u64,
             Error::KeyUpdate => WireErrorCode::KeyUpdateError as u64,
+            #[cfg(feature = "multipath")]
+            Error::PathLimitExceeded => WireErrorCode::NoError as u64,
+            #[cfg(feature = "multipath")]
+            Error::PathNotFound => WireErrorCode::NoError as u64,
+            #[cfg(feature = "multipath")]
+            Error::PathNotValidated => WireErrorCode::NoError as u64,
+            #[cfg(feature = "multipath")]
+            Error::MultipathNotNegotiated => WireErrorCode::ProtocolViolation as u64,
+            #[cfg(feature = "multipath")]
+            Error::LastActivePath => WireErrorCode::NoError as u64,
             _ => WireErrorCode::ProtocolViolation as u64,
         }
     }
@@ -227,6 +257,16 @@ impl Error {
             Error::InvalidAckRange => -21,
             Error::OptimisticAckDetected => -22,
             Error::InvalidDcidInitialization => -23,
+            #[cfg(feature = "multipath")]
+            Error::PathLimitExceeded => -24,
+            #[cfg(feature = "multipath")]
+            Error::PathNotFound => -25,
+            #[cfg(feature = "multipath")]
+            Error::PathNotValidated => -26,
+            #[cfg(feature = "multipath")]
+            Error::MultipathNotNegotiated => -27,
+            #[cfg(feature = "multipath")]
+            Error::LastActivePath => -28,
         }
     }
 }
@@ -260,4 +300,24 @@ pub struct ConnectionError {
 
     /// The reason carried by the `CONNECTION_CLOSE` frame.
     pub reason: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn multipath_error_variants_exist() {
+        let e1 = Error::PathLimitExceeded;
+        let e2 = Error::PathNotFound;
+        let e3 = Error::PathNotValidated;
+        let e4 = Error::MultipathNotNegotiated;
+        let e5 = Error::LastActivePath;
+
+        // Each variant should have a distinct debug representation
+        assert_ne!(format!("{:?}", e1), format!("{:?}", e2));
+        assert_ne!(format!("{:?}", e3), format!("{:?}", e4));
+        assert_ne!(format!("{:?}", e4), format!("{:?}", e5));
+    }
 }
