@@ -386,6 +386,7 @@ impl Path {
 
     /// Returns the current validation state of the path.
     #[inline]
+    #[allow(dead_code)]
     pub fn state(&self) -> PathState {
         self.state
     }

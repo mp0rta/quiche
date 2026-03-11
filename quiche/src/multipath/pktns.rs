@@ -8,6 +8,7 @@
 ///   Bits 61-0:  packet_number (62 bits, network byte order)
 ///
 /// The nonce is: N = IV ^ PPN
+#[allow(dead_code)]
 pub fn compute_nonce_mp(
     iv: &[u8],
     pkt_num: u64,

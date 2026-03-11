@@ -240,10 +240,12 @@ pub struct ConnectionIdentifiers {
 
     /// Per-path source CID sequences: maps path_id -> list of SCID seqs.
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     pub(crate) path_scid_map: std::collections::HashMap<u64, Vec<u64>>,
 
     /// Per-path destination CID sequences: maps path_id -> list of DCID seqs.
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     pub(crate) path_dcid_map: std::collections::HashMap<u64, Vec<u64>>,
 }
 

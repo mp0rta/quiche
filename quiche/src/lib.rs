@@ -1592,15 +1592,18 @@ where
 
     /// The reinjection controller instance.
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     reinjection_controller:
         Option<Box<dyn multipath::reinjection::ReinjectionController>>,
 
     /// Reinjection mode.
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     reinjection_mode: multipath::reinjection::ReinjectionMode,
 
     /// Pre-allocated buffer for PathInfo (refreshed each scheduling round).
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     path_info_buf: Vec<multipath::scheduler::PathInfo>,
 
     /// QoS hints per stream.
@@ -7783,7 +7786,7 @@ impl<F: BufFactory> Connection<F> {
     /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
     /// negotiated for this connection.
     #[cfg(feature = "multipath")]
-    pub fn active_paths(&self) -> Vec<(u64, crate::PathStats)> {
+    pub fn active_paths(&self) -> Vec<(u64, PathStats)> {
         self.paths
             .iter()
             .filter_map(|(_, p)| {

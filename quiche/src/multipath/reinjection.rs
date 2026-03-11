@@ -9,46 +9,61 @@ use super::scheduler::PathInfo;
 /// Application-provided QoS requirements per stream.
 #[derive(Debug, Clone)]
 pub struct StreamQosHint {
+    /// The stream ID this hint applies to.
     pub stream_id: u64,
+    /// Optional deadline by which data should be delivered.
     pub deadline: Option<Duration>,
+    /// Priority level for this stream (0 = lowest, 255 = highest).
     pub priority: u8,
+    /// If true, the stream should be redundantly sent on multiple paths.
     pub redundant: bool,
 }
 
 /// When to perform reinjection relative to normal scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReinjectionMode {
+    /// Reinjection is attempted after normal packet scheduling.
+    #[default]
     AfterScheduling,
+    /// Reinjection is attempted before normal packet scheduling.
     BeforeScheduling,
-}
-
-impl Default for ReinjectionMode {
-    fn default() -> Self {
-        ReinjectionMode::AfterScheduling
-    }
 }
 
 /// Information about a packet that is a candidate for reinjection.
 #[derive(Debug, Clone)]
 pub struct ReinjectionCandidate {
+    /// The packet number of this candidate.
     pub packet_number: u64,
+    /// The path ID on which this packet was originally sent.
     pub original_path_id: u64,
+    /// The time at which this packet was originally sent.
     pub sent_time: Instant,
+    /// The size of the packet in bytes.
     pub size: usize,
+    /// The type of content carried in this packet.
     pub content_type: PacketContentType,
+    /// Whether this packet has already been reinjected once.
     pub is_already_reinjected: bool,
 }
 
 /// Context for reinjection decisions.
 pub struct ReinjectionContext<'a> {
+    /// The path on which the candidate packet was originally sent.
     pub original_path: &'a PathInfo,
+    /// Snapshot of all currently active paths.
     pub all_paths: &'a [PathInfo],
+    /// Time elapsed since the packet was originally sent.
     pub elapsed_since_sent: Duration,
+    /// Optional QoS hint for the stream this packet belongs to.
     pub qos_hint: Option<&'a StreamQosHint>,
 }
 
 /// Implement this trait to create custom reinjection strategies.
 pub trait ReinjectionController: Send + Sync {
+    /// Decide whether the given packet candidate should be reinjected.
+    ///
+    /// Returns `true` if the packet should be reinjected on an alternate path,
+    /// or `false` if no reinjection is needed.
     fn should_reinject(
         &mut self,
         candidate: &ReinjectionCandidate,
@@ -58,12 +73,14 @@ pub trait ReinjectionController: Send + Sync {
 
 /// Factory for creating per-connection reinjection controller instances.
 pub trait ReinjectionControllerFactory: Send + Sync {
+    /// Create a new reinjection controller instance for a connection.
     fn create(&self) -> Box<dyn ReinjectionController>;
 }
 
 /// RTT-based reinjection controller.
 #[derive(Debug)]
 pub struct DefaultReinjectionController {
+    /// Multiplier applied to the path RTT to determine the reinjection threshold.
     pub rtt_multiplier: f64,
 }
 
@@ -130,6 +147,7 @@ impl ReinjectionController for DefaultReinjectionController {
 /// Factory for DefaultReinjectionController.
 #[derive(Debug)]
 pub struct DefaultReinjectionControllerFactory {
+    /// Multiplier applied to the path RTT to determine the reinjection threshold.
     pub rtt_multiplier: f64,
 }
 

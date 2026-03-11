@@ -51,13 +51,13 @@ impl Scheduler for RoundRobinScheduler {
                 };
             }
 
-            self.last_index = (self.last_index) % backup.len();
+            self.last_index %= backup.len();
             let chosen = backup[self.last_index].path_id;
             self.last_index = (self.last_index + 1) % backup.len();
             return SchedulerDecision::Send(chosen);
         }
 
-        self.last_index = (self.last_index) % usable.len();
+        self.last_index %= usable.len();
         let chosen = usable[self.last_index].path_id;
         self.last_index = (self.last_index + 1) % usable.len();
         SchedulerDecision::Send(chosen)
