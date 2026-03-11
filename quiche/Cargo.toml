@@ -64,6 +64,9 @@ internal = []
 # Enable qlog support with serde_json for extension data
 qlog = ["dep:qlog", "dep:serde", "dep:serde_json", "dep:serde_with"]
 
+# Enable multipath support
+multipath = []
+
 [package.metadata.release]
 tag-prefix = ""
 
