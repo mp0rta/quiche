@@ -12340,3 +12340,22 @@ fn multipath_set_path_status() {
         pipe.client.set_path_status(999, path::PathAppStatus::Backup);
     assert!(result.is_err());
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_per_path_pkt_num_recording() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.stream_send(0, b"hello", true).unwrap();
+    pipe.advance().unwrap();
+
+    let (_, server_path) = pipe.server.paths.iter().next().unwrap();
+    assert!(
+        server_path.app_pkt_num_space.recv_pkt_need_ack.len() > 0,
+        "per-path app_pkt_num_space should have recorded received pkt nums"
+    );
+}

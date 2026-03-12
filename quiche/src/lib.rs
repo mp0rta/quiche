@@ -3747,6 +3747,24 @@ impl<F: BufFactory> Connection<F> {
         self.pkt_num_spaces[epoch].largest_rx_pkt_num =
             cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
 
+        // For multipath, also record the packet number in the per-path
+        // application data packet number space so that PATH_ACK frames can be
+        // generated per-path.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && epoch == packet::Epoch::Application {
+            let recv_path = self.paths.get_mut(recv_pid)?;
+            if recv_path.app_pkt_num_space.recv_pkt_need_ack.last() < Some(pn)
+            {
+                recv_path.app_pkt_num_space.largest_rx_pkt_time = now;
+            }
+            recv_path.app_pkt_num_space.recv_pkt_num.insert(pn);
+            recv_path.app_pkt_num_space.recv_pkt_need_ack.push_item(pn);
+            recv_path.app_pkt_num_space.ack_elicited =
+                cmp::max(recv_path.app_pkt_num_space.ack_elicited, ack_elicited);
+            recv_path.app_pkt_num_space.largest_rx_pkt_num =
+                cmp::max(recv_path.app_pkt_num_space.largest_rx_pkt_num, pn);
+        }
+
         if !probing {
             self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num = cmp::max(
                 self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num,
