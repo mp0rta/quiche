@@ -8780,16 +8780,74 @@ impl<F: BufFactory> Connection<F> {
             frame::Frame::PathAck {
                 path_id,
                 ack_delay,
+                ranges,
                 ..
             } => {
-                // TODO: Implement full PATH_ACK processing feeding ack ranges
-                // into the per-path recovery state. For now just log receipt.
                 trace!(
                     "{} received PATH_ACK for path_id={} ack_delay={}",
                     self.trace_id,
                     path_id,
                     ack_delay,
                 );
+
+                // Find the path this PATH_ACK refers to.
+                let target_pid = self
+                    .paths
+                    .iter()
+                    .find_map(|(i, p)| {
+                        if p.path_id == path_id {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    });
+
+                if let Some(pid) = target_pid {
+                    let ack_delay = ack_delay
+                        .checked_mul(2_u64.pow(
+                            self.peer_transport_params.ack_delay_exponent
+                                as u32,
+                        ))
+                        .ok_or(Error::InvalidFrame)?;
+
+                    let handshake_status = self.handshake_status();
+                    let is_app_limited =
+                        self.delivery_rate_check_if_app_limited();
+                    let trace_id = self.trace_id.clone();
+
+                    let p = self.paths.get_mut(pid)?;
+                    let skip_pn = p.mp_pkt_num_manager.skip_pn();
+
+                    if is_app_limited {
+                        p.recovery.delivery_rate_update_app_limited(true);
+                    }
+
+                    let OnAckReceivedOutcome {
+                        lost_packets,
+                        lost_bytes,
+                        acked_bytes,
+                        spurious_losses,
+                    } = p.recovery.on_ack_received(
+                        &ranges,
+                        ack_delay,
+                        packet::Epoch::Application,
+                        handshake_status,
+                        now,
+                        skip_pn,
+                        &trace_id,
+                    )?;
+
+                    self.lost_count += lost_packets;
+                    self.lost_bytes += lost_bytes as u64;
+                    self.acked_bytes += acked_bytes as u64;
+                    self.spurious_lost_count += spurious_losses;
+                } else {
+                    trace!(
+                        "{} PATH_ACK for unknown path_id={}",
+                        self.trace_id,
+                        path_id,
+                    );
+                }
             },
 
             #[cfg(feature = "multipath")]
