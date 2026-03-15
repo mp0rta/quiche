@@ -12385,3 +12385,55 @@ fn multipath_path_ack_processing_no_panic() {
     assert!(pipe.client.is_established());
     assert!(pipe.server.is_established());
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_ack_generation() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Enable multipath on both sides
+    pipe.client.multipath_enabled = true;
+    pipe.server.multipath_enabled = true;
+
+    // Client sends stream data
+    let mut buf = [0u8; 65535];
+    pipe.client.stream_send(0, b"hello", false).unwrap();
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+
+    // Deliver to server — this records pkt nums in per-path app_pkt_num_space
+    let recv_info = RecvInfo {
+        to: pipe.server.paths.get(0).unwrap().local_addr(),
+        from: pipe.server.paths.get(0).unwrap().peer_addr(),
+    };
+    pipe.server.recv(&mut buf[..len], recv_info).unwrap();
+
+    // Server should now have pending ACKs in per-path app_pkt_num_space
+    let (_, path) = pipe.server.paths.iter().next().unwrap();
+    assert!(
+        path.app_pkt_num_space.recv_pkt_need_ack.len() > 0,
+        "server path should have pending per-path ACKs"
+    );
+
+    // Server sends a response — this should include PATH_ACK frames
+    pipe.server.stream_send(0, b"world", false).unwrap();
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    assert!(len > 0, "server should produce a packet");
+
+    // After sending, the path's ack_elicited should be cleared
+    let (_, path) = pipe.server.paths.iter().next().unwrap();
+    assert!(
+        !path.app_pkt_num_space.ack_elicited,
+        "ack_elicited should be cleared after generating PATH_ACK"
+    );
+}

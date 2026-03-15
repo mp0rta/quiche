@@ -1030,6 +1030,13 @@ impl Frame {
     }
 
     pub fn ack_eliciting(&self) -> bool {
+        // PATH_ACK is the multipath equivalent of ACK and must also
+        // be treated as non-ack-eliciting to avoid feedback loops.
+        #[cfg(feature = "multipath")]
+        if matches!(self, Frame::PathAck { .. }) {
+            return false;
+        }
+
         // Any other frame is ack-eliciting (note the `!`).
         !matches!(
             self,

@@ -4515,6 +4515,58 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Generate PATH_ACK frames for all paths when multipath is enabled.
+        // PATH_ACK frames for any path can be sent on any path.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && pkt_type == packet::Type::Short {
+            // Collect per-path ACK info into locals to avoid borrow conflicts
+            // with push_frame_to_pkt! (which borrows `b`).
+            let ack_delay_exponent =
+                self.local_transport_params.ack_delay_exponent as u32;
+            let mp_ack_infos: Vec<(usize, u64, u64, ranges::RangeSet)> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| {
+                    p.app_pkt_num_space.recv_pkt_need_ack.len() > 0 &&
+                        p.app_pkt_num_space.ack_elicited
+                })
+                .map(|(pid, p)| {
+                    #[cfg(not(feature = "fuzzing"))]
+                    let delay = {
+                        let elapsed =
+                            p.app_pkt_num_space.largest_rx_pkt_time.elapsed();
+                        elapsed.as_micros() as u64 /
+                            2_u64.pow(ack_delay_exponent)
+                    };
+                    #[cfg(feature = "fuzzing")]
+                    let delay = rand::rand_u8() as u64 + 1;
+                    (
+                        pid,
+                        p.path_id,
+                        delay,
+                        p.app_pkt_num_space.recv_pkt_need_ack.clone(),
+                    )
+                })
+                .collect();
+
+            for (pid, mp_path_id, mp_ack_delay, mp_ranges) in mp_ack_infos {
+                let frame = frame::Frame::PathAck {
+                    path_id: mp_path_id,
+                    ack_delay: mp_ack_delay,
+                    ranges: mp_ranges,
+                    ecn_counts: None,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.paths
+                        .get_mut(pid)
+                        .unwrap()
+                        .app_pkt_num_space
+                        .ack_elicited = false;
+                }
+            }
+        }
+
         // Limit output packet size by congestion window size.
         left = cmp::min(
             left,

@@ -47,7 +47,4 @@ pub(crate) fn refresh_path_info(
     }
 }
 
-// Task 19: PATH_ACK generation for all paths is not yet implemented.
-// TODO: When sending packets, generate PATH_ACK frames acknowledging received
-//       packets on each path, analogous to how regular ACK frames are generated
-//       for the shared packet number space.
+
