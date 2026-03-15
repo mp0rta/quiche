@@ -4005,7 +4005,61 @@ impl<F: BufFactory> Connection<F> {
                 .path_id_from_addrs(&(f, t))
                 .ok_or(Error::InvalidState)?,
 
-            _ => self.get_send_path_id(from, to)?,
+            _ => {
+                #[cfg(feature = "multipath")]
+                {
+                    if self.multipath_enabled && from.is_none() && to.is_none() {
+                        if let Some(scheduler) = &mut self.scheduler {
+                            let mut path_infos =
+                                std::mem::take(&mut self.path_info_buf);
+                            multipath::refresh_path_info(
+                                &self.paths,
+                                &mut path_infos,
+                            );
+
+                            let packet_meta =
+                                multipath::scheduler::PacketMeta {
+                                    packet_type:
+                                        multipath::scheduler::PacketContentType::Stream,
+                                    size_estimate: 0,
+                                    is_retransmission: false,
+                                    is_reinjection: false,
+                                    original_path_id: None,
+                                };
+                            let decision =
+                                scheduler.select_path(&path_infos, &packet_meta);
+                            self.path_info_buf = path_infos;
+
+                            match decision {
+                                multipath::scheduler::SchedulerDecision::Send(
+                                    selected_path_id,
+                                ) => {
+                                    self.paths
+                                        .iter()
+                                        .find_map(|(i, p)| {
+                                            if p.path_id == selected_path_id {
+                                                Some(i)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .ok_or(Error::InvalidState)?
+                                },
+                                _ => self.get_send_path_id(from, to)?,
+                            }
+                        } else {
+                            self.get_send_path_id(from, to)?
+                        }
+                    } else {
+                        self.get_send_path_id(from, to)?
+                    }
+                }
+
+                #[cfg(not(feature = "multipath"))]
+                {
+                    self.get_send_path_id(from, to)?
+                }
+            },
         };
 
         let send_path = self.paths.get_mut(send_pid)?;

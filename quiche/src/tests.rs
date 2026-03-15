@@ -12437,3 +12437,32 @@ fn multipath_path_ack_generation() {
         "ack_elicited should be cleared after generating PATH_ACK"
     );
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_scheduler_path_selection() {
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(4);
+    config.set_multipath_scheduler(
+        multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+    );
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.multipath_enabled = true;
+    pipe.server.multipath_enabled = true;
+
+    // Send data — scheduler should pick the single available path
+    pipe.client.stream_send(0, b"hello", false).unwrap();
+    let mut buf = [0u8; 65535];
+    let result = pipe.client.send(&mut buf);
+    assert!(result.is_ok(), "scheduler should pick the single available path");
+}
