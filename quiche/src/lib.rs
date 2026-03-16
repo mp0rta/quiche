@@ -9079,6 +9079,9 @@ impl<F: BufFactory> Connection<F> {
                 ranges,
                 ..
             } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 trace!(
                     "{} received PATH_ACK for path_id={} ack_delay={}",
                     self.trace_id,
@@ -9148,6 +9151,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathAbandon { path_id, error_code } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 // Mark the path identified by multipath path_id as closing.
                 let mut found = false;
                 for (_, p) in self.paths.iter_mut() {
@@ -9171,6 +9177,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathStatusAvailable { path_id, seq_num } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
                         p.app_status = path::PathAppStatus::Available;
@@ -9187,6 +9196,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathStatusBackup { path_id, seq_num } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
                         p.app_status = path::PathAppStatus::Backup;
@@ -9203,6 +9215,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::MaxPathId { path_id } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 if path_id > self.paths.peer_max_path_id {
                     self.paths.peer_max_path_id = path_id;
                 }
@@ -9215,6 +9230,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathsBlocked { path_id } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 // Peer cannot open more paths beyond path_id. No local action
                 // required; just acknowledge receipt.
                 trace!(
@@ -9226,6 +9244,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathNewConnectionId { path_id, .. } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 // TODO: Handle path-specific connection ID management.
                 trace!(
                     "{} PATH_NEW_CONNECTION_ID path_id={}",
@@ -9236,6 +9257,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 // TODO: Handle path-specific connection ID retirement.
                 trace!(
                     "{} PATH_RETIRE_CONNECTION_ID path_id={} seq={}",
@@ -9247,6 +9271,9 @@ impl<F: BufFactory> Connection<F> {
 
             #[cfg(feature = "multipath")]
             frame::Frame::PathCidsBlocked { path_id, seq_num } => {
+                if !self.multipath_enabled {
+                    return Err(Error::InvalidFrame);
+                }
                 // Peer cannot provide more path CIDs. Just acknowledge.
                 trace!(
                     "{} PATH_CIDS_BLOCKED path_id={} seq={}",

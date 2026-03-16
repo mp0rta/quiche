@@ -108,6 +108,10 @@ pub fn encode_path_ack(
         PATH_ACK_TYPE
     };
 
+    if ranges.len() == 0 {
+        return Err(crate::Error::InvalidFrame);
+    }
+
     b.put_varint(ty)?;
     b.put_varint(path_id)?;
 

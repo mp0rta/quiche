@@ -967,7 +967,46 @@ impl Frame {
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathAck { .. } => 0, // placeholder; actual length computed at encode time
+            Frame::PathAck {
+                path_id,
+                ack_delay,
+                ref ranges,
+                ref ecn_counts,
+            } => {
+                let frame_type =
+                    if ecn_counts.is_some() { 0x3f_u64 } else { 0x3e_u64 };
+                let mut it = ranges.iter().rev();
+
+                let first = it.next().unwrap();
+                let ack_block = (first.end - 1) - first.start;
+
+                let mut len = octets::varint_len(frame_type) + // frame type
+                    octets::varint_len(*path_id) +              // path_id
+                    octets::varint_len(first.end - 1) +         // largest_ack
+                    octets::varint_len(*ack_delay) +            // ack_delay
+                    octets::varint_len(it.len() as u64) +       // block_count
+                    octets::varint_len(ack_block);              // first_block
+
+                let mut smallest_ack = first.start;
+
+                for block in it {
+                    let gap = smallest_ack - block.end - 1;
+                    let ack_block = (block.end - 1) - block.start;
+
+                    len += octets::varint_len(gap) +    // gap
+                           octets::varint_len(ack_block); // ack_block
+
+                    smallest_ack = block.start;
+                }
+
+                if let Some(ecn) = ecn_counts {
+                    len += octets::varint_len(ecn.ect0_count) +
+                        octets::varint_len(ecn.ect1_count) +
+                        octets::varint_len(ecn.ecn_ce_count);
+                }
+
+                len
+            },
 
             #[cfg(feature = "multipath")]
             Frame::PathAbandon { path_id, error_code } => {
