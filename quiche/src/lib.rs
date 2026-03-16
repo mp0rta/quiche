@@ -7874,7 +7874,7 @@ impl<F: BufFactory> Connection<F> {
 
         let path = self.paths.get_mut(idx)?;
         path.mp_closing = true;
-        // TODO: Queue PATH_ABANDON frame { path_id, error_code: 0 } for transmission
+        path.mp_path_abandon_pending = true;
         self.paths.active_path_count -= 1;
 
         Ok(())
@@ -7900,8 +7900,10 @@ impl<F: BufFactory> Connection<F> {
             .find_map(|(i, p)| if p.path_id == path_id { Some(i) } else { None })
             .ok_or(Error::PathNotFound)?;
 
-        self.paths.get_mut(idx)?.app_status = status;
-        // TODO: Queue PATH_STATUS frame for transmission to peer
+        let path = self.paths.get_mut(idx)?;
+        path.app_status = status;
+        path.mp_path_status_pending = true;
+        path.mp_path_status_seq_num += 1;
 
         Ok(())
     }

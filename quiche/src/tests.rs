@@ -12466,3 +12466,62 @@ fn multipath_scheduler_path_selection() {
     let result = pipe.client.send(&mut buf);
     assert!(result.is_ok(), "scheduler should pick the single available path");
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_close_path_sets_abandon_pending() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.multipath_enabled = true;
+    pipe.client.paths.active_path_count = 2;
+
+    let (idx, _) = pipe.client.paths.iter().next().unwrap();
+    pipe.client.paths.get_mut(idx).unwrap().path_id = 0;
+
+    pipe.client.close_path(0).unwrap();
+
+    let path = pipe.client.paths.get(idx).unwrap();
+    assert!(path.mp_path_abandon_pending, "close_path should set mp_path_abandon_pending");
+    assert!(path.mp_closing, "close_path should set mp_closing");
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_set_path_status_sets_pending() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.multipath_enabled = true;
+
+    let (idx, _) = pipe.client.paths.iter().next().unwrap();
+    pipe.client.paths.get_mut(idx).unwrap().path_id = 0;
+
+    pipe.client
+        .set_path_status(0, path::PathAppStatus::Backup)
+        .unwrap();
+
+    let path = pipe.client.paths.get(idx).unwrap();
+    assert!(path.mp_path_status_pending, "set_path_status should set mp_path_status_pending");
+    assert_eq!(path.app_status, path::PathAppStatus::Backup);
+}
