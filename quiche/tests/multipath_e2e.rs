@@ -244,6 +244,11 @@ fn multipath_second_path_creation() {
     );
 }
 
+// TODO: This test requires per-path packet number decoding on the receive
+// side (lib.rs:3257 uses shared pkt_num_spaces instead of per-path counters).
+// Until the receive-side multipath nonce/pkt_num integration is done, the
+// second path hits CryptoFail and cannot transfer data.
+// Re-enable once per-path recv decoding is implemented.
 #[test]
 #[ignore]
 fn multipath_data_transfer_two_paths() {
