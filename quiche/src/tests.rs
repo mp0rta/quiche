@@ -12262,18 +12262,8 @@ fn create_path_without_negotiation_fails() {
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_full_negotiation_and_create_path() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto1"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_stream_data_uni(15);
-    config.set_initial_max_streams_bidi(3);
-    config.set_initial_max_streams_uni(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
-    config.verify_peer(false);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
@@ -12286,42 +12276,22 @@ fn multipath_full_negotiation_and_create_path() {
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_close_path_last_path_error() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto1"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_stream_data_uni(15);
-    config.set_initial_max_streams_bidi(3);
-    config.set_initial_max_streams_uni(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
-    config.verify_peer(false);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
 
     // Cannot close the only path (path_id=0)
-    let result = pipe.client.close_path(0);
+    let result = pipe.client.close_path(0, 0);
     assert_eq!(result, Err(Error::LastActivePath));
 }
 
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_set_path_status() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto1"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_stream_data_uni(15);
-    config.set_initial_max_streams_bidi(3);
-    config.set_initial_max_streams_uni(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
-    config.verify_peer(false);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
@@ -12470,14 +12440,7 @@ fn multipath_scheduler_path_selection() {
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_close_path_sets_abandon_pending() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_streams_bidi(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
@@ -12489,7 +12452,7 @@ fn multipath_close_path_sets_abandon_pending() {
     let (idx, _) = pipe.client.paths.iter().next().unwrap();
     pipe.client.paths.get_mut(idx).unwrap().path_id = 0;
 
-    pipe.client.close_path(0).unwrap();
+    pipe.client.close_path(0, 0).unwrap();
 
     let path = pipe.client.paths.get(idx).unwrap();
     assert!(path.mp_path_abandon_pending, "close_path should set mp_path_abandon_pending");
@@ -12499,14 +12462,7 @@ fn multipath_close_path_sets_abandon_pending() {
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_set_path_status_sets_pending() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_streams_bidi(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
@@ -12529,14 +12485,7 @@ fn multipath_set_path_status_sets_pending() {
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_path_abandon_frame_generated() {
-    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
-    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
-    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
-    config.set_application_protos(&[b"proto"]).unwrap();
-    config.set_initial_max_data(30);
-    config.set_initial_max_stream_data_bidi_local(15);
-    config.set_initial_max_stream_data_bidi_remote(15);
-    config.set_initial_max_streams_bidi(3);
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
 
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
@@ -12548,7 +12497,7 @@ fn multipath_path_abandon_frame_generated() {
     let (idx, _) = pipe.client.paths.iter().next().unwrap();
     pipe.client.paths.get_mut(idx).unwrap().path_id = 0;
 
-    pipe.client.close_path(0).unwrap();
+    pipe.client.close_path(0, 0).unwrap();
 
     assert!(pipe.client.paths.get(idx).unwrap().mp_path_abandon_pending);
 

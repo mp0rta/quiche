@@ -268,6 +268,10 @@ pub struct Path {
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_abandon_acked: bool,
 
+    /// Error code to send in the PATH_ABANDON frame.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_abandon_error_code: u64,
+
     /// True when a PATH_STATUS frame needs to be sent for this path.
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_status_pending: bool,
@@ -279,6 +283,11 @@ pub struct Path {
     /// Sequence number for PATH_STATUS frames (monotonically increasing).
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_status_seq_num: u64,
+
+    /// Highest received PATH_STATUS sequence number from the peer.
+    /// Used to reject stale (out-of-order) PATH_STATUS frames.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_status_rx_seq_num: Option<u64>,
 }
 
 impl Path {
@@ -365,11 +374,15 @@ impl Path {
             #[cfg(feature = "multipath")]
             mp_path_abandon_acked: false,
             #[cfg(feature = "multipath")]
+            mp_path_abandon_error_code: 0,
+            #[cfg(feature = "multipath")]
             mp_path_status_pending: false,
             #[cfg(feature = "multipath")]
             mp_path_status_acked: false,
             #[cfg(feature = "multipath")]
             mp_path_status_seq_num: 0,
+            #[cfg(feature = "multipath")]
+            mp_path_status_rx_seq_num: None,
         }
     }
 

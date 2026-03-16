@@ -2,12 +2,19 @@
 
 /// Compute the multipath AEAD nonce using PPN (Path and Packet Number).
 ///
-/// The 96-bit PPN is:
-///   Bits 95-64: path_id (32 bits, network byte order)
+/// Implements draft-ietf-quic-multipath Section 5.1: the 96-bit PPN is:
+///   Bits 95-64: path_id (lower 32 bits, network byte order)
 ///   Bits 63-62: 00 (2 zero bits)
 ///   Bits 61-0:  packet_number (62 bits, network byte order)
 ///
 /// The nonce is: N = IV ^ PPN
+///
+/// Note: `path_id` is truncated to 32 bits per the spec. The QUIC path_id
+/// is a varint (up to 62 bits) but only the lower 32 bits are used in the
+/// nonce computation.
+///
+/// Currently unused — will be called when per-path encryption is
+/// integrated in the packet protection layer.
 #[allow(dead_code)]
 pub fn compute_nonce_mp(
     iv: &[u8],

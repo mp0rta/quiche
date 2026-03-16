@@ -1605,11 +1605,11 @@ where
 
     /// Pre-allocated buffer for PathInfo (refreshed each scheduling round).
     #[cfg(feature = "multipath")]
-    #[allow(dead_code)]
     path_info_buf: Vec<multipath::scheduler::PathInfo>,
 
-    /// QoS hints per stream.
+    /// QoS hints per stream, used by the reinjection engine (future).
     #[cfg(feature = "multipath")]
+    #[allow(dead_code)]
     stream_qos_hints:
         std::collections::HashMap<u64, multipath::reinjection::StreamQosHint>,
 }
@@ -3531,9 +3531,9 @@ impl<F: BufFactory> Connection<F> {
         // (since we cannot call self.paths.iter_mut() while already iterating
         // it mutably).
         #[cfg(feature = "multipath")]
-        let mut mp_abandon_acked: Vec<u64> = Vec::new();
+        let mut mp_abandon_acked: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
-        let mut mp_status_acked: Vec<u64> = Vec::new();
+        let mut mp_status_acked: SmallVec<[u64; 2]> = SmallVec::new();
 
         for (_, p) in self.paths.iter_mut() {
             while let Some(acked) = p.recovery.next_acked_frame(epoch) {
@@ -4246,9 +4246,9 @@ impl<F: BufFactory> Connection<F> {
         // lost frames requiring retransmission (deferred to avoid nested
         // mutable borrows of self.paths).
         #[cfg(feature = "multipath")]
-        let mut mp_abandon_lost: Vec<u64> = Vec::new();
+        let mut mp_abandon_lost: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
-        let mut mp_status_lost: Vec<u64> = Vec::new();
+        let mut mp_status_lost: SmallVec<[u64; 2]> = SmallVec::new();
 
         for (_, p) in self.paths.iter_mut() {
             while let Some(lost) = p.recovery.next_lost_frame(epoch) {
@@ -4667,12 +4667,17 @@ impl<F: BufFactory> Connection<F> {
         // Generate PATH_ACK frames for all paths when multipath is enabled.
         // PATH_ACK frames for any path can be sent on any path.
         #[cfg(feature = "multipath")]
-        if self.multipath_enabled && pkt_type == packet::Type::Short {
-            // Collect per-path ACK info into locals to avoid borrow conflicts
-            // with push_frame_to_pkt! (which borrows `b`).
+        if self.multipath_enabled && pkt_type == Type::Short {
+            // Collect per-path ACK info into locals to avoid borrow
+            // conflicts with push_frame_to_pkt! (which borrows `b`).
+            // The ranges are cloned — same pattern as the regular ACK
+            // (line ~4649) — because they must persist for retransmission
+            // if the PATH_ACK is lost.
             let ack_delay_exponent =
                 self.local_transport_params.ack_delay_exponent as u32;
-            let mp_ack_infos: Vec<(usize, u64, u64, ranges::RangeSet)> = self
+            let mp_ack_infos: SmallVec<
+                [(usize, u64, u64, ranges::RangeSet); 4],
+            > = self
                 .paths
                 .iter()
                 .filter(|(_, p)| {
@@ -4719,17 +4724,17 @@ impl<F: BufFactory> Connection<F> {
         // Generate PATH_ABANDON frames for paths that are closing.
         #[cfg(feature = "multipath")]
         if self.multipath_enabled && pkt_type == Type::Short {
-            let abandon_paths: Vec<(usize, u64)> = self
+            let abandon_paths: SmallVec<[(usize, u64, u64); 2]> = self
                 .paths
                 .iter()
                 .filter(|(_, p)| p.mp_path_abandon_pending)
-                .map(|(i, p)| (i, p.path_id))
+                .map(|(i, p)| (i, p.path_id, p.mp_path_abandon_error_code))
                 .collect();
 
-            for (pid, mp_path_id) in abandon_paths {
+            for (pid, mp_path_id, mp_error_code) in abandon_paths {
                 let frame = frame::Frame::PathAbandon {
                     path_id: mp_path_id,
-                    error_code: 0,
+                    error_code: mp_error_code,
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -4740,7 +4745,9 @@ impl<F: BufFactory> Connection<F> {
                 }
             }
 
-            let status_paths: Vec<(usize, u64, path::PathAppStatus, u64)> = self
+            let status_paths: SmallVec<
+                [(usize, u64, path::PathAppStatus, u64); 2],
+            > = self
                 .paths
                 .iter()
                 .filter(|(_, p)| p.mp_path_status_pending)
@@ -8017,11 +8024,16 @@ impl<F: BufFactory> Connection<F> {
     /// negotiated, or [`Error::PathNotFound`] if no path with the given ID
     /// exists.
     #[cfg(feature = "multipath")]
-    pub fn close_path(&mut self, path_id: u64) -> Result<()> {
+    pub fn close_path(
+        &mut self, path_id: u64, error_code: u64,
+    ) -> Result<()> {
         if !self.multipath_enabled {
             return Err(Error::MultipathNotNegotiated);
         }
 
+        // O(n) linear scan by multipath path_id. Acceptable because the
+        // number of paths is small (typically 2-4) and this is not on the
+        // per-packet hot path.
         let idx = self
             .paths
             .iter()
@@ -8035,13 +8047,17 @@ impl<F: BufFactory> Connection<F> {
         let path = self.paths.get_mut(idx)?;
         path.mp_closing = true;
         path.mp_path_abandon_pending = true;
+        path.mp_path_abandon_error_code = error_code;
         self.paths.active_path_count -= 1;
 
         #[cfg(feature = "qlog")]
         qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
             let ev_data = EventData::Marker {
                 marker_type: "multipath:path_closed".to_string(),
-                message: Some(format!("path_id={}", path_id)),
+                message: Some(format!(
+                    "path_id={} error_code={}",
+                    path_id, error_code
+                )),
             };
             q.add_event_data_with_instant(ev_data, Instant::now()).ok();
         });
@@ -8063,6 +8079,7 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::MultipathNotNegotiated);
         }
 
+        // O(n) scan; acceptable for small path count (typically 2-4).
         let idx = self
             .paths
             .iter()
@@ -9170,6 +9187,10 @@ impl<F: BufFactory> Connection<F> {
                     }
                 }
                 if found {
+                    debug_assert!(
+                        self.paths.active_path_count > 0,
+                        "active_path_count underflow on PATH_ABANDON recv"
+                    );
                     self.paths.active_path_count =
                         self.paths.active_path_count.saturating_sub(1);
                 }
@@ -9182,6 +9203,20 @@ impl<F: BufFactory> Connection<F> {
                 }
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
+                        // Reject stale PATH_STATUS frames.
+                        if let Some(prev) = p.mp_path_status_rx_seq_num {
+                            if seq_num <= prev {
+                                trace!(
+                                    "{} PATH_STATUS Available stale seq={} \
+                                     (latest={}), ignoring",
+                                    self.trace_id,
+                                    seq_num,
+                                    prev,
+                                );
+                                break;
+                            }
+                        }
+                        p.mp_path_status_rx_seq_num = Some(seq_num);
                         p.app_status = path::PathAppStatus::Available;
                         trace!(
                             "{} PATH_STATUS Available path_id={} seq={}",
@@ -9201,6 +9236,20 @@ impl<F: BufFactory> Connection<F> {
                 }
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
+                        // Reject stale PATH_STATUS frames.
+                        if let Some(prev) = p.mp_path_status_rx_seq_num {
+                            if seq_num <= prev {
+                                trace!(
+                                    "{} PATH_STATUS Backup stale seq={} \
+                                     (latest={}), ignoring",
+                                    self.trace_id,
+                                    seq_num,
+                                    prev,
+                                );
+                                break;
+                            }
+                        }
+                        p.mp_path_status_rx_seq_num = Some(seq_num);
                         p.app_status = path::PathAppStatus::Backup;
                         trace!(
                             "{} PATH_STATUS Backup path_id={} seq={}",
