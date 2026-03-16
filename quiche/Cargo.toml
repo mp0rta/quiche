@@ -108,6 +108,7 @@ windows-sys = { version = "0.59", features = [
 mio = { workspace = true, features = ["net", "os-poll"] }
 ring = { workspace = true }
 rstest = { workspace = true }
+tempfile = "3"
 url = { workspace = true }
 
 [lib]
