@@ -361,6 +361,16 @@ pub fn connect(
                 conn.path_stats().collect::<Vec<quiche::PathStats>>()
             );
 
+            #[cfg(feature = "multipath")]
+            if conn.is_multipath() {
+                for (i, stats) in conn.path_stats().enumerate() {
+                    eprintln!(
+                        "MP_PATH path_id={} sent_bytes={} recv_bytes={}",
+                        i, stats.sent_bytes, stats.recv_bytes
+                    );
+                }
+            }
+
             if !conn.is_established() {
                 error!(
                     "connection timed out after {:?}",
@@ -611,6 +621,16 @@ pub fn connect(
                 conn.stats(),
                 conn.path_stats().collect::<Vec<quiche::PathStats>>()
             );
+
+            #[cfg(feature = "multipath")]
+            if conn.is_multipath() {
+                for (i, stats) in conn.path_stats().enumerate() {
+                    eprintln!(
+                        "MP_PATH path_id={} sent_bytes={} recv_bytes={}",
+                        i, stats.sent_bytes, stats.recv_bytes
+                    );
+                }
+            }
 
             if !conn.is_established() {
                 error!(
