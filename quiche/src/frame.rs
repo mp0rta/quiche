@@ -1260,66 +1260,138 @@ impl Frame {
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathAck { .. } => QuicFrame::Unknown {
-                frame_type_value: Some(0x3e),
-                raw_frame_type: 0x3e,
-                raw: None,
+            Frame::PathAck {
+                path_id,
+                ack_delay,
+                ranges: _,
+                ref ecn_counts,
+            } => {
+                let raw_type =
+                    if ecn_counts.is_some() { 0x3f_u64 } else { 0x3e_u64 };
+                QuicFrame::Unknown {
+                    frame_type_value: Some(raw_type),
+                    raw_frame_type: raw_type,
+                    raw: Some(qlog::events::RawInfo {
+                        length: None,
+                        payload_length: None,
+                        data: Some(format!(
+                            "{{\"path_id\":{},\"ack_delay\":{}}}",
+                            path_id, ack_delay
+                        )),
+                    }),
+                }
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathAbandon { .. } => QuicFrame::Unknown {
+            Frame::PathAbandon { path_id, error_code } => QuicFrame::Unknown {
                 frame_type_value: Some(0x3e75),
                 raw_frame_type: 0x3e75,
-                raw: None,
+                raw: Some(qlog::events::RawInfo {
+                    length: None,
+                    payload_length: None,
+                    data: Some(format!(
+                        "{{\"path_id\":{},\"error_code\":{}}}",
+                        path_id, error_code
+                    )),
+                }),
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathStatusAvailable { .. } => QuicFrame::Unknown {
-                frame_type_value: Some(0x3e77),
-                raw_frame_type: 0x3e77,
-                raw: None,
+            Frame::PathStatusAvailable { path_id, seq_num } => {
+                QuicFrame::Unknown {
+                    frame_type_value: Some(0x3e77),
+                    raw_frame_type: 0x3e77,
+                    raw: Some(qlog::events::RawInfo {
+                        length: None,
+                        payload_length: None,
+                        data: Some(format!(
+                            "{{\"path_id\":{},\"seq_num\":{},\"status\":\"available\"}}",
+                            path_id, seq_num
+                        )),
+                    }),
+                }
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathStatusBackup { .. } => QuicFrame::Unknown {
+            Frame::PathStatusBackup { path_id, seq_num } => QuicFrame::Unknown {
                 frame_type_value: Some(0x3e76),
                 raw_frame_type: 0x3e76,
-                raw: None,
+                raw: Some(qlog::events::RawInfo {
+                    length: None,
+                    payload_length: None,
+                    data: Some(format!(
+                        "{{\"path_id\":{},\"seq_num\":{},\"status\":\"backup\"}}",
+                        path_id, seq_num
+                    )),
+                }),
             },
 
             #[cfg(feature = "multipath")]
-            Frame::MaxPathId { .. } => QuicFrame::Unknown {
+            Frame::MaxPathId { path_id } => QuicFrame::Unknown {
                 frame_type_value: Some(0x3e7a),
                 raw_frame_type: 0x3e7a,
-                raw: None,
+                raw: Some(qlog::events::RawInfo {
+                    length: None,
+                    payload_length: None,
+                    data: Some(format!("{{\"path_id\":{}}}", path_id)),
+                }),
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathsBlocked { .. } => QuicFrame::Unknown {
+            Frame::PathsBlocked { path_id } => QuicFrame::Unknown {
                 frame_type_value: Some(0x3e7b),
                 raw_frame_type: 0x3e7b,
-                raw: None,
+                raw: Some(qlog::events::RawInfo {
+                    length: None,
+                    payload_length: None,
+                    data: Some(format!("{{\"path_id\":{}}}", path_id)),
+                }),
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathNewConnectionId { .. } => QuicFrame::Unknown {
-                frame_type_value: Some(0x3e78),
-                raw_frame_type: 0x3e78,
-                raw: None,
+            Frame::PathNewConnectionId { path_id, seq_num, .. } => {
+                QuicFrame::Unknown {
+                    frame_type_value: Some(0x3e78),
+                    raw_frame_type: 0x3e78,
+                    raw: Some(qlog::events::RawInfo {
+                        length: None,
+                        payload_length: None,
+                        data: Some(format!(
+                            "{{\"path_id\":{},\"seq_num\":{}}}",
+                            path_id, seq_num
+                        )),
+                    }),
+                }
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathRetireConnectionId { .. } => QuicFrame::Unknown {
-                frame_type_value: Some(0x3e79),
-                raw_frame_type: 0x3e79,
-                raw: None,
+            Frame::PathRetireConnectionId { path_id, seq_num } => {
+                QuicFrame::Unknown {
+                    frame_type_value: Some(0x3e79),
+                    raw_frame_type: 0x3e79,
+                    raw: Some(qlog::events::RawInfo {
+                        length: None,
+                        payload_length: None,
+                        data: Some(format!(
+                            "{{\"path_id\":{},\"seq_num\":{}}}",
+                            path_id, seq_num
+                        )),
+                    }),
+                }
             },
 
             #[cfg(feature = "multipath")]
-            Frame::PathCidsBlocked { .. } => QuicFrame::Unknown {
+            Frame::PathCidsBlocked { path_id, seq_num } => QuicFrame::Unknown {
                 frame_type_value: Some(0x3e7c),
                 raw_frame_type: 0x3e7c,
-                raw: None,
+                raw: Some(qlog::events::RawInfo {
+                    length: None,
+                    payload_length: None,
+                    data: Some(format!(
+                        "{{\"path_id\":{},\"seq_num\":{}}}",
+                        path_id, seq_num
+                    )),
+                }),
             },
         }
     }
