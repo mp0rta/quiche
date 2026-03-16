@@ -3518,6 +3518,16 @@ impl<F: BufFactory> Connection<F> {
 
         // Process acked frames. Note that several packets from several paths
         // might have been acked by the received packet.
+        //
+        // These vecs accumulate path_id values for PATH_ABANDON / PATH_STATUS
+        // acked frames that need per-path state updates after the loop ends
+        // (since we cannot call self.paths.iter_mut() while already iterating
+        // it mutably).
+        #[cfg(feature = "multipath")]
+        let mut mp_abandon_acked: Vec<u64> = Vec::new();
+        #[cfg(feature = "multipath")]
+        let mut mp_status_acked: Vec<u64> = Vec::new();
+
         for (_, p) in self.paths.iter_mut() {
             while let Some(acked) = p.recovery.next_acked_frame(epoch) {
                 match acked {
@@ -3662,6 +3672,17 @@ impl<F: BufFactory> Connection<F> {
                         self.handshake_done_acked = true;
                     },
 
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathAbandon { path_id, .. } => {
+                        mp_abandon_acked.push(path_id);
+                    },
+
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathStatusAvailable { path_id, .. } |
+                    frame::Frame::PathStatusBackup { path_id, .. } => {
+                        mp_status_acked.push(path_id);
+                    },
+
                     frame::Frame::ResetStream { stream_id, .. } => {
                         let stream = match self.streams.get_mut(stream_id) {
                             Some(v) => v,
@@ -3704,6 +3725,30 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     _ => (),
+                }
+            }
+        }
+
+        // Apply PATH_ABANDON / PATH_STATUS acked state updates that were
+        // deferred from inside the acked-frames loop above (to avoid nested
+        // mutable borrows of self.paths).
+        #[cfg(feature = "multipath")]
+        for mp_path_id in mp_abandon_acked {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id {
+                    p.mp_path_abandon_pending = false;
+                    p.mp_path_abandon_acked = true;
+                    break;
+                }
+            }
+        }
+        #[cfg(feature = "multipath")]
+        for mp_path_id in mp_status_acked {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id {
+                    p.mp_path_status_pending = false;
+                    p.mp_path_status_acked = true;
+                    break;
                 }
             }
         }
@@ -4189,6 +4234,15 @@ impl<F: BufFactory> Connection<F> {
         let crypto_ctx = &mut self.crypto_ctx[epoch];
 
         // Process lost frames. There might be several paths having lost frames.
+        //
+        // Vecs to accumulate path_id values for PATH_ABANDON / PATH_STATUS
+        // lost frames requiring retransmission (deferred to avoid nested
+        // mutable borrows of self.paths).
+        #[cfg(feature = "multipath")]
+        let mut mp_abandon_lost: Vec<u64> = Vec::new();
+        #[cfg(feature = "multipath")]
+        let mut mp_status_lost: Vec<u64> = Vec::new();
+
         for (_, p) in self.paths.iter_mut() {
             while let Some(lost) = p.recovery.next_lost_frame(epoch) {
                 match lost {
@@ -4300,6 +4354,17 @@ impl<F: BufFactory> Connection<F> {
                         self.handshake_done_sent = false;
                     },
 
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathAbandon { path_id, .. } => {
+                        mp_abandon_lost.push(path_id);
+                    },
+
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathStatusAvailable { path_id, .. } |
+                    frame::Frame::PathStatusBackup { path_id, .. } => {
+                        mp_status_lost.push(path_id);
+                    },
+
                     frame::Frame::MaxStreamData { stream_id, .. } => {
                         if self.streams.get(stream_id).is_some() {
                             self.streams.insert_almost_full(stream_id);
@@ -4338,6 +4403,29 @@ impl<F: BufFactory> Connection<F> {
                 }
             }
         }
+
+        // Apply PATH_ABANDON / PATH_STATUS lost state updates deferred from
+        // inside the lost-frames loop (to avoid nested mutable borrows of
+        // self.paths).
+        #[cfg(feature = "multipath")]
+        for mp_path_id in mp_abandon_lost {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id && !p.mp_path_abandon_acked {
+                    p.mp_path_abandon_pending = true;
+                    break;
+                }
+            }
+        }
+        #[cfg(feature = "multipath")]
+        for mp_path_id in mp_status_lost {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id && !p.mp_path_status_acked {
+                    p.mp_path_status_pending = true;
+                    break;
+                }
+            }
+        }
+
         self.check_tx_buffered_invariant();
 
         let is_app_limited = self.delivery_rate_check_if_app_limited();
@@ -4623,7 +4711,7 @@ impl<F: BufFactory> Connection<F> {
 
         // Generate PATH_ABANDON frames for paths that are closing.
         #[cfg(feature = "multipath")]
-        if self.multipath_enabled && pkt_type == packet::Type::Short {
+        if self.multipath_enabled && pkt_type == Type::Short {
             let abandon_paths: Vec<(usize, u64)> = self
                 .paths
                 .iter()
