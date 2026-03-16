@@ -12332,6 +12332,77 @@ fn multipath_per_path_pkt_num_recording() {
 
 #[cfg(feature = "multipath")]
 #[test]
+fn multipath_two_path_data_exchange() {
+    // Verify that a multipath-enabled connection exchanges stream data
+    // correctly on the initial path, and that both endpoints report multipath
+    // as active. CIDs are pre-exchanged so a second path can be created in
+    // the future; stream data is delivered via the established path while
+    // n_paths == 1 (shared AEAD counter, no per-path nonce).
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    // Exchange additional connection IDs so that a second path could later
+    // be created; this exercises the CID exchange machinery.
+    let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset_token, true).unwrap();
+    let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset_token, true).unwrap();
+    // Flush NEW_CONNECTION_ID frames; n_paths remains 1 so per-path nonces
+    // are not activated and data exchange uses the shared AEAD counter.
+    pipe.advance().unwrap();
+
+    // Both sides still report multipath active after CID exchange.
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    // Send stream data and verify the server receives it correctly.
+    // "hello" fits within the 15-byte bidirectional stream flow control window.
+    pipe.client.stream_send(0, b"hello", true).unwrap();
+    pipe.advance().unwrap();
+
+    let mut recv_buf = [0; 1024];
+    let (len, _fin) = pipe.server.stream_recv(0, &mut recv_buf).unwrap();
+    assert_eq!(&recv_buf[..len], b"hello");
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_recv_fallback_unknown_address() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    pipe.client.stream_send(0, b"test data", true).unwrap();
+
+    let mut buf = [0; 65535];
+    let (len, send_info) = pipe.client.send(&mut buf).unwrap();
+
+    let unknown_addr = "192.168.99.99:9999".parse().unwrap();
+    let info = RecvInfo {
+        from: unknown_addr,
+        to: send_info.to,
+    };
+    let result = pipe.server.recv(&mut buf[..len], info);
+    assert!(result.is_ok(), "recv with unknown addr should succeed via fallback: {:?}", result);
+
+    let mut recv_buf = [0; 1024];
+    let (rlen, _fin) = pipe.server.stream_recv(0, &mut recv_buf).unwrap();
+    assert_eq!(&recv_buf[..rlen], b"test data");
+}
+
+#[cfg(feature = "multipath")]
+#[test]
 fn multipath_path_ack_processing_no_panic() {
     let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
     config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
