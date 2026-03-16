@@ -22,6 +22,9 @@ boringssl-boring-crate = ["quiche/boringssl-boring-crate"]
 # Enable sfv support.
 sfv = ["quiche/sfv"]
 
+# Enable multipath QUIC support.
+multipath = ["quiche/multipath"]
+
 default = ["qlog", "sfv"]
 
 [dependencies]

@@ -161,6 +161,14 @@ pub fn connect(
         config.enable_dgram(true, 1000, 1000);
     }
 
+    #[cfg(feature = "multipath")]
+    if conn_args.multipath {
+        config.set_initial_max_path_id(4);
+        config.set_multipath_scheduler(
+            quiche::multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+        );
+    }
+
     let mut http_conn: Option<Box<dyn HttpConn>> = None;
 
     let mut app_proto_selected = false;

@@ -164,6 +164,14 @@ fn main() {
         config.enable_dgram(true, 1000, 1000);
     }
 
+    #[cfg(feature = "multipath")]
+    if conn_args.multipath {
+        config.set_initial_max_path_id(4);
+        config.set_multipath_scheduler(
+            quiche::multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+        );
+    }
+
     let rng = SystemRandom::new();
     let conn_id_seed =
         ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
