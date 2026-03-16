@@ -254,12 +254,10 @@ pub struct Path {
 
     /// Per-path packet number space for Application Data epoch.
     #[cfg(feature = "multipath")]
-    #[allow(dead_code)]
     pub(crate) app_pkt_num_space: crate::packet::PktNumSpace,
 
     /// Per-path packet number skip logic.
     #[cfg(feature = "multipath")]
-    #[allow(dead_code)]
     pub(crate) mp_pkt_num_manager: crate::packet::PktNumManager,
 
     /// True when a PATH_ABANDON frame needs to be sent for this path.

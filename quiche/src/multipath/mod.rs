@@ -14,7 +14,6 @@ use crate::recovery::RecoveryOps;
 /// Iterates all paths in the `PathMap`, skips any that are already closed
 /// (`mp_closed`), and populates `buf` with a snapshot of each path's
 /// scheduling-relevant metrics.
-#[allow(dead_code)]
 pub(crate) fn refresh_path_info(
     paths: &PathMap,
     buf: &mut Vec<scheduler::PathInfo>,
