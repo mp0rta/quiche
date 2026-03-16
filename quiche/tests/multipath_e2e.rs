@@ -243,3 +243,96 @@ fn multipath_second_path_creation() {
         stderr
     );
 }
+
+#[test]
+#[ignore]
+fn multipath_data_transfer_two_paths() {
+    if !check_netns_ready() {
+        return;
+    }
+
+    // Create 1MB test file
+    let (_dir, root) = setup_test_root(1_000_000);
+
+    let server = start_server("mp-server", "10.0.3.1", &root);
+    wait_for_server_ready("mp-server", PORT, Duration::from_secs(5));
+
+    // Create output directory for downloaded response
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_path = output_dir.path().to_str().unwrap();
+
+    let output = start_client(
+        "mp-client",
+        &format!("https://10.0.3.1:{}/testfile", PORT),
+        &[
+            "--second-path",
+            "10.0.2.1",
+            "--dump-responses",
+            output_path,
+        ],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _server_stderr = collect_server_stderr(server);
+
+    eprintln!("--- client stderr ---\n{}", stderr);
+
+    assert!(
+        output.status.success(),
+        "client should exit with code 0, got {:?}\nstderr: {}",
+        output.status,
+        stderr
+    );
+
+    // Verify downloaded file matches original
+    let original =
+        std::fs::read(std::path::Path::new(&root).join("testfile")).unwrap();
+    // quiche-client dumps responses with URL-encoded filenames.
+    // We expect exactly one response file for our single request.
+    let response_files: Vec<_> = std::fs::read_dir(output_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        response_files.len(),
+        1,
+        "should have exactly one response file, got {:?}",
+        response_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+    let downloaded = std::fs::read(response_files[0].path()).unwrap();
+    assert_eq!(
+        original.len(),
+        downloaded.len(),
+        "downloaded file size should match original"
+    );
+    assert_eq!(
+        original, downloaded,
+        "downloaded file content should match original"
+    );
+
+    // Both paths should have sent data with non-zero byte counts
+    for path_id in 0..=1 {
+        let marker = format!("MP_PATH path_id={}", path_id);
+        let line = stderr
+            .lines()
+            .find(|l| l.contains(&marker))
+            .unwrap_or_else(|| {
+                panic!(
+                    "should have {} in stats\nstderr: {}",
+                    marker, stderr
+                )
+            });
+        // Verify sent_bytes > 0
+        let sent_bytes: u64 = line
+            .split_whitespace()
+            .find_map(|token| {
+                token.strip_prefix("sent_bytes=")?.parse().ok()
+            })
+            .expect("MP_PATH line should contain sent_bytes=N");
+        assert!(
+            sent_bytes > 0,
+            "path_id={} should have sent_bytes > 0, got {}",
+            path_id, sent_bytes
+        );
+    }
+}
