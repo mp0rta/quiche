@@ -306,6 +306,7 @@ Options:
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   --multipath              Enable multipath QUIC.
+  --second-path ADDRESS    Bind a second socket and create a multipath path from this address.
   -h --help                Show this screen.
 ";
 
@@ -326,6 +327,7 @@ pub struct ClientArgs {
     pub source_port: u16,
     pub perform_migration: bool,
     pub send_priority_update: bool,
+    pub second_path: Option<String>,
 }
 
 impl Args for ClientArgs {
@@ -403,6 +405,12 @@ impl Args for ClientArgs {
 
         let send_priority_update = args.get_bool("--send-priority-update");
 
+        let second_path = if !args.get_str("--second-path").is_empty() {
+            Some(args.get_str("--second-path").to_string())
+        } else {
+            None
+        };
+
         ClientArgs {
             version,
             dump_response_path,
@@ -419,6 +427,7 @@ impl Args for ClientArgs {
             source_port,
             perform_migration,
             send_priority_update,
+            second_path,
         }
     }
 }
@@ -441,6 +450,7 @@ impl Default for ClientArgs {
             source_port: 0,
             perform_migration: false,
             send_priority_update: false,
+            second_path: None,
         }
     }
 }
