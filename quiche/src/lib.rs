@@ -4621,6 +4621,62 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Generate PATH_ABANDON frames for paths that are closing.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && pkt_type == packet::Type::Short {
+            let abandon_paths: Vec<(usize, u64)> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| p.mp_path_abandon_pending)
+                .map(|(i, p)| (i, p.path_id))
+                .collect();
+
+            for (pid, mp_path_id) in abandon_paths {
+                let frame = frame::Frame::PathAbandon {
+                    path_id: mp_path_id,
+                    error_code: 0,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.paths.get_mut(pid).unwrap().mp_path_abandon_pending =
+                        false;
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            let status_paths: Vec<(usize, u64, path::PathAppStatus, u64)> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| p.mp_path_status_pending)
+                .map(|(i, p)| {
+                    (i, p.path_id, p.app_status, p.mp_path_status_seq_num)
+                })
+                .collect();
+
+            for (pid, mp_path_id, status, seq_num) in status_paths {
+                let frame = match status {
+                    path::PathAppStatus::Available =>
+                        frame::Frame::PathStatusAvailable {
+                            path_id: mp_path_id,
+                            seq_num,
+                        },
+                    path::PathAppStatus::Backup =>
+                        frame::Frame::PathStatusBackup {
+                            path_id: mp_path_id,
+                            seq_num,
+                        },
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.paths.get_mut(pid).unwrap().mp_path_status_pending =
+                        false;
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+        }
+
         // Limit output packet size by congestion window size.
         left = cmp::min(
             left,

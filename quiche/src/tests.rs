@@ -12525,3 +12525,42 @@ fn multipath_set_path_status_sets_pending() {
     assert!(path.mp_path_status_pending, "set_path_status should set mp_path_status_pending");
     assert_eq!(path.app_status, path::PathAppStatus::Backup);
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_abandon_frame_generated() {
+    let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+    config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+    config.set_application_protos(&[b"proto"]).unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.multipath_enabled = true;
+    pipe.client.paths.active_path_count = 2;
+
+    let (idx, _) = pipe.client.paths.iter().next().unwrap();
+    pipe.client.paths.get_mut(idx).unwrap().path_id = 0;
+
+    pipe.client.close_path(0).unwrap();
+
+    assert!(pipe.client.paths.get(idx).unwrap().mp_path_abandon_pending);
+
+    // Send a packet — this should include the PATH_ABANDON frame
+    pipe.client.stream_send(4, b"x", false).unwrap();
+    let mut buf = [0u8; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    assert!(len > 0, "should produce a packet with PATH_ABANDON");
+
+    // After sending, the pending flag should be cleared (frame was sent)
+    assert!(
+        !pipe.client.paths.get(idx).unwrap().mp_path_abandon_pending,
+        "mp_path_abandon_pending should be cleared after sending frame"
+    );
+}
