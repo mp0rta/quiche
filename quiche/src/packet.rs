@@ -671,6 +671,27 @@ pub fn decrypt_pkt<'a>(
     Ok(b.get_bytes(payload_len)?)
 }
 
+#[cfg(feature = "multipath")]
+pub fn decrypt_pkt_mp<'a>(
+    b: &'a mut octets::OctetsMut, pn: u64, path_id: u32, pn_len: usize,
+    payload_len: usize, aead: &crypto::Open,
+) -> Result<octets::Octets<'a>> {
+    let payload_offset = b.off();
+
+    let (header, mut payload) = b.split_at(payload_offset)?;
+
+    let payload_len = payload_len
+        .checked_sub(pn_len)
+        .ok_or(Error::InvalidPacket)?;
+
+    let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
+
+    let payload_len =
+        aead.open_with_mp_nonce(pn, path_id, header.as_ref(), ciphertext.as_mut())?;
+
+    Ok(b.get_bytes(payload_len)?)
+}
+
 pub fn encrypt_hdr(
     b: &mut octets::OctetsMut, pn_len: usize, payload: &[u8], aead: &crypto::Seal,
 ) -> Result<()> {
@@ -705,6 +726,28 @@ pub fn encrypt_pkt(
 
     let ciphertext_len = aead.seal_with_u64_counter(
         pn,
+        header.as_ref(),
+        payload.as_mut(),
+        payload_len,
+        extra_in,
+    )?;
+
+    encrypt_hdr(&mut header, pn_len, payload.as_ref(), aead)?;
+
+    Ok(payload_offset + ciphertext_len)
+}
+
+#[cfg(feature = "multipath")]
+pub fn encrypt_pkt_mp(
+    b: &mut octets::OctetsMut, pn: u64, path_id: u32, pn_len: usize,
+    payload_len: usize, payload_offset: usize, extra_in: Option<&[u8]>,
+    aead: &mut crypto::Seal,
+) -> Result<usize> {
+    let (mut header, mut payload) = b.split_at(payload_offset)?;
+
+    let ciphertext_len = aead.seal_with_mp_nonce(
+        pn,
+        path_id,
         header.as_ref(),
         payload.as_mut(),
         payload_len,
