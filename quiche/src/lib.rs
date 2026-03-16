@@ -415,6 +415,8 @@ use qlog::events::EventImportance;
 #[cfg(feature = "qlog")]
 use qlog::events::EventType;
 #[cfg(feature = "qlog")]
+use qlog::events::GenericEventType;
+#[cfg(feature = "qlog")]
 use qlog::events::RawInfo;
 
 use smallvec::SmallVec;
@@ -1959,6 +1961,11 @@ const QLOG_METRICS: EventType =
 #[cfg(feature = "qlog")]
 const QLOG_CONNECTION_CLOSED: EventType =
     EventType::ConnectivityEventType(ConnectivityEventType::ConnectionClosed);
+
+#[cfg(feature = "qlog")]
+#[cfg(feature = "multipath")]
+const QLOG_MULTIPATH: EventType =
+    EventType::GenericEventType(GenericEventType::Marker);
 
 #[cfg(feature = "qlog")]
 struct QlogInfo {
@@ -7988,6 +7995,15 @@ impl<F: BufFactory> Connection<F> {
         self.paths.next_path_id += 1;
         self.paths.active_path_count += 1;
 
+        #[cfg(feature = "qlog")]
+        qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
+            let ev_data = EventData::Marker {
+                marker_type: "multipath:path_created".to_string(),
+                message: Some(format!("path_id={}", next_id)),
+            };
+            q.add_event_data_with_instant(ev_data, Instant::now()).ok();
+        });
+
         Ok(next_id)
     }
 
@@ -8021,6 +8037,15 @@ impl<F: BufFactory> Connection<F> {
         path.mp_path_abandon_pending = true;
         self.paths.active_path_count -= 1;
 
+        #[cfg(feature = "qlog")]
+        qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
+            let ev_data = EventData::Marker {
+                marker_type: "multipath:path_closed".to_string(),
+                message: Some(format!("path_id={}", path_id)),
+            };
+            q.add_event_data_with_instant(ev_data, Instant::now()).ok();
+        });
+
         Ok(())
     }
 
@@ -8048,6 +8073,25 @@ impl<F: BufFactory> Connection<F> {
         path.app_status = status;
         path.mp_path_status_pending = true;
         path.mp_path_status_seq_num += 1;
+
+        #[cfg(feature = "qlog")]
+        {
+            let status_str = match status {
+                path::PathAppStatus::Available => "available",
+                path::PathAppStatus::Backup => "backup",
+            };
+
+            qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
+                let ev_data = EventData::Marker {
+                    marker_type: "multipath:path_status_changed".to_string(),
+                    message: Some(format!(
+                        "path_id={} status={}",
+                        path_id, status_str
+                    )),
+                };
+                q.add_event_data_with_instant(ev_data, Instant::now()).ok();
+            });
+        }
 
         Ok(())
     }

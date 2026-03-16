@@ -302,6 +302,19 @@ impl From<EventType> for EventImportance {
             EventType::QpackEventType(QpackEventType::InstructionParsed) =>
                 EventImportance::Base,
 
+            EventType::GenericEventType(GenericEventType::ConnectionError) =>
+                EventImportance::Base,
+            EventType::GenericEventType(GenericEventType::ApplicationError) =>
+                EventImportance::Base,
+            EventType::GenericEventType(GenericEventType::InternalError) =>
+                EventImportance::Base,
+            EventType::GenericEventType(GenericEventType::InternalWarning) =>
+                EventImportance::Base,
+            EventType::GenericEventType(GenericEventType::Message) =>
+                EventImportance::Base,
+            EventType::GenericEventType(GenericEventType::Marker) =>
+                EventImportance::Base,
+
             _ => unimplemented!(),
         }
     }
