@@ -261,6 +261,26 @@ pub struct Path {
     #[cfg(feature = "multipath")]
     #[allow(dead_code)]
     pub(crate) mp_pkt_num_manager: crate::packet::PktNumManager,
+
+    /// True when a PATH_ABANDON frame needs to be sent for this path.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_abandon_pending: bool,
+
+    /// True when the PATH_ABANDON frame has been acked.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_abandon_acked: bool,
+
+    /// True when a PATH_STATUS frame needs to be sent for this path.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_status_pending: bool,
+
+    /// True when the last PATH_STATUS frame has been acked.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_status_acked: bool,
+
+    /// Sequence number for PATH_STATUS frames (monotonically increasing).
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_status_seq_num: u64,
 }
 
 impl Path {
@@ -342,6 +362,16 @@ impl Path {
             app_pkt_num_space: crate::packet::PktNumSpace::new(),
             #[cfg(feature = "multipath")]
             mp_pkt_num_manager: crate::packet::PktNumManager::new(),
+            #[cfg(feature = "multipath")]
+            mp_path_abandon_pending: false,
+            #[cfg(feature = "multipath")]
+            mp_path_abandon_acked: false,
+            #[cfg(feature = "multipath")]
+            mp_path_status_pending: false,
+            #[cfg(feature = "multipath")]
+            mp_path_status_acked: false,
+            #[cfg(feature = "multipath")]
+            mp_path_status_seq_num: 0,
         }
     }
 
