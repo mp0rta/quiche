@@ -186,6 +186,10 @@ impl PacketKey {
         Ok(plaintext_len + olen as usize)
     }
 
+    pub fn nonce(&self) -> &[u8] {
+        &self.nonce
+    }
+
     pub fn open_with_nonce(
         &self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {

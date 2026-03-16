@@ -214,6 +214,20 @@ impl Open {
 
         self.packet.open_with_u64_counter(counter, ad, buf)
     }
+
+    #[cfg(feature = "multipath")]
+    pub fn open_with_mp_nonce(
+        &self, pkt_num: u64, path_id: u32, ad: &[u8], buf: &mut [u8],
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            return self.open_with_u64_counter(pkt_num, ad, buf);
+        }
+
+        let nonce = crate::multipath::pktns::compute_nonce_mp(
+            self.packet.nonce(), pkt_num, path_id,
+        );
+        self.packet.open_with_nonce(&nonce, ad, buf)
+    }
 }
 
 pub struct Seal {
@@ -311,6 +325,21 @@ impl Seal {
 
         self.packet
             .seal_with_u64_counter(counter, ad, buf, in_len, extra_in)
+    }
+
+    #[cfg(feature = "multipath")]
+    pub fn seal_with_mp_nonce(
+        &mut self, pkt_num: u64, path_id: u32, ad: &[u8], buf: &mut [u8],
+        in_len: usize, extra_in: Option<&[u8]>,
+    ) -> Result<usize> {
+        if cfg!(feature = "fuzzing") {
+            return self.seal_with_u64_counter(pkt_num, ad, buf, in_len, extra_in);
+        }
+
+        let nonce = crate::multipath::pktns::compute_nonce_mp(
+            self.packet.nonce(), pkt_num, path_id,
+        );
+        self.packet.seal_with_nonce(&nonce, ad, buf, in_len, extra_in)
     }
 }
 

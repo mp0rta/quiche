@@ -13,9 +13,7 @@
 /// is a varint (up to 62 bits) but only the lower 32 bits are used in the
 /// nonce computation.
 ///
-/// Currently unused — will be called when per-path encryption is
-/// integrated in the packet protection layer.
-#[allow(dead_code)]
+/// Used by the crypto layer to compute per-path multipath AEAD nonces.
 pub fn compute_nonce_mp(
     iv: &[u8],
     pkt_num: u64,
