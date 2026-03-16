@@ -96,6 +96,21 @@ pub fn connect(
         None
     };
 
+    let mp_socket = if let Some(ref addr) = args.second_path {
+        let bind_addr: std::net::SocketAddr =
+            format!("{}:0", addr).parse().unwrap();
+        let mut socket = mio::net::UdpSocket::bind(bind_addr).unwrap();
+        poll.registry()
+            .register(&mut socket, mio::Token(2), mio::Interest::READABLE)
+            .unwrap();
+        Some(socket)
+    } else {
+        None
+    };
+
+    #[cfg(feature = "multipath")]
+    let mut mp_path_created = false;
+
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(args.version).unwrap();
 
@@ -281,6 +296,8 @@ pub fn connect(
 
                 mio::Token(1) => migrate_socket.as_ref().unwrap(),
 
+                mio::Token(2) => mp_socket.as_ref().unwrap(),
+
                 _ => unreachable!(),
             };
 
@@ -433,12 +450,21 @@ pub fn connect(
         // Handle path events.
         while let Some(qe) = conn.path_event_next() {
             match qe {
-                quiche::PathEvent::New(..) => unreachable!(),
+                quiche::PathEvent::New(local_addr, peer_addr) => {
+                    info!(
+                        "New path ({local_addr}, {peer_addr}) — probing"
+                    );
+                    conn.probe_path(local_addr, peer_addr).ok();
+                },
 
                 quiche::PathEvent::Validated(local_addr, peer_addr) => {
                     info!("Path ({local_addr}, {peer_addr}) is now validated");
-                    conn.migrate(local_addr, peer_addr).unwrap();
-                    migrated = true;
+                    if args.perform_migration && !migrated {
+                        conn.migrate(local_addr, peer_addr).unwrap();
+                        migrated = true;
+                    }
+                    // For multipath (--second-path), validated paths
+                    // remain as additional paths without migration.
                 },
 
                 quiche::PathEvent::FailedValidation(local_addr, peer_addr) => {
@@ -493,11 +519,39 @@ pub fn connect(
             new_path_probed = true;
         }
 
+        // Create a second multipath path when --second-path is specified.
+        #[cfg(feature = "multipath")]
+        if !mp_path_created &&
+            mp_socket.is_some() &&
+            conn.is_established() &&
+            conn.is_multipath() &&
+            scid_sent &&
+            conn.available_dcids() > 0
+        {
+            let additional_local_addr =
+                mp_socket.as_ref().unwrap().local_addr().unwrap();
+            match conn.create_path(additional_local_addr, peer_addr) {
+                Ok(path_id) => {
+                    info!(
+                        "Multipath: created path_id={} from {}",
+                        path_id, additional_local_addr
+                    );
+                    mp_path_created = true;
+                },
+                Err(e) => {
+                    error!("Multipath: create_path failed: {e:?}");
+                },
+            }
+        }
+
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
         let mut sockets = vec![&socket];
         if let Some(migrate_socket) = migrate_socket.as_ref() {
             sockets.push(migrate_socket);
+        }
+        if let Some(mp_socket) = mp_socket.as_ref() {
+            sockets.push(mp_socket);
         }
 
         for socket in sockets {
