@@ -155,3 +155,45 @@ fn collect_server_stderr(mut child: Child) -> String {
     child.wait().ok();
     stderr
 }
+
+#[test]
+#[ignore]
+fn multipath_negotiation_e2e() {
+    if !check_netns_ready() {
+        return;
+    }
+
+    // Create a minimal test root with an index.html
+    let (_dir, root) = setup_test_root(64);
+    let index_path = std::path::Path::new(&root).join("index.html");
+    std::fs::write(&index_path, b"hello").unwrap();
+
+    // Start server
+    let server = start_server("mp-server", "10.0.3.1", &root);
+    wait_for_server_ready("mp-server", PORT, Duration::from_secs(5));
+
+    // Start client — single path, just negotiate multipath
+    let output = start_client(
+        "mp-client",
+        &format!("https://10.0.3.1:{}/index.html", PORT),
+        &[],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _server_stderr = collect_server_stderr(server);
+
+    eprintln!("--- client stderr ---\n{}", stderr);
+
+    assert!(
+        output.status.success(),
+        "client should exit with code 0, got {:?}\nstderr: {}",
+        output.status,
+        stderr
+    );
+
+    assert!(
+        stderr.contains("MP_PATH path_id=0"),
+        "client should output MP_PATH stats\nstderr: {}",
+        stderr
+    );
+}
