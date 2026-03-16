@@ -197,3 +197,49 @@ fn multipath_negotiation_e2e() {
         stderr
     );
 }
+
+#[test]
+#[ignore]
+fn multipath_second_path_creation() {
+    if !check_netns_ready() {
+        return;
+    }
+
+    let (_dir, root) = setup_test_root(64);
+    let index_path = std::path::Path::new(&root).join("index.html");
+    std::fs::write(&index_path, b"hello").unwrap();
+
+    let server = start_server("mp-server", "10.0.3.1", &root);
+    wait_for_server_ready("mp-server", PORT, Duration::from_secs(5));
+
+    // Client with --second-path to create a second multipath path
+    let output = start_client(
+        "mp-client",
+        &format!("https://10.0.3.1:{}/index.html", PORT),
+        &["--second-path", "10.0.2.1"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _server_stderr = collect_server_stderr(server);
+
+    eprintln!("--- client stderr ---\n{}", stderr);
+
+    assert!(
+        output.status.success(),
+        "client should exit with code 0, got {:?}\nstderr: {}",
+        output.status,
+        stderr
+    );
+
+    // Both paths should appear in stats
+    assert!(
+        stderr.contains("MP_PATH path_id=0"),
+        "should have path_id=0 in stats\nstderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("MP_PATH path_id=1"),
+        "should have path_id=1 in stats (second path)\nstderr: {}",
+        stderr
+    );
+}
