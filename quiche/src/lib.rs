@@ -3254,13 +3254,52 @@ impl<F: BufFactory> Connection<F> {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
 
-        let pn = packet::decode_pkt_num(
-            self.pkt_num_spaces[epoch].largest_rx_pkt_num,
-            hdr.pkt_num,
-            hdr.pkt_num_len,
-        );
-
         let pn_len = hdr.pkt_num_len;
+
+        // Multipath per-path packet number decode: use per-path counter
+        // when multipath is active, Short packet, multiple paths, and
+        // we can identify the path from addresses.
+        #[cfg(feature = "multipath")]
+        let mp_recv_ctx: Option<(u64, u32)> = if self.multipath_enabled &&
+            hdr.ty == Type::Short &&
+            self.paths.len() > 1 &&
+            recv_pid.is_some()
+        {
+            let pid = recv_pid.unwrap();
+            if let Ok(recv_path) = self.paths.get(pid) {
+                Some((
+                    recv_path.app_pkt_num_space.largest_rx_pkt_num,
+                    recv_path.path_id as u32,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "multipath"))]
+        let mp_recv_ctx: Option<(u64, u32)> = None;
+
+        let (pn, used_per_path_pn) = if let Some((per_path_largest, _path_id)) = mp_recv_ctx {
+            (
+                packet::decode_pkt_num(
+                    per_path_largest,
+                    hdr.pkt_num,
+                    hdr.pkt_num_len,
+                ),
+                true,
+            )
+        } else {
+            (
+                packet::decode_pkt_num(
+                    self.pkt_num_spaces[epoch].largest_rx_pkt_num,
+                    hdr.pkt_num,
+                    hdr.pkt_num_len,
+                ),
+                false,
+            )
+        };
 
         trace!(
             "{} rx pkt {:?} len={} pn={} {}",
@@ -3312,18 +3351,112 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Decrypt: try per-path mp nonce first, fallback to shared.
+        #[cfg(feature = "multipath")]
+        let (mut payload, pn, used_per_path_pn) = if used_per_path_pn {
+            let (_per_path_largest, path_id) = mp_recv_ctx.unwrap();
+
+            // Snapshot payload for fallback (AEAD decrypts in-place).
+            // b.off() is at the payload start after header parsing.
+            let payload_start = b.off();
+            let ciphertext_len = payload_len - pn_len;
+            let snapshot: Vec<u8> = b.buf()[payload_start..payload_start + ciphertext_len]
+                .to_vec();
+
+            match packet::decrypt_pkt_mp(
+                &mut b, pn, path_id, pn_len, payload_len, aead,
+            ) {
+                Ok(payload) => (payload, pn, true),
+
+                Err(_) => {
+                    // decrypt_pkt_mp uses split_at internally which
+                    // creates temporary sub-borrows. On Err, those
+                    // borrows are dropped and b.off() is still at
+                    // payload_start (split_at doesn't advance the
+                    // original OctetsMut's offset permanently on error
+                    // since the function takes &mut b by reborrow).
+                    //
+                    // However, the buffer CONTENT is corrupted by the
+                    // failed AEAD open. Restore from snapshot using
+                    // split_at to get temporary mutable access.
+                    debug_assert_eq!(b.off(), payload_start);
+
+                    // Restore the corrupted payload content. Use
+                    // split_at (which reborrows `b` temporarily) to
+                    // get mutable access to the payload region.
+                    {
+                        let (_, mut payload_region) =
+                            b.split_at(payload_start).map_err(|e| {
+                                drop_pkt_on_err(
+                                    e.into(), self.recv_count,
+                                    self.is_server, &self.trace_id,
+                                )
+                            })?;
+                        payload_region.as_mut()[..snapshot.len()]
+                            .copy_from_slice(&snapshot);
+                    }
+
+                    // Re-decode with shared counter.
+                    let pn = packet::decode_pkt_num(
+                        self.pkt_num_spaces[epoch].largest_rx_pkt_num,
+                        hdr.pkt_num,
+                        hdr.pkt_num_len,
+                    );
+
+                    let payload = packet::decrypt_pkt(
+                        &mut b, pn, pn_len, payload_len, aead,
+                    )
+                    .map_err(|e| {
+                        drop_pkt_on_err(
+                            e, self.recv_count, self.is_server, &self.trace_id,
+                        )
+                    })?;
+
+                    (payload, pn, false)
+                },
+            }
+        } else {
+            let payload = packet::decrypt_pkt(
+                &mut b, pn, pn_len, payload_len, aead,
+            )
+            .map_err(|e| {
+                drop_pkt_on_err(
+                    e, self.recv_count, self.is_server, &self.trace_id,
+                )
+            })?;
+
+            (payload, pn, false)
+        };
+
+        #[cfg(not(feature = "multipath"))]
         let mut payload = packet::decrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            aead,
+            &mut b, pn, pn_len, payload_len, aead,
         )
         .map_err(|e| {
-            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+            drop_pkt_on_err(
+                e, self.recv_count, self.is_server, &self.trace_id,
+            )
         })?;
 
-        if self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn) {
+        #[cfg(feature = "multipath")]
+        let is_dup = if used_per_path_pn {
+            if let Some(pid) = recv_pid {
+                if let Ok(rp) = self.paths.get_mut(pid) {
+                    rp.app_pkt_num_space.recv_pkt_num.contains(pn)
+                } else {
+                    self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn)
+                }
+            } else {
+                self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn)
+            }
+        } else {
+            self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn)
+        };
+
+        #[cfg(not(feature = "multipath"))]
+        let is_dup = self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn);
+
+        if is_dup {
             trace!("{} ignored duplicate packet {}", self.trace_id, pn);
             return Err(Error::Done);
         }
@@ -3785,19 +3918,23 @@ impl<F: BufFactory> Connection<F> {
 
         // We only record the time of arrival of the largest packet number
         // that still needs to be acked, to be used for ACK delay calculation.
-        if self.pkt_num_spaces[epoch].recv_pkt_need_ack.last() < Some(pn) {
-            self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
+        // When per-path packet numbers are used, the per-path space is updated
+        // in the multipath block below instead.
+        if !used_per_path_pn {
+            if self.pkt_num_spaces[epoch].recv_pkt_need_ack.last() < Some(pn) {
+                self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
+            }
+
+            self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
+
+            self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
+
+            self.pkt_num_spaces[epoch].ack_elicited =
+                cmp::max(self.pkt_num_spaces[epoch].ack_elicited, ack_elicited);
+
+            self.pkt_num_spaces[epoch].largest_rx_pkt_num =
+                cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
         }
-
-        self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
-
-        self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
-
-        self.pkt_num_spaces[epoch].ack_elicited =
-            cmp::max(self.pkt_num_spaces[epoch].ack_elicited, ack_elicited);
-
-        self.pkt_num_spaces[epoch].largest_rx_pkt_num =
-            cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
 
         // For multipath, also record the packet number in the per-path
         // application data packet number space so that PATH_ACK frames can be
