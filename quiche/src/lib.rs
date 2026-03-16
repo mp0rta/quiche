@@ -5592,6 +5592,31 @@ impl<F: BufFactory> Connection<F> {
             None => return Err(Error::InvalidState),
         };
 
+        #[cfg(feature = "multipath")]
+        let written = if use_per_path_pn {
+            packet::encrypt_pkt_mp(
+                &mut b,
+                pn,
+                path.path_id as u32,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?
+        } else {
+            packet::encrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                aead,
+            )?
+        };
+
+        #[cfg(not(feature = "multipath"))]
         let written = packet::encrypt_pkt(
             &mut b,
             pn,
