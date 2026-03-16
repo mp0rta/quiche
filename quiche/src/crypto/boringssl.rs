@@ -116,6 +116,40 @@ impl PacketKey {
         Ok(out_len)
     }
 
+    pub fn open_with_nonce(
+        &self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
+    ) -> Result<usize> {
+        let tag_len = self.alg.tag_len();
+
+        let mut out_len = match buf.len().checked_sub(tag_len) {
+            Some(n) => n,
+            None => return Err(Error::CryptoFail),
+        };
+
+        let max_out_len = out_len;
+
+        let rc = unsafe {
+            EVP_AEAD_CTX_open(
+                &self.ctx,
+                buf.as_mut_ptr(),
+                &mut out_len,
+                max_out_len,
+                nonce.as_ptr(),
+                nonce.len(),
+                buf.as_ptr(),
+                buf.len(),
+                ad.as_ptr(),
+                ad.len(),
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(out_len)
+    }
+
     pub fn seal_with_u64_counter(
         &mut self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
         extra_in: Option<&[u8]>,
@@ -152,6 +186,48 @@ impl PacketKey {
                 extra_in_len,               // extra_in_len
                 ad.as_ptr(),                // ad
                 ad.len(),                   // ad_len
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(in_len + out_tag_len)
+    }
+
+    pub fn seal_with_nonce(
+        &mut self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
+        in_len: usize, extra_in: Option<&[u8]>,
+    ) -> Result<usize> {
+        let tag_len = self.alg.tag_len();
+
+        let mut out_tag_len = tag_len;
+
+        let (extra_in_ptr, extra_in_len) = match extra_in {
+            Some(v) => (v.as_ptr(), v.len()),
+            None => (std::ptr::null(), 0),
+        };
+
+        if in_len + tag_len + extra_in_len > buf.len() {
+            return Err(Error::CryptoFail);
+        }
+
+        let rc = unsafe {
+            EVP_AEAD_CTX_seal_scatter(
+                &mut self.ctx,
+                buf.as_mut_ptr(),
+                buf[in_len..].as_mut_ptr(),
+                &mut out_tag_len,
+                tag_len + extra_in_len,
+                nonce.as_ptr(),
+                nonce.len(),
+                buf.as_ptr(),
+                in_len,
+                extra_in_ptr,
+                extra_in_len,
+                ad.as_ptr(),
+                ad.len(),
             )
         };
 
