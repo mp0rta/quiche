@@ -186,6 +186,112 @@ impl PacketKey {
         Ok(plaintext_len + olen as usize)
     }
 
+    pub fn open_with_nonce(
+        &self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
+    ) -> Result<usize> {
+        let tag_len = self.alg.tag_len();
+
+        let in_buf = buf.to_owned();
+
+        let mut cipher_len = buf.len();
+
+        const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
+        let mut rc = unsafe {
+            EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                EVP_CTRL_AEAD_SET_IVLEN,
+                nonce.len() as i32,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        rc = unsafe {
+            EVP_CipherInit_ex2(
+                self.ctx,
+                std::ptr::null_mut(),
+                self.key.as_ptr(),
+                nonce.as_ptr(),
+                Open::DECRYPT as i32,
+                std::ptr::null(),
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut olen: i32 = 0;
+
+        if !ad.is_empty() {
+            rc = unsafe {
+                EVP_CipherUpdate(
+                    self.ctx,
+                    std::ptr::null_mut(),
+                    &mut olen,
+                    ad.as_ptr(),
+                    ad.len() as i32,
+                )
+            };
+
+            if rc != 1 {
+                return Err(Error::CryptoFail);
+            }
+        }
+
+        if cipher_len < tag_len {
+            return Err(Error::CryptoFail);
+        }
+
+        cipher_len -= tag_len;
+
+        rc = unsafe {
+            EVP_CipherUpdate(
+                self.ctx,
+                buf.as_mut_ptr(),
+                &mut olen,
+                in_buf.as_ptr(),
+                cipher_len as i32,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        let plaintext_len = olen as usize;
+
+        const EVP_CTRL_AEAD_SET_TAG: i32 = 0x11;
+        rc = unsafe {
+            EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                EVP_CTRL_AEAD_SET_TAG,
+                tag_len as i32,
+                buf[cipher_len..].as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        rc = unsafe {
+            EVP_CipherFinal_ex(
+                self.ctx,
+                buf[plaintext_len..].as_mut_ptr(),
+                &mut olen,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(plaintext_len + olen as usize)
+    }
+
     pub fn seal_with_u64_counter(
         &mut self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
         _extra_in: Option<&[u8]>,
@@ -261,6 +367,108 @@ impl PacketKey {
         if rc != 1 {
             return Err(Error::CryptoFail);
         };
+
+        ciphertext_len += olen as usize;
+
+        let len = olen as usize;
+        rc = unsafe {
+            EVP_CipherFinal_ex(self.ctx, buf[len..].as_mut_ptr(), &mut olen)
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        ciphertext_len += olen as usize;
+
+        const EVP_CTRL_AEAD_GET_TAG: i32 = 0x10;
+        rc = unsafe {
+            EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                EVP_CTRL_AEAD_GET_TAG,
+                tag_len as i32,
+                buf[ciphertext_len..].as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(in_len + tag_len)
+    }
+
+    pub fn seal_with_nonce(
+        &mut self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
+        in_len: usize, _extra_in: Option<&[u8]>,
+    ) -> Result<usize> {
+        let tag_len = self.alg.tag_len();
+
+        let in_buf = buf.to_owned();
+
+        const EVP_CTRL_AEAD_SET_IVLEN: i32 = 0x9;
+        let mut rc = unsafe {
+            EVP_CIPHER_CTX_ctrl(
+                self.ctx,
+                EVP_CTRL_AEAD_SET_IVLEN,
+                nonce.len() as i32,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        rc = unsafe {
+            EVP_CipherInit_ex2(
+                self.ctx,
+                std::ptr::null_mut(),
+                self.key.as_ptr(),
+                nonce.as_ptr(),
+                Seal::ENCRYPT as i32,
+                std::ptr::null(),
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut olen: i32 = 0;
+        let mut rc;
+
+        if !ad.is_empty() {
+            rc = unsafe {
+                EVP_CipherUpdate(
+                    self.ctx,
+                    std::ptr::null_mut(),
+                    &mut olen,
+                    ad.as_ptr(),
+                    ad.len() as i32,
+                )
+            };
+
+            if rc != 1 {
+                return Err(Error::CryptoFail);
+            }
+        }
+
+        let mut ciphertext_len: usize = 0;
+
+        rc = unsafe {
+            EVP_CipherUpdate(
+                self.ctx,
+                buf.as_mut_ptr(),
+                &mut olen,
+                in_buf.as_ptr(),
+                in_len as i32,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
 
         ciphertext_len += olen as usize;
 
