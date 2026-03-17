@@ -3731,6 +3731,8 @@ impl<F: BufFactory> Connection<F> {
         let mut mp_abandon_acked: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
         let mut mp_status_acked: SmallVec<[u64; 2]> = SmallVec::new();
+        #[cfg(feature = "multipath")]
+        let mut mp_path_ack_acked: SmallVec<[(u64, u64); 4]> = SmallVec::new();
 
         for (_, p) in self.paths.iter_mut() {
             while let Some(acked) = p.recovery.next_acked_frame(epoch) {
@@ -3877,6 +3879,18 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     #[cfg(feature = "multipath")]
+                    frame::Frame::PathAck {
+                        path_id, ranges, ..
+                    } => {
+                        // Defer cleanup of per-path recv_pkt_need_ack
+                        // (can't mutably access another path inside
+                        // this iter_mut loop).
+                        if let Some(largest_acked) = ranges.last() {
+                            mp_path_ack_acked.push((path_id, largest_acked));
+                        }
+                    },
+
+                    #[cfg(feature = "multipath")]
                     frame::Frame::PathAbandon { path_id, .. } => {
                         mp_abandon_acked.push(path_id);
                     },
@@ -3933,9 +3947,24 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        // Apply PATH_ABANDON / PATH_STATUS acked state updates that were
-        // deferred from inside the acked-frames loop above (to avoid nested
-        // mutable borrows of self.paths).
+        // Apply PATH_ACK / PATH_ABANDON / PATH_STATUS acked state updates
+        // that were deferred from inside the acked-frames loop above (to
+        // avoid nested mutable borrows of self.paths).
+        //
+        // PATH_ACK cleanup: when a PATH_ACK we sent is itself acknowledged
+        // by the peer, we can stop re-acknowledging the packet numbers that
+        // were covered by that PATH_ACK.
+        #[cfg(feature = "multipath")]
+        for (mp_path_id, largest_acked) in mp_path_ack_acked {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id {
+                    p.app_pkt_num_space
+                        .recv_pkt_need_ack
+                        .remove_until(largest_acked);
+                    break;
+                }
+            }
+        }
         #[cfg(feature = "multipath")]
         for mp_path_id in mp_abandon_acked {
             for (_, p) in self.paths.iter_mut() {
