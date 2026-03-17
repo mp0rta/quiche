@@ -36,12 +36,35 @@ impl Algorithm {
             },
         }
     }
+
+    /// Returns the non-TLS13 AEAD variant for this algorithm.
+    ///
+    /// The TLS13 variants enforce monotonically increasing nonces, which is
+    /// incompatible with multipath nonce computation where path_id in the
+    /// upper bits breaks monotonicity. The standard GCM variants have no
+    /// such restriction.
+    #[cfg(feature = "multipath")]
+    fn get_evp_aead_mp(self) -> *const EVP_AEAD {
+        match self {
+            Algorithm::AES128_GCM => unsafe { EVP_aead_aes_128_gcm() },
+            Algorithm::AES256_GCM => unsafe { EVP_aead_aes_256_gcm() },
+            Algorithm::ChaCha20_Poly1305 => unsafe {
+                EVP_aead_chacha20_poly1305()
+            },
+        }
+    }
 }
 
 pub(crate) struct PacketKey {
     alg: Algorithm,
 
     ctx: EVP_AEAD_CTX,
+
+    /// Non-TLS13 AEAD context for multipath nonce operations.
+    /// The TLS13 AEAD enforces monotonic nonces, which is incompatible with
+    /// multipath nonces that include path_id in the upper bits.
+    #[cfg(feature = "multipath")]
+    mp_ctx: EVP_AEAD_CTX,
 
     nonce: Vec<u8>,
 }
@@ -53,6 +76,8 @@ impl PacketKey {
         Ok(Self {
             alg,
             ctx: make_aead_ctx(alg, &key)?,
+            #[cfg(feature = "multipath")]
+            mp_ctx: make_aead_ctx_mp(alg, &key)?,
             nonce: iv,
         })
     }
@@ -132,9 +157,15 @@ impl PacketKey {
 
         let max_out_len = out_len;
 
+        // Use mp_ctx (non-TLS13 AEAD) to avoid monotonic nonce enforcement.
+        #[cfg(feature = "multipath")]
+        let ctx = &self.mp_ctx;
+        #[cfg(not(feature = "multipath"))]
+        let ctx = &self.ctx;
+
         let rc = unsafe {
             EVP_AEAD_CTX_open(
-                &self.ctx,
+                ctx,
                 buf.as_mut_ptr(),
                 &mut out_len,
                 max_out_len,
@@ -217,9 +248,15 @@ impl PacketKey {
             return Err(Error::CryptoFail);
         }
 
+        // Use mp_ctx (non-TLS13 AEAD) to avoid monotonic nonce enforcement.
+        #[cfg(feature = "multipath")]
+        let ctx = &mut self.mp_ctx;
+        #[cfg(not(feature = "multipath"))]
+        let ctx = &mut self.ctx;
+
         let rc = unsafe {
             EVP_AEAD_CTX_seal_scatter(
-                &mut self.ctx,
+                ctx,
                 buf.as_mut_ptr(),
                 buf[in_len..].as_mut_ptr(),
                 &mut out_tag_len,
@@ -328,6 +365,37 @@ impl HeaderProtectionKey {
     }
 }
 
+/// Creates an AEAD context using the non-TLS13 GCM variant.
+///
+/// Unlike the TLS13 variant, this does not enforce monotonically increasing
+/// nonces, making it suitable for multipath nonce computation where path_id
+/// in the upper bits breaks monotonicity.
+#[cfg(feature = "multipath")]
+fn make_aead_ctx_mp(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
+    let mut ctx = MaybeUninit::uninit();
+
+    let ctx = unsafe {
+        let aead = alg.get_evp_aead_mp();
+
+        let rc = EVP_AEAD_CTX_init(
+            ctx.as_mut_ptr(),
+            aead,
+            key.as_ptr(),
+            alg.key_len(),
+            alg.tag_len(),
+            std::ptr::null_mut(),
+        );
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        ctx.assume_init()
+    };
+
+    Ok(ctx)
+}
+
 fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
     let mut ctx = MaybeUninit::uninit();
 
@@ -405,6 +473,13 @@ extern "C" {
     fn EVP_aead_aes_256_gcm_tls13() -> *const EVP_AEAD;
 
     fn EVP_aead_chacha20_poly1305() -> *const EVP_AEAD;
+
+    // Non-TLS13 GCM variants (no monotonic nonce enforcement).
+    #[cfg(feature = "multipath")]
+    fn EVP_aead_aes_128_gcm() -> *const EVP_AEAD;
+
+    #[cfg(feature = "multipath")]
+    fn EVP_aead_aes_256_gcm() -> *const EVP_AEAD;
 
     // HKDF
     fn HKDF_extract(
