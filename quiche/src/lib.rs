@@ -3415,6 +3415,70 @@ impl<F: BufFactory> Connection<F> {
                     (payload, pn, false)
                 },
             }
+        } else if self.multipath_enabled &&
+            hdr.ty == Type::Short &&
+            recv_pid.is_none() &&
+            self.is_server
+        {
+            // Packet from an unknown address while multipath is enabled.
+            // The peer may have created a new path and sent this packet
+            // with an mp nonce. Try standard decrypt first; if it fails,
+            // fall back to mp nonce with candidate path_ids.
+
+            // Snapshot payload before AEAD (which decrypts in-place).
+            let payload_start = b.off();
+            let ciphertext_len = payload_len - pn_len;
+            let snapshot: Vec<u8> = b.buf()
+                [payload_start..payload_start + ciphertext_len]
+                .to_vec();
+
+            match packet::decrypt_pkt(
+                &mut b, pn, pn_len, payload_len, aead,
+            ) {
+                Ok(payload) => (payload, pn, false),
+
+                Err(_) => {
+                    // Standard decrypt failed. Restore buffer content
+                    // and try mp nonce with candidate path_ids.
+                    debug_assert_eq!(b.off(), payload_start);
+                    {
+                        let (_, mut payload_region) =
+                            b.split_at(payload_start).map_err(|e| {
+                                drop_pkt_on_err(
+                                    e.into(), self.recv_count,
+                                    self.is_server, &self.trace_id,
+                                )
+                            })?;
+                        payload_region.as_mut()[..snapshot.len()]
+                            .copy_from_slice(&snapshot);
+                    }
+
+                    // Try candidate path_ids. The peer assigns them
+                    // sequentially, so try next_path_id first (the most
+                    // likely candidate for a new path).
+                    let candidate_pid = self.paths.next_path_id as u32;
+
+                    // For a new path, the per-path pn starts at 0, so
+                    // decode with largest_rx = 0.
+                    let mp_pn = packet::decode_pkt_num(
+                        0, hdr.pkt_num, hdr.pkt_num_len,
+                    );
+
+                    match packet::decrypt_pkt_mp(
+                        &mut b, mp_pn, candidate_pid, pn_len,
+                        payload_len, aead,
+                    ) {
+                        Ok(payload) => (payload, mp_pn, true),
+
+                        Err(e) => {
+                            return Err(drop_pkt_on_err(
+                                e, self.recv_count, self.is_server,
+                                &self.trace_id,
+                            ));
+                        },
+                    }
+                },
+            }
         } else {
             let payload = packet::decrypt_pkt(
                 &mut b, pn, pn_len, payload_len, aead,
@@ -8164,6 +8228,17 @@ impl<F: BufFactory> Connection<F> {
         self.paths.next_path_id += 1;
         self.paths.active_path_count += 1;
 
+        // When the first additional path is created (transition from 1→2
+        // paths), sync path 0's per-path send counter from the shared
+        // counter so that subsequent per-path pn values don't collide with
+        // pn values already sent (and seen by the peer) using the shared
+        // counter during handshake / single-path phase.
+        if self.paths.len() == 2 {
+            if let Ok(path0) = self.paths.get_mut(0) {
+                path0.mp_next_pkt_num = self.next_pkt_num;
+            }
+        }
+
         #[cfg(feature = "qlog")]
         qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
             let ev_data = EventData::Marker {
@@ -9744,6 +9819,15 @@ impl<F: BufFactory> Connection<F> {
         path.max_send_bytes = buf_len * self.max_amplification_factor;
         path.active_scid_seq = Some(in_scid_seq);
 
+        // Assign multipath path_id for the new path on the server side.
+        // The path_id is the next sequential ID, matching what the client
+        // assigned via create_path().
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled {
+            path.path_id = self.paths.next_path_id;
+            self.paths.next_path_id += 1;
+        }
+
         // Automatically probes the new path.
         path.request_validation();
 
@@ -9752,6 +9836,15 @@ impl<F: BufFactory> Connection<F> {
         // Do not record path reuse.
         if in_scid_pid.is_none() {
             ids.link_scid_to_path_id(in_scid_seq, pid)?;
+        }
+
+        // When the first additional path is created on the server side,
+        // sync path 0's per-path send counter from the shared counter.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && self.paths.len() == 2 {
+            if let Ok(path0) = self.paths.get_mut(0) {
+                path0.mp_next_pkt_num = self.next_pkt_num;
+            }
         }
 
         Ok(pid)
