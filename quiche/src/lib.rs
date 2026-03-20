@@ -5571,10 +5571,18 @@ impl<F: BufFactory> Connection<F> {
         }
 
         // Create a single STREAM frame for the first stream that is flushable.
+        //
+        // In multipath mode, STREAM frames can be sent on any working path
+        // that the scheduler selected, not just the "active" migration path.
+        #[cfg(feature = "multipath")]
+        let path_can_send_stream = self.multipath_enabled || path.active();
+        #[cfg(not(feature = "multipath"))]
+        let path_can_send_stream = path.active();
+
         if (pkt_type == Type::Short || pkt_type == Type::ZeroRTT) &&
             left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing &&
-            path.active() &&
+            path_can_send_stream &&
             !dgram_emitted
         {
             while let Some(priority_key) = self.streams.peek_flushable() {
@@ -8729,6 +8737,19 @@ impl<F: BufFactory> Connection<F> {
                 return Ok(Type::from_epoch(epoch));
             }
 
+            // When multipath is enabled, per-path ack_elicited also
+            // triggers sending (for PATH_ACK frames).
+            #[cfg(feature = "multipath")]
+            if self.multipath_enabled &&
+                epoch == packet::Epoch::Application &&
+                self.paths.iter().any(|(_, p)| {
+                    p.app_pkt_num_space.ack_elicited &&
+                        p.app_pkt_num_space.recv_pkt_need_ack.len() > 0
+                })
+            {
+                return Ok(Type::from_epoch(epoch));
+            }
+
             // There are lost frames in this packet number space.
             for (_, p) in self.paths.iter() {
                 if p.recovery.has_lost_frames(epoch) {
@@ -9681,6 +9702,25 @@ impl<F: BufFactory> Connection<F> {
 
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
+        #[cfg(feature = "multipath")]
+        let cwin_available = if self.multipath_enabled {
+            // In multipath mode, the send capacity should reflect the
+            // aggregate cwnd across all usable paths so that the
+            // application can fill stream buffers for the scheduler to
+            // distribute across paths.
+            self.paths
+                .iter()
+                .filter(|(_, p)| p.usable())
+                .map(|(_, p)| p.recovery.cwnd_available() as u64)
+                .sum()
+        } else {
+            match self.paths.get_active() {
+                Ok(p) => p.recovery.cwnd_available() as u64,
+                Err(_) => 0,
+            }
+        };
+
+        #[cfg(not(feature = "multipath"))]
         let cwin_available = match self.paths.get_active() {
             Ok(p) => p.recovery.cwnd_available() as u64,
             Err(_) => 0,
