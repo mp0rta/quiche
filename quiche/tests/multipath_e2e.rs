@@ -180,9 +180,10 @@ fn multipath_negotiation_e2e() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let _server_stderr = collect_server_stderr(server);
+    let server_stderr = collect_server_stderr(server);
 
     eprintln!("--- client stderr ---\n{}", stderr);
+    eprintln!("--- server stderr ---\n{}", server_stderr);
 
     assert!(
         output.status.success(),
@@ -220,9 +221,10 @@ fn multipath_second_path_creation() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let _server_stderr = collect_server_stderr(server);
+    let server_stderr = collect_server_stderr(server);
 
     eprintln!("--- client stderr ---\n{}", stderr);
+    eprintln!("--- server stderr ---\n{}", server_stderr);
 
     assert!(
         output.status.success(),
@@ -273,9 +275,10 @@ fn multipath_data_transfer_two_paths() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let _server_stderr = collect_server_stderr(server);
+    let server_stderr = collect_server_stderr(server);
 
     eprintln!("--- client stderr ---\n{}", stderr);
+    eprintln!("--- server stderr ---\n{}", server_stderr);
 
     assert!(
         output.status.success(),
