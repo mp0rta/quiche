@@ -12373,6 +12373,457 @@ fn multipath_two_path_data_exchange() {
 
 #[cfg(feature = "multipath")]
 #[test]
+fn multipath_two_path_bulk_transfer() {
+    // Verify bulk data transfer works when both sides have 2 paths.
+    // This exercises per-path packet numbers, mp nonce, PATH_ACK, and cwnd
+    // growth across the multipath transition.
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    // Exchange additional CIDs for second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    // Create second path on client.
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let path_id = pipe.client.create_path(local2, peer2).unwrap();
+    assert_eq!(path_id, 1);
+    assert_eq!(pipe.client.paths.len(), 2);
+
+    // Send a large chunk of data from client to server.
+    let data = vec![42u8; 100_000];
+    let mut data_written = 0usize;
+
+    // Queue as much as tx_cap allows initially.
+    match pipe.client.stream_send(0, &data, true) {
+        Ok(written) => data_written += written,
+        Err(Error::Done) => {},
+        Err(e) => panic!("initial stream_send error: {:?}", e),
+    }
+
+    // Manually drive the connection, sending on both paths.
+    let mut buf = [0u8; 65535];
+    let mut total_received = 0usize;
+    let mut recv_buf = vec![0u8; 200_000];
+
+    for _round in 0..200 {
+        // Try to queue more data as tx_cap opens up.
+        if data_written < data.len() {
+            match pipe.client.stream_send(
+                0,
+                &data[data_written..],
+                true,
+            ) {
+                Ok(written) => data_written += written,
+                Err(Error::Done) => {},
+                Err(e) => panic!("stream_send error: {:?}", e),
+            }
+        }
+
+        // Client sends on all paths.
+        let mut client_pkts = 0;
+        loop {
+            match pipe.client.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.server.recv(&mut buf[..len], recv_info).ok();
+                    client_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("client send error: {:?}", e),
+            }
+        }
+
+        // Try reading data from server.
+        let prev_received = total_received;
+        loop {
+            match pipe.server.stream_recv(0, &mut recv_buf[total_received..]) {
+                Ok((len, _fin)) => {
+                    total_received += len;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("server stream_recv error: {:?}", e),
+            }
+        }
+
+        // Server sends responses (ACKs/PATH_ACKs).
+        let mut server_pkts = 0;
+        loop {
+            match pipe.server.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.client.recv(&mut buf[..len], recv_info).ok();
+                    server_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("server send error: {:?}", e),
+            }
+        }
+
+        let _ = (client_pkts, server_pkts, prev_received);
+
+        if total_received >= data.len() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        total_received,
+        data.len(),
+        "should have received all {} bytes, got {}",
+        data.len(),
+        total_received,
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_server_to_client_bulk_transfer() {
+    // Reproduce E2E scenario: SERVER sends large response to CLIENT.
+    // Client has 2 paths. Server sends data, client sends PATH_ACKs.
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Exchange additional CIDs for second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    // Create second path on client.
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+
+    // Exchange path validation.
+    pipe.advance().unwrap();
+
+    // SERVER sends data on stream 1 (server-initiated bidi).
+    let data = vec![42u8; 100_000];
+    let mut data_written = 0usize;
+
+    match pipe.server.stream_send(1, &data, true) {
+        Ok(written) => data_written += written,
+        Err(Error::Done) => {},
+        Err(e) => panic!("initial stream_send error: {:?}", e),
+    }
+
+    let mut buf = [0u8; 65535];
+    let mut total_received = 0usize;
+    let mut recv_buf = vec![0u8; 200_000];
+
+    for round in 0..200 {
+        // Server queues more data as tx_cap opens up.
+        if data_written < data.len() {
+            match pipe.server.stream_send(1, &data[data_written..], true) {
+                Ok(written) => data_written += written,
+                Err(Error::Done) => {},
+                Err(e) => panic!("stream_send error: {:?}", e),
+            }
+        }
+
+        // Server sends data packets.
+        let mut server_pkts = 0;
+        loop {
+            match pipe.server.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.client.recv(&mut buf[..len], recv_info).ok();
+                    server_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("server send error: {:?}", e),
+            }
+        }
+
+        // Client reads received data.
+        loop {
+            match pipe.client.stream_recv(1, &mut recv_buf[total_received..]) {
+                Ok((len, _fin)) => total_received += len,
+                Err(Error::Done) => break,
+                Err(e) => panic!("client stream_recv error: {:?}", e),
+            }
+        }
+
+        // Client sends PATH_ACKs back to server.
+        let mut client_pkts = 0;
+        loop {
+            match pipe.client.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.server.recv(&mut buf[..len], recv_info).ok();
+                    client_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("client send error: {:?}", e),
+            }
+        }
+
+        if round < 10 || total_received != data.len() {
+            eprintln!(
+                "round={} s_pkts={} c_pkts={} recv={}/{} queued={}",
+                round, server_pkts, client_pkts, total_received,
+                data.len(), data_written,
+            );
+        }
+
+        if total_received >= data.len() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        total_received,
+        data.len(),
+        "should have received all {} bytes, got {}",
+        data.len(),
+        total_received,
+    );
+}
+
+/// Reproduces E2E timing: server starts sending data with shared pn space
+/// (paths.len()==1), then client creates second path mid-transfer, causing
+/// the server to switch to per-path pn space.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_mid_transfer_path_creation() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+    config.set_initial_max_data(1_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Exchange additional CIDs but do NOT create second path yet.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    // At this point: both sides have 1 path (path 0), multipath negotiated.
+
+    // SERVER starts sending data on stream 1 (server-initiated bidi).
+    let data = vec![42u8; 100_000];
+    let mut data_written = 0usize;
+
+    match pipe.server.stream_send(1, &data, true) {
+        Ok(written) => data_written += written,
+        Err(Error::Done) => {},
+        Err(e) => panic!("initial stream_send error: {:?}", e),
+    }
+
+    let mut buf = [0u8; 65535];
+    let mut total_received = 0usize;
+    let mut recv_buf = vec![0u8; 200_000];
+
+    // Do a few rounds with only 1 path (shared pn space).
+    for round in 0..3 {
+        if data_written < data.len() {
+            match pipe.server.stream_send(1, &data[data_written..], true) {
+                Ok(written) => data_written += written,
+                Err(Error::Done) => {},
+                Err(e) => panic!("stream_send error: {:?}", e),
+            }
+        }
+
+        // Server sends data packets.
+        loop {
+            match pipe.server.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.client.recv(&mut buf[..len], recv_info).ok();
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("server send error: {:?}", e),
+            }
+        }
+
+        // Client reads received data.
+        loop {
+            match pipe.client.stream_recv(1, &mut recv_buf[total_received..]) {
+                Ok((len, _fin)) => total_received += len,
+                Err(Error::Done) => break,
+                Err(e) => panic!("client stream_recv error: {:?}", e),
+            }
+        }
+
+        // Client sends ACKs/PATH_ACKs.
+        loop {
+            match pipe.client.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.server.recv(&mut buf[..len], recv_info).ok();
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("client send error: {:?}", e),
+            }
+        }
+
+        eprintln!(
+            "pre-multipath round={} recv={}/{} queued={}",
+            round, total_received, data.len(), data_written,
+        );
+    }
+
+    eprintln!("--- Creating second path mid-transfer ---");
+
+    // NOW create the second path (mimics E2E --second-path timing).
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+
+    // Send path validation probe from path 1's addresses so the server
+    // sees the new source address and creates path 1 on its side.
+    // advance() with send_on_path(None,None) defaults to the active path,
+    // so we must explicitly send from path 1.
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(local2),
+        Some(peer2),
+    )
+    .unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // Server responds (path validation response).
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    // One more round to complete validation.
+    if let Ok(flight) = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(local2),
+        Some(peer2),
+    ) {
+        test_utils::process_flight(&mut pipe.server, flight).ok();
+    }
+    if let Ok(flight) = test_utils::emit_flight(&mut pipe.server) {
+        test_utils::process_flight(&mut pipe.client, flight).ok();
+    }
+
+    eprintln!(
+        "After path creation: client paths={}, server paths={}",
+        pipe.client.path_stats().count(),
+        pipe.server.path_stats().count(),
+    );
+
+    // Continue transfer with 2 paths (per-path pn space).
+    for round in 0..200 {
+        if data_written < data.len() {
+            match pipe.server.stream_send(1, &data[data_written..], true) {
+                Ok(written) => data_written += written,
+                Err(Error::Done) => {},
+                Err(e) => panic!("stream_send error: {:?}", e),
+            }
+        }
+
+        // Server sends data packets.
+        let mut server_pkts = 0;
+        loop {
+            match pipe.server.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.client.recv(&mut buf[..len], recv_info).ok();
+                    server_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("server send error: {:?}", e),
+            }
+        }
+
+        // Client reads received data.
+        loop {
+            match pipe.client.stream_recv(1, &mut recv_buf[total_received..]) {
+                Ok((len, _fin)) => total_received += len,
+                Err(Error::Done) => break,
+                Err(e) => panic!("client stream_recv error: {:?}", e),
+            }
+        }
+
+        // Client sends ACKs/PATH_ACKs.
+        let mut client_pkts = 0;
+        loop {
+            match pipe.client.send(&mut buf) {
+                Ok((len, info)) => {
+                    let recv_info = RecvInfo {
+                        to: info.to,
+                        from: info.from,
+                    };
+                    pipe.server.recv(&mut buf[..len], recv_info).ok();
+                    client_pkts += 1;
+                },
+                Err(Error::Done) => break,
+                Err(e) => panic!("client send error: {:?}", e),
+            }
+        }
+
+        if round < 10 || total_received != data.len() {
+            eprintln!(
+                "post-mp round={} s_pkts={} c_pkts={} recv={}/{} queued={}",
+                round, server_pkts, client_pkts, total_received,
+                data.len(), data_written,
+            );
+        }
+
+        if total_received >= data.len() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        total_received,
+        data.len(),
+        "should have received all {} bytes, got {}",
+        data.len(),
+        total_received,
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
 fn multipath_recv_fallback_unknown_address() {
     let mut config = test_utils::Pipe::default_config("cubic").unwrap();
     config.set_initial_max_path_id(4);
