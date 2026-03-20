@@ -543,6 +543,19 @@ fn main() {
             }
         }
 
+        // Ensure writable streams have data queued before the send loop.
+        // This is needed for continue_write re-entries where the 'read loop
+        // doesn't execute and handle_writable() was not called.
+        for client in clients.values_mut() {
+            if let Some(http_conn) = client.http_conn.as_mut() {
+                let conn = &mut client.conn;
+                let partial_responses = &mut client.partial_responses;
+                for stream_id in writable_response_streams(conn) {
+                    http_conn.handle_writable(conn, partial_responses, stream_id);
+                }
+            }
+        }
+
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
@@ -564,7 +577,7 @@ fn main() {
                     client.max_datagram_size *
                     client.max_datagram_size;
             let mut total_write = 0;
-            let mut dst_info = None;
+            let mut dst_info: Option<quiche::SendInfo> = None;
 
             while total_write < max_send_burst {
                 let (write, send_info) = match client
@@ -574,7 +587,6 @@ fn main() {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
-                        trace!("{} done writing", client.conn.trace_id());
                         break;
                     },
 
@@ -585,6 +597,47 @@ fn main() {
                         break;
                     },
                 };
+
+                // When the destination changes (e.g., different multipath
+                // paths), flush the current batch before starting a new
+                // one. Packets for different destinations must not be
+                // batched together.
+                if let Some(ref prev) = dst_info {
+                    if prev.to != send_info.to {
+                        if let Err(e) = send_to(
+                            &socket,
+                            &out[..total_write],
+                            prev,
+                            client.max_datagram_size,
+                            pacing,
+                            enable_gso,
+                        ) {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("send() would block");
+                                break;
+                            }
+
+                            panic!("send_to() failed: {e:?}");
+                        }
+
+                        trace!(
+                            "{} written {total_write} bytes (flush) with {dst_info:?}",
+                            client.conn.trace_id()
+                        );
+
+                        // Reset batch for new destination.
+                        out.copy_within(total_write..total_write + write, 0);
+                        total_write = 0;
+                        dst_info = Some(send_info);
+                        total_write += write;
+
+                        if write < client.max_datagram_size {
+                            continue_write = true;
+                            break;
+                        }
+                        continue;
+                    }
+                }
 
                 total_write += write;
 
