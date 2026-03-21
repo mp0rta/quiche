@@ -4471,13 +4471,11 @@ impl<F: BufFactory> Connection<F> {
     /// Returns the desired send time for the next packet.
     #[inline]
     pub fn get_next_release_time(&self) -> Option<ReleaseDecision> {
-        Some(
-            self.paths
-                .get_active()
-                .ok()?
-                .recovery
-                .get_next_release_time(),
-        )
+        let now = Instant::now();
+        self.paths
+            .sendable(self.mp_enabled())
+            .map(|(_, p)| p.recovery.get_next_release_time())
+            .min_by_key(|rd| rd.time(now))
     }
 
     /// Returns whether gcongestion is enabled.
@@ -4492,8 +4490,9 @@ impl<F: BufFactory> Connection<F> {
     /// 5ms.
     pub fn max_release_into_future(&self) -> Duration {
         self.paths
-            .get_active()
-            .map(|p| p.recovery.rtt().mul_f64(0.125))
+            .sendable(self.mp_enabled())
+            .map(|(_, p)| p.recovery.rtt().mul_f64(0.125))
+            .min()
             .unwrap_or(Duration::from_millis(1))
             .max(Duration::from_millis(1))
             .min(Duration::from_millis(5))
@@ -4513,12 +4512,11 @@ impl<F: BufFactory> Connection<F> {
     /// Applications can, for example, use it in conjunction with segmentation
     /// offloading mechanisms as the maximum limit for outgoing aggregates of
     /// multiple packets.
-    #[inline]
     pub fn send_quantum(&self) -> usize {
-        match self.paths.get_active() {
-            Ok(p) => p.recovery.send_quantum(),
-            _ => 0,
-        }
+        self.paths
+            .sendable(self.mp_enabled())
+            .map(|(_, p)| p.recovery.send_quantum())
+            .sum()
     }
 
     /// Returns the size of the send quantum over the given 4-tuple, in bytes.

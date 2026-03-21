@@ -13150,3 +13150,99 @@ fn multipath_aggregate_cwnd_available() {
     let closing_agg = pipe.client.paths.aggregate_cwnd_available(true);
     assert_eq!(closing_agg, p0_cwnd);
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_get_next_release_time_earliest() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Add second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    // Manually validate path 1 for test.
+    pipe.client.paths.get_mut(1).unwrap().state = path::PathState::Validated;
+
+    // With two sendable paths the method should return Some.
+    let rd = pipe.client.get_next_release_time();
+    assert!(rd.is_some(), "expected Some(ReleaseDecision) with two paths");
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_release_into_future_uses_min_srtt() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Add second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    // Manually validate path 1 for test.
+    pipe.client.paths.get_mut(1).unwrap().state = path::PathState::Validated;
+
+    let max_future = pipe.client.max_release_into_future();
+    assert!(
+        max_future >= Duration::from_millis(1),
+        "max_release_into_future must be >= 1ms, got {:?}",
+        max_future
+    );
+    assert!(
+        max_future <= Duration::from_millis(5),
+        "max_release_into_future must be <= 5ms, got {:?}",
+        max_future
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_send_quantum_aggregates() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Add second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    // Manually validate path 1 for test.
+    pipe.client.paths.get_mut(1).unwrap().state = path::PathState::Validated;
+
+    let mp_q = pipe.client.send_quantum();
+    let p0_q = pipe.client.paths.get(0).unwrap().recovery.send_quantum();
+    let p1_q = pipe.client.paths.get(1).unwrap().recovery.send_quantum();
+    assert_eq!(mp_q, p0_q + p1_q);
+}
