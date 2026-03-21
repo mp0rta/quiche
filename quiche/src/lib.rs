@@ -4277,9 +4277,8 @@ impl<F: BufFactory> Connection<F> {
 
         let mut done = 0;
 
-        // Limit output packet size to respect the sender and receiver's
-        // maximum UDP payload size limit.
-        let mut left = cmp::min(out.len(), self.max_send_udp_payload_size());
+        // Start with buffer size; path-specific MTU applied after path selection.
+        let mut left = out.len();
 
         let send_pid = match (from, to) {
             (Some(f), Some(t)) => self
@@ -4343,6 +4342,17 @@ impl<F: BufFactory> Connection<F> {
                 }
             },
         };
+
+        // Apply the selected path's MTU limit.
+        left = cmp::min(left, self.paths.get(send_pid)
+            .map(|p| {
+                if self.is_established() {
+                    cmp::min(16383, p.recovery.max_datagram_size())
+                } else {
+                    MIN_CLIENT_INITIAL_LEN
+                }
+            })
+            .unwrap_or(MIN_CLIENT_INITIAL_LEN));
 
         let send_path = self.paths.get_mut(send_pid)?;
 
@@ -6487,6 +6497,42 @@ impl<F: BufFactory> Connection<F> {
                 pmtud.revalidate_pmtu();
             }
         }
+    }
+
+    /// Returns the PMTU for the path identified by the multipath `path_id`.
+    ///
+    /// Returns `Ok(None)` if PMTUD has not completed yet on this path, or if
+    /// PMTUD is disabled. Returns [`Error::PathNotFound`] if no path with the
+    /// given `path_id` exists.
+    #[cfg(feature = "multipath")]
+    pub fn pmtu_on_path(&self, path_id: u64) -> Result<Option<usize>> {
+        let idx = self
+            .paths
+            .iter()
+            .find_map(|(i, p)| if p.path_id == path_id { Some(i) } else { None })
+            .ok_or(Error::PathNotFound)?;
+
+        let path = self.paths.get(idx)?;
+        Ok(path.pmtud.as_ref().and_then(|pmtud| pmtud.get_pmtu()))
+    }
+
+    /// Triggers PMTU revalidation on the path identified by `path_id`.
+    ///
+    /// Returns [`Error::PathNotFound`] if no path with the given `path_id`
+    /// exists.
+    #[cfg(feature = "multipath")]
+    pub fn revalidate_pmtu_on_path(&mut self, path_id: u64) -> Result<()> {
+        let idx = self
+            .paths
+            .iter()
+            .find_map(|(i, p)| if p.path_id == path_id { Some(i) } else { None })
+            .ok_or(Error::PathNotFound)?;
+
+        let path = self.paths.get_mut(idx)?;
+        if let Some(pmtud) = path.pmtud.as_mut() {
+            pmtud.revalidate_pmtu();
+        }
+        Ok(())
     }
 
     /// Returns true if the connection handshake is complete.

@@ -13246,3 +13246,76 @@ fn multipath_send_quantum_aggregates() {
     let p1_q = pipe.client.paths.get(1).unwrap().recovery.send_quantum();
     assert_eq!(mp_q, p0_q + p1_q);
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_pmtu_on_path() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Create second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    let path_id = pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    // Query PMTU on the new path (may be None if PMTUD not completed).
+    let result = pipe.client.pmtu_on_path(path_id);
+    assert!(result.is_ok());
+
+    // Query PMTU on non-existent path.
+    let result = pipe.client.pmtu_on_path(999);
+    assert_eq!(result, Err(Error::PathNotFound));
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_send_on_path_uses_selected_path_mtu() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    let path0_mtu = pipe.client.paths.get(0).unwrap()
+        .recovery.max_datagram_size();
+
+    // Create second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    pipe.client.paths.get_mut(1).unwrap().state = path::PathState::Validated;
+
+    let path1_mtu = pipe.client.paths.get(1).unwrap()
+        .recovery.max_datagram_size();
+
+    assert!(path0_mtu >= 1200);
+    assert!(path1_mtu >= 1200);
+
+    pipe.client.stream_send(0, &[0xab; 2000], false).unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    let result = pipe.client.send_on_path(&mut buf, Some(local2), Some(peer2));
+    if let Ok((written, info)) = result {
+        assert!(written <= path1_mtu, "packet {} exceeds path MTU {}", written, path1_mtu);
+        assert_eq!(info.from, local2);
+        assert_eq!(info.to, peer2);
+    }
+}
