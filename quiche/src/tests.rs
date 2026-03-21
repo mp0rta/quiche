@@ -13102,3 +13102,51 @@ fn multipath_can_send_boundary_conditions() {
     // Restore DCID
     pipe.client.paths.get_mut(1).unwrap().active_dcid_seq = saved_dcid;
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_aggregate_cwnd_available() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Single path: aggregate should equal the active path's cwnd_available.
+    let single_agg = pipe.client.paths.aggregate_cwnd_available(false);
+    let active_cwnd =
+        pipe.client.paths.get_active().unwrap().recovery.cwnd_available();
+    assert_eq!(single_agg, active_cwnd);
+
+    // Add second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+
+    // Promote path 1 to Validated for testing.
+    pipe.client.paths.get_mut(1).unwrap().state =
+        path::PathState::Validated;
+
+    // Multipath: aggregate should include both paths.
+    let mp_agg = pipe.client.paths.aggregate_cwnd_available(true);
+    let p0_cwnd =
+        pipe.client.paths.get(0).unwrap().recovery.cwnd_available();
+    let p1_cwnd =
+        pipe.client.paths.get(1).unwrap().recovery.cwnd_available();
+    assert_eq!(mp_agg, p0_cwnd + p1_cwnd);
+
+    // Single-path mode: only the active path.
+    let sp_agg = pipe.client.paths.aggregate_cwnd_available(false);
+    assert_eq!(sp_agg, p0_cwnd);
+
+    // Mark path 1 as mp_closing: aggregate should exclude it.
+    pipe.client.paths.get_mut(1).unwrap().mp_closing = true;
+    let closing_agg = pipe.client.paths.aggregate_cwnd_available(true);
+    assert_eq!(closing_agg, p0_cwnd);
+}

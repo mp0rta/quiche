@@ -861,6 +861,32 @@ impl PathMap {
             .ok_or(Error::InvalidState)
     }
 
+    /// Returns an iterator over paths eligible for sending data frames.
+    pub fn sendable(
+        &self, multipath_enabled: bool,
+    ) -> impl Iterator<Item = (usize, &Path)> {
+        self.iter()
+            .filter(move |(_, p)| p.can_send(multipath_enabled))
+    }
+
+    /// Returns a mutable iterator over paths eligible for sending data
+    /// frames.
+    pub fn sendable_mut(
+        &mut self, multipath_enabled: bool,
+    ) -> impl Iterator<Item = (usize, &mut Path)> {
+        self.iter_mut()
+            .filter(move |(_, p)| p.can_send(multipath_enabled))
+    }
+
+    /// Returns the aggregate cwnd available across all sendable paths.
+    pub fn aggregate_cwnd_available(
+        &self, multipath_enabled: bool,
+    ) -> usize {
+        self.sendable(multipath_enabled)
+            .map(|(_, p)| p.recovery.cwnd_available())
+            .sum()
+    }
+
     /// Returns an iterator over all existing paths.
     #[inline]
     pub fn iter(&self) -> slab::Iter<'_, Path> {
