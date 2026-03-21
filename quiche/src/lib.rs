@@ -8362,17 +8362,6 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
-    #[cfg(feature = "multipath")]
-    #[inline]
-    fn notify_scheduler_conn(
-        &mut self,
-        event: multipath::scheduler::SchedulerConnEvent,
-    ) {
-        if let Some(ref mut scheduler) = self.scheduler {
-            scheduler.on_conn_event(event);
-        }
-    }
-
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
         let cwin_available =
