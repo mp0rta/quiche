@@ -288,6 +288,10 @@ pub struct Path {
     /// Used to reject stale (out-of-order) PATH_STATUS frames.
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_status_rx_seq_num: Option<u64>,
+
+    /// Total number of ACKed bytes on this path (for loss_rate calculation).
+    #[cfg(feature = "multipath")]
+    pub(crate) total_acked_bytes: u64,
 }
 
 impl Path {
@@ -383,6 +387,8 @@ impl Path {
             mp_path_status_seq_num: 0,
             #[cfg(feature = "multipath")]
             mp_path_status_rx_seq_num: None,
+            #[cfg(feature = "multipath")]
+            total_acked_bytes: 0,
         }
     }
 

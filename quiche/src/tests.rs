@@ -13319,3 +13319,55 @@ fn multipath_send_on_path_uses_selected_path_mtu() {
         assert_eq!(info.to, peer2);
     }
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_pathinfo_bandwidth_and_loss() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+    config.set_initial_max_data(1000000);
+    config.set_initial_max_stream_data_bidi_local(1000000);
+    config.set_initial_max_stream_data_bidi_remote(1000000);
+    config.set_initial_max_streams_bidi(10);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    pipe.client.stream_send(0, &[0xab; 5000], false).unwrap();
+    pipe.advance().unwrap();
+
+    let now = std::time::Instant::now();
+    let mut path_infos = Vec::new();
+    crate::multipath::refresh_path_info(
+        &pipe.client.paths,
+        &mut path_infos,
+        now,
+    );
+
+    assert!(!path_infos.is_empty());
+    let info = &path_infos[0];
+    assert!(info.est_bandwidth_bps.is_some());
+    assert_eq!(info.loss_rate, 0.0);
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_pathinfo_pacing_fields() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    let now = std::time::Instant::now();
+    let mut path_infos = Vec::new();
+    crate::multipath::refresh_path_info(
+        &pipe.client.paths,
+        &mut path_infos,
+        now,
+    );
+
+    assert!(!path_infos.is_empty());
+    let info = &path_infos[0];
+    assert!(info.pacing_rate_bps.is_some());
+}

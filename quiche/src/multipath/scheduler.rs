@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::path::PathAppStatus;
 use crate::path::PathState;
@@ -37,6 +38,12 @@ pub struct PathInfo {
     pub loss_rate: f64,
     /// Maximum transmission unit for this path in bytes.
     pub mtu: usize,
+    /// Next time this path's pacer allows sending, if pacing-delayed.
+    /// `None` means the path is ready to send immediately.
+    pub next_send_time: Option<Instant>,
+    /// Pacing rate in bits per second, if available.
+    /// `Some(0)` means pacing is not available (legacy recovery).
+    pub pacing_rate_bps: Option<u64>,
 }
 
 /// Metadata about the packet being scheduled.

@@ -89,6 +89,8 @@ mod tests {
             est_bandwidth_bps: None,
             loss_rate: 0.0,
             mtu: 1200,
+            next_send_time: None,
+            pacing_rate_bps: None,
         }
     }
 

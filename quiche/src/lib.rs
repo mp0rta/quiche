@@ -4296,6 +4296,7 @@ impl<F: BufFactory> Connection<F> {
                             multipath::refresh_path_info(
                                 &self.paths,
                                 &mut path_infos,
+                                now,
                             );
 
                             let packet_meta =
@@ -7437,6 +7438,11 @@ impl<F: BufFactory> Connection<F> {
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_bytes += acked_bytes as u64;
                     self.spurious_lost_count += spurious_losses;
+
+                    #[cfg(feature = "multipath")]
+                    {
+                        p.total_acked_bytes += acked_bytes as u64;
+                    }
                 }
             },
 
@@ -7978,6 +7984,11 @@ impl<F: BufFactory> Connection<F> {
                     self.lost_bytes += lost_bytes as u64;
                     self.acked_bytes += acked_bytes as u64;
                     self.spurious_lost_count += spurious_losses;
+
+                    #[cfg(feature = "multipath")]
+                    {
+                        p.total_acked_bytes += acked_bytes as u64;
+                    }
                 } else {
                     trace!(
                         "{} PATH_ACK for unknown path_id={}",

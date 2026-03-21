@@ -6,6 +6,8 @@ pub mod reinjection;
 pub(crate) mod frames;
 pub(crate) mod pktns;
 
+use std::time::Instant;
+
 use crate::path::PathMap;
 use crate::recovery::RecoveryOps;
 
@@ -17,6 +19,7 @@ use crate::recovery::RecoveryOps;
 pub(crate) fn refresh_path_info(
     paths: &PathMap,
     buf: &mut Vec<scheduler::PathInfo>,
+    now: Instant,
 ) {
     buf.clear();
     for (_, path) in paths.iter() {
@@ -37,11 +40,21 @@ pub(crate) fn refresh_path_info(
             cwnd: path.recovery.cwnd(),
             cwnd_available: path.recovery.cwnd_available(),
             bytes_in_flight: path.recovery.bytes_in_flight(),
-            // TODO: expose delivery rate from recovery.
-            est_bandwidth_bps: None,
-            // TODO: compute loss_rate from path statistics.
-            loss_rate: 0.0,
+            est_bandwidth_bps: Some(
+                path.recovery.delivery_rate().to_bits_per_second(),
+            ),
+            loss_rate: {
+                let total =
+                    path.total_acked_bytes + path.recovery.bytes_lost();
+                if total > 0 {
+                    path.recovery.bytes_lost() as f64 / total as f64
+                } else {
+                    0.0
+                }
+            },
             mtu: path.recovery.max_datagram_size(),
+            next_send_time: path.recovery.get_next_release_time().time(now),
+            pacing_rate_bps: Some(path.recovery.pacing_rate() * 8),
         });
     }
 }
