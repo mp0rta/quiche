@@ -13371,3 +13371,91 @@ fn multipath_pathinfo_pacing_fields() {
     let info = &path_infos[0];
     assert!(info.pacing_rate_bps.is_some());
 }
+
+#[cfg(feature = "multipath")]
+mod scheduler_event_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use crate::multipath::scheduler::*;
+
+    #[derive(Debug, Clone)]
+    enum RecordedEvent {
+        Path(SchedulerPathEvent),
+        Conn(SchedulerConnEvent),
+    }
+
+    struct RecordingScheduler {
+        events: Arc<Mutex<Vec<RecordedEvent>>>,
+        inner: crate::multipath::schedulers::minrtt::MinRttScheduler,
+    }
+
+    impl Scheduler for RecordingScheduler {
+        fn select_path(
+            &mut self, paths: &[PathInfo], packet: &PacketMeta,
+        ) -> SchedulerDecision {
+            self.inner.select_path(paths, packet)
+        }
+
+        fn on_path_event(&mut self, event: SchedulerPathEvent) {
+            self.events.lock().unwrap().push(RecordedEvent::Path(event));
+        }
+
+        fn on_conn_event(&mut self, event: SchedulerConnEvent) {
+            self.events.lock().unwrap().push(RecordedEvent::Conn(event));
+        }
+    }
+
+    struct RecordingSchedulerFactory {
+        events: Arc<Mutex<Vec<RecordedEvent>>>,
+    }
+
+    impl SchedulerFactory for RecordingSchedulerFactory {
+        fn create(&self) -> Box<dyn Scheduler> {
+            Box::new(RecordingScheduler {
+                events: self.events.clone(),
+                inner: crate::multipath::schedulers::minrtt::MinRttScheduler,
+            })
+        }
+    }
+
+    #[test]
+    fn scheduler_receives_path_events() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let factory = RecordingSchedulerFactory { events: events.clone() };
+
+        let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+        config.set_initial_max_path_id(4);
+        config.set_scheduler_factory(Box::new(factory));
+
+        let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+        pipe.handshake().unwrap();
+
+        // Create second path — should fire Activated.
+        let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+        pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+        let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+        pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+        pipe.advance().unwrap();
+
+        let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let path_id = pipe.client.create_path(local2, peer2).unwrap();
+
+        // Check that Activated event was recorded.
+        let recorded = events.lock().unwrap();
+        let has_activated = recorded.iter().any(|e| matches!(
+            e, RecordedEvent::Path(SchedulerPathEvent::Activated(id)) if *id == path_id
+        ));
+        assert!(has_activated, "Expected Activated event for path_id={}", path_id);
+        drop(recorded);
+
+        // Close path — should fire Closed.
+        pipe.client.close_path(path_id, 0).unwrap();
+
+        let recorded = events.lock().unwrap();
+        let has_closed = recorded.iter().any(|e| matches!(
+            e, RecordedEvent::Path(SchedulerPathEvent::Closed(id)) if *id == path_id
+        ));
+        assert!(has_closed, "Expected Closed event for path_id={}", path_id);
+    }
+}

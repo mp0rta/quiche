@@ -4333,6 +4333,9 @@ impl<F: BufFactory> Connection<F> {
                                     original_path_id: None,
                                     now,
                                 };
+                            scheduler.on_conn_event(
+                                multipath::scheduler::SchedulerConnEvent::RoundStart,
+                            );
                             let decision =
                                 scheduler.select_path(&path_infos, &packet_meta);
                             self.path_info_buf = path_infos;
@@ -4341,7 +4344,7 @@ impl<F: BufFactory> Connection<F> {
                                 multipath::scheduler::SchedulerDecision::Send(
                                     selected_path_id,
                                 ) => {
-                                    self.paths
+                                    let pid = self.paths
                                         .iter()
                                         .find_map(|(i, p)| {
                                             if p.path_id == selected_path_id {
@@ -4350,9 +4353,22 @@ impl<F: BufFactory> Connection<F> {
                                                 None
                                             }
                                         })
-                                        .ok_or(Error::InvalidState)?
+                                        .ok_or(Error::InvalidState)?;
+                                    if let Some(ref mut sched) = self.scheduler {
+                                        sched.on_conn_event(
+                                            multipath::scheduler::SchedulerConnEvent::RoundEnd,
+                                        );
+                                    }
+                                    pid
                                 },
-                                _ => self.get_send_path_id(from, to)?,
+                                _ => {
+                                    if let Some(ref mut sched) = self.scheduler {
+                                        sched.on_conn_event(
+                                            multipath::scheduler::SchedulerConnEvent::RoundEnd,
+                                        );
+                                    }
+                                    self.get_send_path_id(from, to)?
+                                },
                             }
                         } else {
                             self.get_send_path_id(from, to)?
@@ -5929,6 +5945,9 @@ impl<F: BufFactory> Connection<F> {
 
         let handshake_status = self.handshake_status();
 
+        #[cfg(feature = "multipath")]
+        let mut loss_event_path_ids: Vec<u64> = Vec::new();
+
         for (_, p) in self.paths.iter_mut() {
             if let Some(timer) = p.recovery.loss_detection_timer() {
                 if timer <= now {
@@ -5947,11 +5966,23 @@ impl<F: BufFactory> Connection<F> {
                     self.lost_count += lost_packets;
                     self.lost_bytes += lost_bytes as u64;
 
+                    #[cfg(feature = "multipath")]
+                    if lost_packets > 0 {
+                        loss_event_path_ids.push(p.path_id);
+                    }
+
                     qlog_with_type!(QLOG_METRICS, self.qlog, q, {
                         p.recovery.maybe_qlog(q, now);
                     });
                 }
             }
+        }
+
+        #[cfg(feature = "multipath")]
+        for path_id in loss_event_path_ids {
+            self.notify_scheduler_path(
+                multipath::scheduler::SchedulerPathEvent::Lost(path_id),
+            );
         }
 
         // Notify timeout events to the application.
@@ -6836,6 +6867,10 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        self.notify_scheduler_path(
+            multipath::scheduler::SchedulerPathEvent::Activated(next_id),
+        );
+
         #[cfg(feature = "qlog")]
         qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
             let ev_data = EventData::Marker {
@@ -6884,6 +6919,10 @@ impl<F: BufFactory> Connection<F> {
         path.mp_path_abandon_error_code = error_code;
         self.paths.active_path_count -= 1;
 
+        self.notify_scheduler_path(
+            multipath::scheduler::SchedulerPathEvent::Closed(path_id),
+        );
+
         #[cfg(feature = "qlog")]
         qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
             let ev_data = EventData::Marker {
@@ -6924,6 +6963,12 @@ impl<F: BufFactory> Connection<F> {
         path.app_status = status;
         path.mp_path_status_pending = true;
         path.mp_path_status_seq_num += 1;
+
+        self.notify_scheduler_path(
+            multipath::scheduler::SchedulerPathEvent::StatusChanged(
+                path_id, status,
+            ),
+        );
 
         #[cfg(feature = "qlog")]
         {
@@ -7467,6 +7512,24 @@ impl<F: BufFactory> Connection<F> {
                     #[cfg(feature = "multipath")]
                     {
                         p.total_acked_bytes += acked_bytes as u64;
+                    }
+
+                    #[cfg(feature = "multipath")]
+                    if self.multipath_enabled {
+                        let pid = p.path_id;
+                        if p.recovery.cwnd_available() == 0 {
+                            if let Some(ref mut sched) = self.scheduler {
+                                sched.on_path_event(
+                                    multipath::scheduler::SchedulerPathEvent::Congested(pid),
+                                );
+                            }
+                        } else if lost_packets > 0 || acked_bytes > 0 {
+                            if let Some(ref mut sched) = self.scheduler {
+                                sched.on_path_event(
+                                    multipath::scheduler::SchedulerPathEvent::CwndAvailable(pid),
+                                );
+                            }
+                        }
                     }
                 }
             },
@@ -8050,6 +8113,10 @@ impl<F: BufFactory> Connection<F> {
                     );
                     self.paths.active_path_count =
                         self.paths.active_path_count.saturating_sub(1);
+
+                    self.notify_scheduler_path(
+                        multipath::scheduler::SchedulerPathEvent::Closed(path_id),
+                    );
                 }
             },
 
@@ -8281,6 +8348,28 @@ impl<F: BufFactory> Connection<F> {
         #[cfg(not(feature = "multipath"))]
         {
             false
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    #[inline]
+    fn notify_scheduler_path(
+        &mut self,
+        event: multipath::scheduler::SchedulerPathEvent,
+    ) {
+        if let Some(ref mut scheduler) = self.scheduler {
+            scheduler.on_path_event(event);
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    #[inline]
+    fn notify_scheduler_conn(
+        &mut self,
+        event: multipath::scheduler::SchedulerConnEvent,
+    ) {
+        if let Some(ref mut scheduler) = self.scheduler {
+            scheduler.on_conn_event(event);
         }
     }
 
