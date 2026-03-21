@@ -146,7 +146,7 @@ pub struct Path {
     pub active_dcid_seq: Option<u64>,
 
     /// The current validation state of the path.
-    state: PathState,
+    pub(crate) state: PathState,
 
     /// Is this path used to send non-probing packets.
     active: bool,
@@ -416,6 +416,27 @@ impl Path {
         self.active() ||
             (self.state == PathState::Validated &&
                 self.active_dcid_seq.is_some())
+    }
+
+    /// Returns whether this path can carry data frames (STREAM, DATAGRAM,
+    /// ACK, flow-control).
+    ///
+    /// In single-path mode, only the active migration path is eligible.
+    /// In multipath mode, any validated, non-closing path with a DCID
+    /// assigned is eligible.
+    #[inline]
+    pub fn can_send(&self, multipath_enabled: bool) -> bool {
+        #[cfg(feature = "multipath")]
+        if multipath_enabled {
+            return self.validated()
+                && !self.mp_closing
+                && !self.mp_closed
+                && self.active_dcid_seq.is_some();
+        }
+
+        // Single-path mode or multipath feature not compiled in.
+        let _ = multipath_enabled;
+        self.active()
     }
 
     /// Returns whether the path is unused.

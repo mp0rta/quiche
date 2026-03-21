@@ -9700,6 +9700,20 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
+    /// Returns whether multipath is enabled for this connection.
+    /// When the multipath feature is not compiled in, always returns false.
+    #[inline]
+    fn mp_enabled(&self) -> bool {
+        #[cfg(feature = "multipath")]
+        {
+            self.multipath_enabled
+        }
+        #[cfg(not(feature = "multipath"))]
+        {
+            false
+        }
+    }
+
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
         #[cfg(feature = "multipath")]

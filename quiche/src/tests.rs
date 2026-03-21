@@ -13035,3 +13035,70 @@ fn multipath_path_abandon_frame_generated() {
         "mp_path_abandon_pending should be cleared after sending frame"
     );
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_can_send_boundary_conditions() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Exchange CIDs for second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    // Create second path — starts in Unknown state.
+    let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+
+    // Manually promote path 1 to Validated for testing can_send().
+    pipe.client.paths.get_mut(1).unwrap().state =
+        path::PathState::Validated;
+
+    // Path 0: active, validated => can_send(false)=true, can_send(true)=true
+    let path0 = pipe.client.paths.get(0).unwrap();
+    assert!(path0.can_send(false), "active path, single-path mode");
+    assert!(path0.can_send(true), "active path, multipath mode");
+
+    // Path 1: not active, validated + DCID => can_send(false)=false, can_send(true)=true
+    let path1 = pipe.client.paths.get(1).unwrap();
+    assert!(!path1.can_send(false), "secondary path, single-path mode");
+    assert!(path1.can_send(true), "secondary path, multipath mode");
+
+    // Mark path 1 as mp_closing => can_send(true)=false
+    pipe.client.paths.get_mut(1).unwrap().mp_closing = true;
+    let path1 = pipe.client.paths.get(1).unwrap();
+    assert!(!path1.can_send(true), "mp_closing path, multipath mode");
+
+    // Mark path 1 as mp_closed => can_send(true)=false
+    pipe.client.paths.get_mut(1).unwrap().mp_closing = false;
+    pipe.client.paths.get_mut(1).unwrap().mp_closed = true;
+    let path1 = pipe.client.paths.get(1).unwrap();
+    assert!(!path1.can_send(true), "mp_closed path, multipath mode");
+
+    // Reset path 1 and mark as Failed => can_send(true)=false
+    pipe.client.paths.get_mut(1).unwrap().mp_closed = false;
+    pipe.client.paths.get_mut(1).unwrap().state = path::PathState::Failed;
+    let path1 = pipe.client.paths.get(1).unwrap();
+    assert!(!path1.can_send(true), "failed path, multipath mode");
+    assert!(!path1.can_send(false), "failed path, single-path mode");
+
+    // Restore to Validated and remove DCID => can_send(true)=false
+    pipe.client.paths.get_mut(1).unwrap().state =
+        path::PathState::Validated;
+    let saved_dcid = pipe.client.paths.get(1).unwrap().active_dcid_seq;
+    pipe.client.paths.get_mut(1).unwrap().active_dcid_seq = None;
+    let path1 = pipe.client.paths.get(1).unwrap();
+    assert!(
+        !path1.can_send(true),
+        "path without DCID, multipath mode"
+    );
+    // Restore DCID
+    pipe.client.paths.get_mut(1).unwrap().active_dcid_seq = saved_dcid;
+}
