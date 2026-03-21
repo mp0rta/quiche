@@ -4299,14 +4299,39 @@ impl<F: BufFactory> Connection<F> {
                                 now,
                             );
 
+                            let size_estimate =
+                                if !self.dgram_send_queue.is_empty() {
+                                    self.dgram_send_queue
+                                        .peek_front_len()
+                                        .unwrap_or(0)
+                                        + 1
+                                        + frame::MAX_DGRAM_OVERHEAD
+                                } else if self.streams.has_flushable() {
+                                    // Stream frames fill available space;
+                                    // use buffer size as upper bound.
+                                    left
+                                } else {
+                                    // Control-only packet.
+                                    128
+                                };
+
+                            let packet_type = if !self.dgram_send_queue.is_empty()
+                            {
+                                multipath::scheduler::PacketContentType::Datagram
+                            } else if self.streams.has_flushable() {
+                                multipath::scheduler::PacketContentType::Stream
+                            } else {
+                                multipath::scheduler::PacketContentType::Control
+                            };
+
                             let packet_meta =
                                 multipath::scheduler::PacketMeta {
-                                    packet_type:
-                                        multipath::scheduler::PacketContentType::Stream,
-                                    size_estimate: 0,
+                                    packet_type,
+                                    size_estimate,
                                     is_retransmission: false,
                                     is_reinjection: false,
                                     original_path_id: None,
+                                    now,
                                 };
                             let decision =
                                 scheduler.select_path(&path_infos, &packet_meta);

@@ -101,6 +101,7 @@ mod tests {
             is_retransmission: false,
             is_reinjection: false,
             original_path_id: None,
+            now: std::time::Instant::now(),
         }
     }
 

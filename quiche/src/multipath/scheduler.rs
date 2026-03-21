@@ -59,6 +59,8 @@ pub struct PacketMeta {
     pub is_reinjection: bool,
     /// The path ID the packet was originally sent on, if applicable.
     pub original_path_id: Option<u64>,
+    /// Current time, for pacing-aware scheduling decisions.
+    pub now: Instant,
 }
 
 /// Type of content in the packet being scheduled.
