@@ -15,12 +15,33 @@ impl Scheduler for RoundRobinScheduler {
     fn select_path(
         &mut self,
         paths: &[PathInfo],
-        _packet: &PacketMeta,
+        packet: &PacketMeta,
     ) -> SchedulerDecision {
         if paths.is_empty() {
             return SchedulerDecision::NoAvailablePath;
         }
 
+        let now = packet.now;
+
+        // First try: ready (not pacing-delayed) Available paths.
+        let ready: Vec<&PathInfo> = paths
+            .iter()
+            .filter(|p| {
+                p.state >= PathState::Validated
+                    && p.cwnd_available > 0
+                    && p.app_status == PathAppStatus::Available
+                    && p.next_send_time.map_or(true, |t| t <= now)
+            })
+            .collect();
+
+        if !ready.is_empty() {
+            self.last_index %= ready.len();
+            let chosen = ready[self.last_index].path_id;
+            self.last_index = (self.last_index + 1) % ready.len();
+            return SchedulerDecision::Send(chosen);
+        }
+
+        // Second: all Available paths with cwnd (including delayed).
         let usable: Vec<&PathInfo> = paths
             .iter()
             .filter(|p| {
@@ -30,36 +51,36 @@ impl Scheduler for RoundRobinScheduler {
             })
             .collect();
 
-        if usable.is_empty() {
-            let backup: Vec<&PathInfo> = paths
-                .iter()
-                .filter(|p| {
-                    p.state >= PathState::Validated
-                        && p.cwnd_available > 0
-                        && p.app_status == PathAppStatus::Backup
-                })
-                .collect();
-
-            if backup.is_empty() {
-                let any_validated = paths
-                    .iter()
-                    .any(|p| p.state >= PathState::Validated);
-                return if any_validated {
-                    SchedulerDecision::AllBlocked
-                } else {
-                    SchedulerDecision::NoAvailablePath
-                };
-            }
-
-            self.last_index %= backup.len();
-            let chosen = backup[self.last_index].path_id;
-            self.last_index = (self.last_index + 1) % backup.len();
+        if !usable.is_empty() {
+            self.last_index %= usable.len();
+            let chosen = usable[self.last_index].path_id;
+            self.last_index = (self.last_index + 1) % usable.len();
             return SchedulerDecision::Send(chosen);
         }
 
-        self.last_index %= usable.len();
-        let chosen = usable[self.last_index].path_id;
-        self.last_index = (self.last_index + 1) % usable.len();
+        // Third: Backup paths.
+        let backup: Vec<&PathInfo> = paths
+            .iter()
+            .filter(|p| {
+                p.state >= PathState::Validated
+                    && p.cwnd_available > 0
+                    && p.app_status == PathAppStatus::Backup
+            })
+            .collect();
+
+        if backup.is_empty() {
+            let any_validated =
+                paths.iter().any(|p| p.state >= PathState::Validated);
+            return if any_validated {
+                SchedulerDecision::AllBlocked
+            } else {
+                SchedulerDecision::NoAvailablePath
+            };
+        }
+
+        self.last_index %= backup.len();
+        let chosen = backup[self.last_index].path_id;
+        self.last_index = (self.last_index + 1) % backup.len();
         SchedulerDecision::Send(chosen)
     }
 }
@@ -139,6 +160,45 @@ mod tests {
             sched.select_path(&paths, &default_packet()),
             SchedulerDecision::Send(1),
         );
+    }
+
+    #[test]
+    fn prefers_ready_paths_in_round_robin() {
+        let mut sched = RoundRobinScheduler::default();
+        let now = std::time::Instant::now();
+        let future = now + Duration::from_millis(50);
+
+        let paths = vec![
+            {
+                let mut p =
+                    make_path(0, 50, 10000, PathAppStatus::Available);
+                p.next_send_time = Some(future); // delayed
+                p
+            },
+            {
+                let mut p =
+                    make_path(1, 50, 10000, PathAppStatus::Available);
+                p.next_send_time = None; // ready
+                p
+            },
+            {
+                let mut p =
+                    make_path(2, 50, 10000, PathAppStatus::Available);
+                p.next_send_time = None; // ready
+                p
+            },
+        ];
+
+        let mut pkt = default_packet();
+        pkt.now = now;
+
+        let d1 = sched.select_path(&paths, &pkt);
+        let d2 = sched.select_path(&paths, &pkt);
+        let d3 = sched.select_path(&paths, &pkt);
+
+        assert_eq!(d1, SchedulerDecision::Send(1));
+        assert_eq!(d2, SchedulerDecision::Send(2));
+        assert_eq!(d3, SchedulerDecision::Send(1)); // wraps around
     }
 
     #[test]

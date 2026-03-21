@@ -13,10 +13,18 @@ impl Scheduler for MinRttScheduler {
     fn select_path(
         &mut self,
         paths: &[PathInfo],
-        _packet: &PacketMeta,
+        packet: &PacketMeta,
     ) -> SchedulerDecision {
-        let mut best_available: Option<(u64, std::time::Duration)> = None;
-        let mut best_backup: Option<(u64, std::time::Duration)> = None;
+        let now = packet.now;
+
+        let mut best_ready_avail: Option<(u64, std::time::Duration)> = None;
+        let mut best_ready_backup: Option<(u64, std::time::Duration)> = None;
+        let mut best_delayed_avail: Option<(u64, Option<std::time::Instant>)> =
+            None;
+        let mut best_delayed_backup: Option<(
+            u64,
+            Option<std::time::Instant>,
+        )> = None;
         let mut has_validated = false;
 
         for p in paths {
@@ -29,27 +37,81 @@ impl Scheduler for MinRttScheduler {
                 continue;
             }
 
-            let target = match p.app_status {
-                PathAppStatus::Available => &mut best_available,
-                PathAppStatus::Backup => &mut best_backup,
-            };
+            let is_ready = p.next_send_time.map_or(true, |t| t <= now);
 
-            match target {
-                Some((_, rtt)) if p.srtt < *rtt => {
-                    *target = Some((p.path_id, p.srtt));
-                }
-                None => {
-                    *target = Some((p.path_id, p.srtt));
-                }
-                _ => {}
+            match p.app_status {
+                PathAppStatus::Available => {
+                    if is_ready {
+                        match best_ready_avail {
+                            Some((_, rtt)) if p.srtt < rtt => {
+                                best_ready_avail =
+                                    Some((p.path_id, p.srtt));
+                            },
+                            None => {
+                                best_ready_avail =
+                                    Some((p.path_id, p.srtt));
+                            },
+                            _ => {},
+                        }
+                    }
+                    match best_delayed_avail {
+                        Some((_, t)) if p.next_send_time < t => {
+                            best_delayed_avail =
+                                Some((p.path_id, p.next_send_time));
+                        },
+                        None => {
+                            best_delayed_avail =
+                                Some((p.path_id, p.next_send_time));
+                        },
+                        _ => {},
+                    }
+                },
+                PathAppStatus::Backup => {
+                    if is_ready {
+                        match best_ready_backup {
+                            Some((_, rtt)) if p.srtt < rtt => {
+                                best_ready_backup =
+                                    Some((p.path_id, p.srtt));
+                            },
+                            None => {
+                                best_ready_backup =
+                                    Some((p.path_id, p.srtt));
+                            },
+                            _ => {},
+                        }
+                    }
+                    match best_delayed_backup {
+                        Some((_, t)) if p.next_send_time < t => {
+                            best_delayed_backup =
+                                Some((p.path_id, p.next_send_time));
+                        },
+                        None => {
+                            best_delayed_backup =
+                                Some((p.path_id, p.next_send_time));
+                        },
+                        _ => {},
+                    }
+                },
             }
         }
 
-        if let Some((id, _)) = best_available {
-            SchedulerDecision::Send(id)
-        } else if let Some((id, _)) = best_backup {
-            SchedulerDecision::Send(id)
-        } else if has_validated {
+        // Prefer ready paths (sorted by RTT).
+        if let Some((id, _)) = best_ready_avail {
+            return SchedulerDecision::Send(id);
+        }
+        if let Some((id, _)) = best_ready_backup {
+            return SchedulerDecision::Send(id);
+        }
+
+        // All pacing-delayed — pick earliest ready time.
+        if let Some((id, _)) = best_delayed_avail {
+            return SchedulerDecision::Send(id);
+        }
+        if let Some((id, _)) = best_delayed_backup {
+            return SchedulerDecision::Send(id);
+        }
+
+        if has_validated {
             SchedulerDecision::AllBlocked
         } else {
             SchedulerDecision::NoAvailablePath
@@ -175,6 +237,96 @@ mod tests {
         assert_eq!(
             sched.select_path(&[p], &default_packet()),
             SchedulerDecision::NoAvailablePath,
+        );
+    }
+
+    #[test]
+    fn prefers_ready_path_over_pacing_delayed() {
+        let mut sched = MinRttScheduler;
+        let now = std::time::Instant::now();
+        let future = now + Duration::from_millis(50);
+
+        let paths = vec![
+            {
+                let mut p =
+                    make_path(0, 10, 10000, PathAppStatus::Available);
+                p.next_send_time = Some(future); // pacing-delayed
+                p
+            },
+            {
+                let mut p =
+                    make_path(1, 50, 10000, PathAppStatus::Available);
+                p.next_send_time = None; // ready now
+                p
+            },
+        ];
+
+        let mut pkt = default_packet();
+        pkt.now = now;
+
+        assert_eq!(
+            sched.select_path(&paths, &pkt),
+            SchedulerDecision::Send(1)
+        );
+    }
+
+    #[test]
+    fn picks_earliest_when_all_delayed() {
+        let mut sched = MinRttScheduler;
+        let now = std::time::Instant::now();
+
+        let paths = vec![
+            {
+                let mut p =
+                    make_path(0, 10, 10000, PathAppStatus::Available);
+                p.next_send_time =
+                    Some(now + Duration::from_millis(100));
+                p
+            },
+            {
+                let mut p =
+                    make_path(1, 50, 10000, PathAppStatus::Available);
+                p.next_send_time =
+                    Some(now + Duration::from_millis(20));
+                p
+            },
+        ];
+
+        let mut pkt = default_packet();
+        pkt.now = now;
+
+        assert_eq!(
+            sched.select_path(&paths, &pkt),
+            SchedulerDecision::Send(1)
+        );
+    }
+
+    #[test]
+    fn ready_paths_still_sorted_by_rtt() {
+        let mut sched = MinRttScheduler;
+        let now = std::time::Instant::now();
+
+        let paths = vec![
+            {
+                let mut p =
+                    make_path(0, 50, 10000, PathAppStatus::Available);
+                p.next_send_time = None;
+                p
+            },
+            {
+                let mut p =
+                    make_path(1, 20, 10000, PathAppStatus::Available);
+                p.next_send_time = None;
+                p
+            },
+        ];
+
+        let mut pkt = default_packet();
+        pkt.now = now;
+
+        assert_eq!(
+            sched.select_path(&paths, &pkt),
+            SchedulerDecision::Send(1)
         );
     }
 
