@@ -4862,7 +4862,7 @@ impl<F: BufFactory> Connection<F> {
                     self.local_error
                         .as_ref()
                         .is_some_and(|le| le.is_app))) &&
-            path.active()
+            path.can_send(mp)
         {
             #[cfg(not(feature = "fuzzing"))]
             let ack_delay = pkt_space.largest_rx_pkt_time.elapsed();
@@ -5499,7 +5499,7 @@ impl<F: BufFactory> Connection<F> {
         if (pkt_type == Type::Short || pkt_type == Type::ZeroRTT) &&
             left > frame::MAX_DGRAM_OVERHEAD &&
             !is_closing &&
-            path.active() &&
+            path.can_send(mp) &&
             do_dgram
         {
             if let Some(max_dgram_payload) = max_dgram_len {
@@ -5579,17 +5579,10 @@ impl<F: BufFactory> Connection<F> {
 
         // Create a single STREAM frame for the first stream that is flushable.
         //
-        // In multipath mode, STREAM frames can be sent on any working path
-        // that the scheduler selected, not just the "active" migration path.
-        #[cfg(feature = "multipath")]
-        let path_can_send_stream = self.multipath_enabled || path.active();
-        #[cfg(not(feature = "multipath"))]
-        let path_can_send_stream = path.active();
-
         if (pkt_type == Type::Short || pkt_type == Type::ZeroRTT) &&
             left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing &&
-            path_can_send_stream &&
+            path.can_send(mp) &&
             !dgram_emitted
         {
             while let Some(priority_key) = self.streams.peek_flushable() {
