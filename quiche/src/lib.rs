@@ -4454,6 +4454,8 @@ impl<F: BufFactory> Connection<F> {
 
         let is_closing = self.local_error.is_some();
 
+        let mp = self.mp_enabled();
+
         let out_len = out.len();
 
         let mut b = octets::OctetsMut::with_slice(out);
@@ -5146,6 +5148,7 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // HANDSHAKE_DONE must only go on the active migration path.
         if pkt_type == Type::Short && !is_closing && path.active() {
             // Create HANDSHAKE_DONE frame.
             // self.should_send_handshake_done() but without the need to borrow
@@ -5162,7 +5165,11 @@ impl<F: BufFactory> Connection<F> {
                     in_flight = true;
                 }
             }
+        }
 
+        // Flow-control and stream-management frames can go on any
+        // sendable path.
+        if pkt_type == Type::Short && !is_closing && path.can_send(mp) {
             // Create MAX_STREAMS_BIDI frame.
             if self.streams.should_update_max_streams_bidi() ||
                 self.should_send_max_streams_bidi
