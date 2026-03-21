@@ -8077,6 +8077,24 @@ impl<F: BufFactory> Connection<F> {
                     {
                         p.total_acked_bytes += acked_bytes as u64;
                     }
+
+                    #[cfg(feature = "multipath")]
+                    if self.multipath_enabled {
+                        let pid = p.path_id;
+                        if p.recovery.cwnd_available() == 0 {
+                            if let Some(ref mut sched) = self.scheduler {
+                                sched.on_path_event(
+                                    multipath::scheduler::SchedulerPathEvent::Congested(pid),
+                                );
+                            }
+                        } else if lost_packets > 0 || acked_bytes > 0 {
+                            if let Some(ref mut sched) = self.scheduler {
+                                sched.on_path_event(
+                                    multipath::scheduler::SchedulerPathEvent::CwndAvailable(pid),
+                                );
+                            }
+                        }
+                    }
                 } else {
                     trace!(
                         "{} PATH_ACK for unknown path_id={}",
