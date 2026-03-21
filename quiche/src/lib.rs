@@ -7187,12 +7187,12 @@ impl<F: BufFactory> Connection<F> {
 
         self.dgram_send_queue.push(buf.to_vec())?;
 
-        let active_path = self.paths.get_active_mut()?;
-
-        if self.dgram_send_queue.byte_size() >
-            active_path.recovery.cwnd_available()
-        {
-            active_path.recovery.update_app_limited(false);
+        let agg_cwnd =
+            self.paths.aggregate_cwnd_available(self.mp_enabled());
+        if self.dgram_send_queue.byte_size() > agg_cwnd {
+            for (_, p) in self.paths.sendable_mut(self.mp_enabled()) {
+                p.recovery.update_app_limited(false);
+            }
         }
 
         Ok(())
@@ -7217,12 +7217,12 @@ impl<F: BufFactory> Connection<F> {
 
         self.dgram_send_queue.push(buf)?;
 
-        let active_path = self.paths.get_active_mut()?;
-
-        if self.dgram_send_queue.byte_size() >
-            active_path.recovery.cwnd_available()
-        {
-            active_path.recovery.update_app_limited(false);
+        let agg_cwnd =
+            self.paths.aggregate_cwnd_available(self.mp_enabled());
+        if self.dgram_send_queue.byte_size() > agg_cwnd {
+            for (_, p) in self.paths.sendable_mut(self.mp_enabled()) {
+                p.recovery.update_app_limited(false);
+            }
         }
 
         Ok(())
@@ -9716,29 +9716,8 @@ impl<F: BufFactory> Connection<F> {
 
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
-        #[cfg(feature = "multipath")]
-        let cwin_available = if self.multipath_enabled {
-            // In multipath mode, the send capacity should reflect the
-            // aggregate cwnd across all usable paths so that the
-            // application can fill stream buffers for the scheduler to
-            // distribute across paths.
-            self.paths
-                .iter()
-                .filter(|(_, p)| p.usable())
-                .map(|(_, p)| p.recovery.cwnd_available() as u64)
-                .sum()
-        } else {
-            match self.paths.get_active() {
-                Ok(p) => p.recovery.cwnd_available() as u64,
-                Err(_) => 0,
-            }
-        };
-
-        #[cfg(not(feature = "multipath"))]
-        let cwin_available = match self.paths.get_active() {
-            Ok(p) => p.recovery.cwnd_available() as u64,
-            Err(_) => 0,
-        };
+        let cwin_available =
+            self.paths.aggregate_cwnd_available(self.mp_enabled()) as u64;
 
         let cap =
             cmp::min(cwin_available, self.max_tx_data - self.tx_data) as usize;
@@ -9761,12 +9740,8 @@ impl<F: BufFactory> Connection<F> {
         // Note that this is equivalent to CheckIfApplicationLimited() from the
         // delivery rate draft. This is also separate from `recovery.app_limited`
         // and only applies to delivery rate calculation.
-        let cwin_available = self
-            .paths
-            .iter()
-            .filter(|&(_, p)| p.active())
-            .map(|(_, p)| p.recovery.cwnd_available())
-            .sum();
+        let cwin_available =
+            self.paths.aggregate_cwnd_available(self.mp_enabled());
 
         ((self.tx_buffered + self.dgram_send_queue_byte_size()) < cwin_available) &&
             (self.tx_data.saturating_sub(self.last_tx_data)) <
