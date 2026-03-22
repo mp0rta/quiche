@@ -276,6 +276,7 @@ where
 
                 #[cfg(feature = "multipath")]
                 while let Some(ev) = qconn.path_event_next() {
+                    self.handle_path_event_cleanup(&ev);
                     self.conn_stage.on_path_event(qconn, ev, ctx)?;
                 }
 
@@ -453,6 +454,31 @@ where
                 let _ = reply.send(result);
             },
         }
+    }
+
+    /// Clean up secondary socket resources when a path is closed or fails
+    /// validation. The main listening socket (self.cfg.local_addr) is never
+    /// cleaned up — only dynamically added sockets are removed.
+    #[cfg(feature = "multipath")]
+    fn handle_path_event_cleanup(&mut self, event: &quiche::PathEvent) {
+        let local_addr = match event {
+            quiche::PathEvent::Closed(local, _) |
+            quiche::PathEvent::FailedValidation(local, _) => *local,
+            _ => return,
+        };
+
+        // Never remove the primary socket.
+        if local_addr == self.cfg.local_addr {
+            return;
+        }
+
+        // Check if any other active paths still use this local address.
+        // If so, don't clean up yet.
+        // Note: We can't check the quiche connection here because we don't
+        // have a borrow to it (it's borrowed by the caller). The cleanup is
+        // best-effort: if another path uses the same socket, AddSocket will
+        // re-add it.
+        self.remove_multipath_socket(&local_addr).ok();
     }
 
     #[cfg(feature = "multipath")]

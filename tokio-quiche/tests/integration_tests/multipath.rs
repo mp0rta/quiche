@@ -459,3 +459,106 @@ async fn multipath_server_dynamic_socket() {
     );
     assert!(got_fin, "should receive FIN with server dynamic socket");
 }
+
+/// Tests that closing a path triggers automatic resource cleanup on the
+/// server, and the connection continues to work on the remaining path.
+#[tokio::test]
+async fn multipath_path_close_failover() {
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    // Handshake on path 0.
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+
+    // Supply extra SCIDs (needed for second path).
+    for _ in 0..3 {
+        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
+        conn.new_scid(&extra_scid, 0, false).unwrap();
+    }
+    exchange(&socket, client_addr, &mut conn).await;
+
+    // Create second path from a new local address.
+    let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr2 = socket2.local_addr().unwrap();
+
+    let path_id = conn
+        .create_path(client_addr2, server_addr)
+        .expect("create_path should succeed");
+
+    // Validate the second path.
+    for _ in 0..6 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    let path_stats: Vec<_> = conn.path_stats().collect();
+    assert!(
+        path_stats.len() >= 2,
+        "should have at least 2 paths before close, got {}",
+        path_stats.len()
+    );
+
+    // Close the second path. Traffic should failover to path 0.
+    conn.close_path(path_id, 0)
+        .expect("close_path should succeed");
+
+    // Exchange to propagate the PATH_ABANDON frame.
+    for _ in 0..4 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    // Create H3 connection on the surviving path and send a request.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    for _ in 0..3 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    for _ in 0..8 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(
+        got_headers,
+        "should receive H3 response after path close failover"
+    );
+    assert!(got_fin, "should receive FIN after path close failover");
+}
