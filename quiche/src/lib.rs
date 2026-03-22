@@ -6949,6 +6949,47 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Replaces the multipath scheduler algorithm at runtime.
+    ///
+    /// The new scheduler is notified of all currently active paths via
+    /// [`SchedulerPathEvent::Activated`] events so it can immediately
+    /// participate in scheduling decisions.
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated.
+    #[cfg(feature = "multipath")]
+    pub fn set_multipath_scheduler(
+        &mut self,
+        algo: multipath::scheduler::MultipathSchedulerAlgorithm,
+    ) -> Result<()> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+
+        use multipath::scheduler::MultipathSchedulerAlgorithm::*;
+        use multipath::scheduler::SchedulerFactory;
+        use multipath::schedulers::*;
+
+        let mut new_scheduler = match algo {
+            MinRtt => MinRttSchedulerFactory.create(),
+            RoundRobin => RoundRobinSchedulerFactory.create(),
+        };
+
+        // Inform the new scheduler about all active paths.
+        for (_, p) in self.paths.iter() {
+            if !p.mp_closing && p.active() {
+                new_scheduler.on_path_event(
+                    multipath::scheduler::SchedulerPathEvent::Activated(
+                        p.path_id,
+                    ),
+                );
+            }
+        }
+
+        self.scheduler = Some(new_scheduler);
+        Ok(())
+    }
+
     /// Sets the application-level status of the multipath path identified by
     /// `path_id`.
     ///

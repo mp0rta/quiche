@@ -442,6 +442,16 @@ where
                 let result = self.remove_multipath_socket(&local_addr);
                 let _ = reply.send(result);
             },
+            MultipathCommand::QueryPathStats { reply } => {
+                let stats: Vec<_> = qconn.path_stats().collect();
+                let _ = reply.send(stats);
+            },
+            MultipathCommand::SetScheduler { algorithm, reply } => {
+                let result = qconn
+                    .set_multipath_scheduler(algorithm)
+                    .map_err(|e| -> crate::BoxError { Box::new(e) });
+                let _ = reply.send(result);
+            },
         }
     }
 

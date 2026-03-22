@@ -59,6 +59,7 @@ fn multipath_server_settings() -> QuicSettings {
         enabled: true,
         scheduler: tokio_quiche::MultipathScheduler::MinRtt,
         max_active_paths: Some(4),
+        reinjection_mode: tokio_quiche::ReinjectionMode::default(),
     };
     settings
 }

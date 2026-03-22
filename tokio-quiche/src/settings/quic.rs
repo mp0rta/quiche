@@ -37,6 +37,16 @@ pub enum MultipathScheduler {
     RoundRobin,
 }
 
+/// When to perform packet reinjection relative to normal scheduling.
+#[settings]
+pub enum ReinjectionMode {
+    /// Reinjection is attempted after normal packet scheduling.
+    #[default]
+    AfterScheduling,
+    /// Reinjection is attempted before normal packet scheduling.
+    BeforeScheduling,
+}
+
 /// Multipath QUIC configuration.
 #[settings]
 pub struct MultipathSettings {
@@ -48,6 +58,10 @@ pub struct MultipathSettings {
     /// Maximum number of active paths. None means no limit.
     /// Used to derive initial_max_path_id and active_connection_id_limit.
     pub max_active_paths: Option<usize>,
+    /// Packet reinjection mode — controls when lost packets are
+    /// re-sent on an alternate path.
+    #[serde(default)]
+    pub reinjection_mode: ReinjectionMode,
 }
 
 /// QUIC configuration parameters.

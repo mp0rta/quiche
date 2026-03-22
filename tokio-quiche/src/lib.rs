@@ -136,6 +136,8 @@ pub use crate::quic::MultipathHandle;
 pub use crate::settings::MultipathScheduler;
 #[cfg(feature = "multipath")]
 pub use crate::settings::MultipathSettings;
+#[cfg(feature = "multipath")]
+pub use crate::settings::ReinjectionMode;
 
 #[doc(hidden)]
 pub use crate::result::QuicResultExt;

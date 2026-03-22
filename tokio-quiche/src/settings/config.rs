@@ -215,6 +215,18 @@ fn make_quiche_config(
                 quiche::multipath::scheduler::MultipathSchedulerAlgorithm::RoundRobin,
             ),
         }
+
+        {
+            use crate::settings::quic::ReinjectionMode;
+            match quic_settings.multipath.reinjection_mode {
+                ReinjectionMode::AfterScheduling => config.set_reinjection_mode(
+                    quiche::multipath::reinjection::ReinjectionMode::AfterScheduling,
+                ),
+                ReinjectionMode::BeforeScheduling => config.set_reinjection_mode(
+                    quiche::multipath::reinjection::ReinjectionMode::BeforeScheduling,
+                ),
+            }
+        }
     }
 
     if let Some(track_unknown_transport_params) =

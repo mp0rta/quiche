@@ -594,6 +594,15 @@ pub enum MultipathCommand {
         local_addr: SocketAddr,
         reply: oneshot::Sender<QuicResult<()>>,
     },
+    /// Query active path statistics.
+    QueryPathStats {
+        reply: oneshot::Sender<Vec<quiche::PathStats>>,
+    },
+    /// Change the multipath scheduler algorithm at runtime.
+    SetScheduler {
+        algorithm: quiche::multipath::scheduler::MultipathSchedulerAlgorithm,
+        reply: oneshot::Sender<QuicResult<()>>,
+    },
 }
 
 /// Handle for applications to manage multipath connections.
@@ -685,6 +694,38 @@ impl MultipathHandle {
         self.cmd_sender
             .send(MultipathCommand::RemoveSocket {
                 local_addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?
+    }
+
+    /// Query statistics for all paths on this connection.
+    pub async fn path_stats(&self) -> QuicResult<Vec<quiche::PathStats>> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::QueryPathStats { reply: reply_tx })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })
+    }
+
+    /// Change the multipath scheduler algorithm at runtime.
+    pub async fn set_scheduler(
+        &self,
+        algorithm: quiche::multipath::scheduler::MultipathSchedulerAlgorithm,
+    ) -> QuicResult<()> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::SetScheduler {
+                algorithm,
                 reply: reply_tx,
             })
             .await
