@@ -744,6 +744,17 @@ pub trait ApplicationOverQuic: Send + 'static {
         connection_result: &QuicResult<()>,
     ) {
     }
+
+    /// Called when a path event occurs (e.g. new path, validated, closed).
+    ///
+    /// Default implementation is a no-op for backward compatibility.
+    #[cfg(feature = "multipath")]
+    fn on_path_event(
+        &mut self, qconn: &mut QuicheConnection, event: quiche::PathEvent,
+    ) -> QuicResult<()> {
+        let _ = (qconn, event);
+        Ok(())
+    }
 }
 
 /// A command to execute on a [quiche::Connection] in the context of an

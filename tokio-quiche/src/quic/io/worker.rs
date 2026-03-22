@@ -249,6 +249,12 @@ where
                 }
 
                 self.conn_stage.on_read(did_recv, qconn, ctx)?;
+
+                #[cfg(feature = "multipath")]
+                while let Some(ev) = qconn.path_event_next() {
+                    self.conn_stage.on_path_event(qconn, ev, ctx)?;
+                }
+
                 self.refresh_connection_ids(qconn);
 
                 let can_release = match self.write_state.next_release_time {

@@ -74,6 +74,15 @@ pub trait ConnectionStage: Send + Debug {
     ) -> ControlFlow<QuicResult<()>> {
         ControlFlow::Continue(())
     }
+
+    #[cfg(feature = "multipath")]
+    fn on_path_event<A: ApplicationOverQuic>(
+        &mut self, _qconn: &mut QuicheConnection,
+        _event: quiche::PathEvent,
+        _ctx: &mut ConnectionStageContext<A>,
+    ) -> QuicResult<()> {
+        Ok(())
+    }
 }
 
 /// Global context shared across all [ConnectionStage]s for a given connection
@@ -164,6 +173,15 @@ impl ConnectionStage for RunningApplication {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "multipath")]
+    fn on_path_event<A: ApplicationOverQuic>(
+        &mut self, qconn: &mut QuicheConnection,
+        event: quiche::PathEvent,
+        ctx: &mut ConnectionStageContext<A>,
+    ) -> QuicResult<()> {
+        ctx.application.on_path_event(qconn, event)
     }
 }
 
