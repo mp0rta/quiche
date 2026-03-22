@@ -122,6 +122,10 @@ pub use self::connection::Incoming;
 pub use self::connection::QuicCommand;
 pub use self::connection::QuicConnectionStats;
 pub use self::connection::SimpleConnectionIdGenerator;
+#[cfg(feature = "multipath")]
+pub use self::connection::MultipathCommand;
+#[cfg(feature = "multipath")]
+pub use self::connection::MultipathHandle;
 pub use self::hooks::ConnectionHook;
 
 /// Alias of [quiche::Connection] used internally by the crate.

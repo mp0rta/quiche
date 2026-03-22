@@ -128,6 +128,15 @@ pub use crate::result::BoxError;
 pub use crate::result::QuicResult;
 pub use crate::settings::ConnectionParams;
 
+#[cfg(feature = "multipath")]
+pub use crate::quic::MultipathCommand;
+#[cfg(feature = "multipath")]
+pub use crate::quic::MultipathHandle;
+#[cfg(feature = "multipath")]
+pub use crate::settings::MultipathScheduler;
+#[cfg(feature = "multipath")]
+pub use crate::settings::MultipathSettings;
+
 #[doc(hidden)]
 pub use crate::result::QuicResultExt;
 
