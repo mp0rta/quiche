@@ -1529,3 +1529,51 @@ mod server_side_driver {
         );
     }
 }
+
+#[cfg(feature = "multipath")]
+mod multipath {
+    use super::*;
+    use crate::ApplicationOverQuic;
+
+    #[test]
+    fn path_event_forwarded_to_controller() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+
+        let local: std::net::SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:4321".parse().unwrap();
+        let event = quiche::PathEvent::Validated(local, peer);
+
+        helper
+            .driver
+            .on_path_event(&mut helper.pipe.server, event.clone())
+            .unwrap();
+
+        let received = helper
+            .controller
+            .event_receiver_mut()
+            .try_recv()
+            .unwrap();
+
+        assert_matches!(
+            received,
+            ServerH3Event::Core(H3Event::PathEvent(
+                quiche::PathEvent::Validated(l, p)
+            )) if l == local && p == peer
+        );
+    }
+
+    #[test]
+    fn multipath_handle_setter_getter() {
+        let (_driver, mut controller) =
+            H3Driver::<ServerHooks>::new(Http3Settings::default());
+
+        assert!(controller.multipath().is_none());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let handle = crate::quic::connection::MultipathHandle::from_sender(tx);
+        controller.set_multipath_handle(handle);
+
+        assert!(controller.multipath().is_some());
+    }
+}

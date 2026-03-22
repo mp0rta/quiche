@@ -598,6 +598,13 @@ pub struct MultipathHandle {
 
 #[cfg(feature = "multipath")]
 impl MultipathHandle {
+    /// Creates a `MultipathHandle` from an existing command sender.
+    pub(crate) fn from_sender(
+        cmd_sender: mpsc::Sender<MultipathCommand>,
+    ) -> Self {
+        Self { cmd_sender }
+    }
+
     /// Add a UDP socket bound to a local address for multipath use.
     ///
     /// After adding a socket, call [`create_path()`](Self::create_path) to
