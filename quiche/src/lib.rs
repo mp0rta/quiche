@@ -4297,7 +4297,25 @@ impl<F: BufFactory> Connection<F> {
                 #[cfg(feature = "multipath")]
                 {
                     if self.multipath_enabled && from.is_none() && to.is_none() {
-                        if let Some(scheduler) = &mut self.scheduler {
+                        // Probing packets (PATH_CHALLENGE/RESPONSE) take
+                        // priority over the scheduler — otherwise the
+                        // scheduler may starve unvalidated paths by always
+                        // picking validated ones.
+                        let probing_pid = if self.is_established() {
+                            self.paths
+                                .iter()
+                                .filter(|(_, p)| !p.mp_closing)
+                                .filter(|(_, p)| p.active_dcid_seq.is_some())
+                                .filter(|(_, p)| p.probing_required())
+                                .map(|(pid, _)| pid)
+                                .next()
+                        } else {
+                            None
+                        };
+
+                        if let Some(pid) = probing_pid {
+                            pid
+                        } else if let Some(scheduler) = &mut self.scheduler {
                             let mut path_infos =
                                 std::mem::take(&mut self.path_info_buf);
                             multipath::refresh_path_info(
@@ -4314,22 +4332,19 @@ impl<F: BufFactory> Connection<F> {
                                         + 1
                                         + frame::MAX_DGRAM_OVERHEAD
                                 } else if self.streams.has_flushable() {
-                                    // Stream frames fill available space;
-                                    // use buffer size as upper bound.
                                     left
                                 } else {
-                                    // Control-only packet.
                                     128
                                 };
 
-                            let packet_type = if !self.dgram_send_queue.is_empty()
-                            {
-                                multipath::scheduler::PacketContentType::Datagram
-                            } else if self.streams.has_flushable() {
-                                multipath::scheduler::PacketContentType::Stream
-                            } else {
-                                multipath::scheduler::PacketContentType::Control
-                            };
+                            let packet_type =
+                                if !self.dgram_send_queue.is_empty() {
+                                    multipath::scheduler::PacketContentType::Datagram
+                                } else if self.streams.has_flushable() {
+                                    multipath::scheduler::PacketContentType::Stream
+                                } else {
+                                    multipath::scheduler::PacketContentType::Control
+                                };
 
                             let packet_meta =
                                 multipath::scheduler::PacketMeta {
@@ -4355,7 +4370,8 @@ impl<F: BufFactory> Connection<F> {
                                 multipath::scheduler::SchedulerDecision::Send(
                                     selected_path_id,
                                 ) => {
-                                    let pid = self.paths
+                                    let pid = self
+                                        .paths
                                         .iter()
                                         .find_map(|(i, p)| {
                                             if p.path_id == selected_path_id {
@@ -4365,7 +4381,9 @@ impl<F: BufFactory> Connection<F> {
                                             }
                                         })
                                         .ok_or(Error::InvalidState)?;
-                                    if let Some(ref mut sched) = self.scheduler {
+                                    if let Some(ref mut sched) =
+                                        self.scheduler
+                                    {
                                         sched.on_conn_event(
                                             multipath::scheduler::SchedulerConnEvent::RoundEnd,
                                         );
@@ -4373,7 +4391,9 @@ impl<F: BufFactory> Connection<F> {
                                     pid
                                 },
                                 _ => {
-                                    if let Some(ref mut sched) = self.scheduler {
+                                    if let Some(ref mut sched) =
+                                        self.scheduler
+                                    {
                                         sched.on_conn_event(
                                             multipath::scheduler::SchedulerConnEvent::RoundEnd,
                                         );

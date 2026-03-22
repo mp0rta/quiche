@@ -23,8 +23,9 @@ pub(crate) fn refresh_path_info(
 ) {
     buf.clear();
     for (_, path) in paths.iter() {
-        // Skip paths that have been fully closed in the multipath sense.
-        if path.mp_closed {
+        // Skip paths that are closing or already closed — the scheduler
+        // must not select them for new data.
+        if path.mp_closing || path.mp_closed {
             continue;
         }
         buf.push(scheduler::PathInfo {
