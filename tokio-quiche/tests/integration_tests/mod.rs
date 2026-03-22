@@ -44,6 +44,8 @@ pub mod async_callbacks;
 pub mod connection_close;
 pub mod headers;
 pub mod migration;
+#[cfg(feature = "multipath")]
+pub mod multipath;
 pub mod timeouts;
 pub mod zero_rtt;
 

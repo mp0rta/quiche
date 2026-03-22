@@ -142,7 +142,9 @@ pub async fn serve_connection_details(
                             H3Event::IncomingSettings {..} | H3Event::BodyBytesReceived { .. } | H3Event::StreamClosed { .. } | H3Event::IncomingHeaders(..) => {},
                             H3Event::ConnectionError(err) => { break Err(err.into()); }
                             H3Event::ConnectionShutdown(Some(err)) => { break Err(err.into()); }
-                            _ => unreachable!()
+                            H3Event::ConnectionShutdown(None) | H3Event::ResetStream { .. } | H3Event::NewFlow { .. } => {},
+                            #[cfg(feature = "multipath")]
+                            H3Event::PathEvent(_) => {},
                         }
                     }
 
