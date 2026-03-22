@@ -123,6 +123,10 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     pub(crate) cmd_receiver: Option<mpsc::Receiver<crate::quic::connection::MultipathCommand>>,
     #[cfg(feature = "multipath")]
     pub(crate) incoming_ev_sender: Option<mpsc::Sender<Incoming>>,
+    #[cfg(feature = "multipath")]
+    pub(crate) socket_registry: Option<crate::socket::registry::SocketRegistry<tokio::net::UdpSocket>>,
+    #[cfg(feature = "multipath")]
+    pub(crate) recv_task_handles: std::collections::HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
 pub(crate) struct IoWorker<Tx, M, S> {
@@ -147,6 +151,8 @@ pub(crate) struct IoWorker<Tx, M, S> {
     cmd_receiver: Option<mpsc::Receiver<crate::quic::connection::MultipathCommand>>,
     #[cfg(feature = "multipath")]
     incoming_ev_sender: Option<mpsc::Sender<Incoming>>,
+    #[cfg(feature = "multipath")]
+    recv_task_handles: std::collections::HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -175,11 +181,13 @@ where
             conn_stage,
             bw_estimator,
             #[cfg(feature = "multipath")]
-            socket_registry: None,
+            socket_registry: params.socket_registry,
             #[cfg(feature = "multipath")]
             cmd_receiver: params.cmd_receiver,
             #[cfg(feature = "multipath")]
             incoming_ev_sender: params.incoming_ev_sender,
+            #[cfg(feature = "multipath")]
+            recv_task_handles: params.recv_task_handles,
         }
     }
 
@@ -430,6 +438,32 @@ where
                     .map_err(|e| Box::new(e) as _);
                 let _ = reply.send(result);
             },
+            MultipathCommand::RemoveSocket { local_addr, reply } => {
+                let result = self.remove_multipath_socket(&local_addr);
+                let _ = reply.send(result);
+            },
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    fn remove_multipath_socket(
+        &mut self, local_addr: &SocketAddr,
+    ) -> QuicResult<()> {
+        if let Some(ref mut registry) = self.socket_registry {
+            registry.remove(local_addr);
+        }
+        if let Some(handle) = self.recv_task_handles.remove(local_addr) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    /// Abort all spawned recv tasks. Called when the IoWorker is shutting
+    /// down to prevent leaked tasks.
+    #[cfg(feature = "multipath")]
+    fn abort_recv_tasks(&mut self) {
+        for (_, handle) in self.recv_task_handles.drain() {
+            handle.abort();
         }
     }
 
@@ -439,26 +473,15 @@ where
     ) -> QuicResult<()> {
         let socket = Arc::new(socket);
 
-        // Initialize registry if needed, using the main socket as a
-        // placeholder default (it won't be looked up by address).
-        if self.socket_registry.is_none() {
-            // We need a default Arc<UdpSocket> for the registry. Since the
-            // main socket may not be a UdpSocket (it's MaybeConnectedSocket<Tx>),
-            // we create the registry lazily and the first added socket becomes
-            // the reference.
-            self.socket_registry = Some(
-                crate::socket::registry::SocketRegistry::new(socket.clone()),
-            );
-        }
-
-        if let Some(ref mut registry) = self.socket_registry {
-            registry.insert(local_addr, Arc::clone(&socket));
-        }
+        let registry = self.socket_registry.get_or_insert_with(
+            crate::socket::registry::SocketRegistry::new,
+        );
+        registry.insert(local_addr, Arc::clone(&socket));
 
         // Spawn recv task feeding into the existing incoming channel.
         if let Some(ref sender) = self.incoming_ev_sender {
             let sender = sender.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
                 loop {
                     match socket.recv_from(&mut buf).await {
@@ -490,6 +513,7 @@ where
                     }
                 }
             });
+            self.recv_task_handles.insert(local_addr, handle);
         }
 
         Ok(())
@@ -1110,6 +1134,10 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             cmd_receiver: value.cmd_receiver,
             #[cfg(feature = "multipath")]
             incoming_ev_sender: value.incoming_ev_sender,
+            #[cfg(feature = "multipath")]
+            socket_registry: value.socket_registry,
+            #[cfg(feature = "multipath")]
+            recv_task_handles: value.recv_task_handles,
         }
     }
 }
@@ -1232,6 +1260,9 @@ where
         for cid in qconn.source_ids().cloned() {
             self.unmap_cid(cid.into_owned());
         }
+
+        #[cfg(feature = "multipath")]
+        self.abort_recv_tasks();
 
         self.metrics.connections_in_memory().dec();
     }

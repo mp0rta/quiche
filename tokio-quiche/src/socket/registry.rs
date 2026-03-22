@@ -37,17 +37,17 @@ use std::sync::Arc;
 /// Manages multiple sockets for multipath connections.
 ///
 /// Each socket is registered by its local address. The registry provides
-/// lookup for send-side routing and a default fallback socket.
+/// lookup for send-side routing: only explicitly registered addresses are
+/// returned. The main listening socket is NOT registered here — it uses
+/// the IoWorker's primary socket directly.
 pub(crate) struct SocketRegistry<Tx: ?Sized> {
-    default_socket: Arc<Tx>,
     sockets: HashMap<SocketAddr, Arc<Tx>>,
 }
 
 impl<Tx: ?Sized> SocketRegistry<Tx> {
-    /// Create a new registry with the initial (default) socket.
-    pub fn new(default_socket: Arc<Tx>) -> Self {
+    /// Create an empty registry.
+    pub fn new() -> Self {
         Self {
-            default_socket,
             sockets: HashMap::new(),
         }
     }
@@ -57,13 +57,7 @@ impl<Tx: ?Sized> SocketRegistry<Tx> {
         self.sockets.insert(local_addr, socket);
     }
 
-    /// Look up the socket for a local address, falling back to the default.
-    pub fn get(&self, local_addr: &SocketAddr) -> &Arc<Tx> {
-        self.sockets.get(local_addr).unwrap_or(&self.default_socket)
-    }
-
-    /// Look up an explicitly registered socket. Returns `None` if the
-    /// address is not in the registry (does not fall back to the default).
+    /// Look up a registered socket by local address.
     pub fn lookup(&self, local_addr: &SocketAddr) -> Option<&Arc<Tx>> {
         self.sockets.get(local_addr)
     }
@@ -73,7 +67,7 @@ impl<Tx: ?Sized> SocketRegistry<Tx> {
         self.sockets.remove(local_addr)
     }
 
-    /// Returns all registered local addresses (excluding the default).
+    /// Returns all registered local addresses.
     pub fn local_addrs(&self) -> impl Iterator<Item = &SocketAddr> {
         self.sockets.keys()
     }
@@ -89,41 +83,16 @@ mod tests {
     }
 
     #[test]
-    fn get_returns_default_when_no_match() {
-        let default = Arc::new(5000u16);
-        let registry = SocketRegistry::new(default.clone());
-        let result = registry.get(&addr(9999));
-        assert_eq!(**result, 5000);
-    }
-
-    #[test]
-    fn get_returns_registered_socket() {
-        let default = Arc::new(5000u16);
-        let mut registry = SocketRegistry::new(default);
+    fn lookup_returns_registered_socket() {
+        let mut registry = SocketRegistry::new();
         let a = addr(6000);
         registry.insert(a, Arc::new(6000u16));
-        assert_eq!(**registry.get(&a), 6000);
-    }
-
-    #[test]
-    fn remove_returns_socket_and_falls_back() {
-        let default = Arc::new(5000u16);
-        let mut registry = SocketRegistry::new(default);
-        let a = addr(6000);
-        registry.insert(a, Arc::new(6000u16));
-
-        let removed = registry.remove(&a);
-        assert!(removed.is_some());
-        assert_eq!(*removed.unwrap(), 6000);
-
-        // Falls back to default after removal
-        assert_eq!(**registry.get(&a), 5000);
+        assert_eq!(**registry.lookup(&a).unwrap(), 6000);
     }
 
     #[test]
     fn lookup_returns_none_for_unregistered() {
-        let default = Arc::new(5000u16);
-        let mut registry = SocketRegistry::new(default);
+        let mut registry: SocketRegistry<u16> = SocketRegistry::new();
         let a = addr(6000);
         let b = addr(7000);
         registry.insert(a, Arc::new(6000u16));
@@ -133,9 +102,22 @@ mod tests {
     }
 
     #[test]
+    fn remove_returns_socket() {
+        let mut registry = SocketRegistry::new();
+        let a = addr(6000);
+        registry.insert(a, Arc::new(6000u16));
+
+        let removed = registry.remove(&a);
+        assert!(removed.is_some());
+        assert_eq!(*removed.unwrap(), 6000);
+
+        // Gone after removal
+        assert!(registry.lookup(&a).is_none());
+    }
+
+    #[test]
     fn local_addrs_returns_registered_addresses() {
-        let default = Arc::new(0u16);
-        let mut registry = SocketRegistry::new(default);
+        let mut registry = SocketRegistry::new();
         let a1 = addr(6000);
         let a2 = addr(7000);
         registry.insert(a1, Arc::new(6000u16));

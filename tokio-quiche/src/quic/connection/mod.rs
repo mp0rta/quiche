@@ -360,6 +360,10 @@ where
             cmd_receiver: Some(mp_cmd_rx),
             #[cfg(feature = "multipath")]
             incoming_ev_sender: Some(incoming_ev_sender),
+            #[cfg(feature = "multipath")]
+            socket_registry: None,
+            #[cfg(feature = "multipath")]
+            recv_task_handles: std::collections::HashMap::new(),
         };
 
         let handshake_fut = async move {
@@ -585,6 +589,11 @@ pub enum MultipathCommand {
         path_id: u64,
         reply: oneshot::Sender<QuicResult<()>>,
     },
+    /// Remove a previously added socket and stop its recv task.
+    RemoveSocket {
+        local_addr: SocketAddr,
+        reply: oneshot::Sender<QuicResult<()>>,
+    },
 }
 
 /// Handle for applications to manage multipath connections.
@@ -656,6 +665,26 @@ impl MultipathHandle {
         self.cmd_sender
             .send(MultipathCommand::ClosePath {
                 path_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?
+    }
+
+    /// Remove a socket and stop its recv task.
+    ///
+    /// All paths using this local address should be closed first.
+    pub async fn remove_socket(
+        &self, local_addr: SocketAddr,
+    ) -> QuicResult<()> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::RemoveSocket {
+                local_addr,
                 reply: reply_tx,
             })
             .await
