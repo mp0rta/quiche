@@ -29,6 +29,8 @@
 mod capabilities;
 mod connected;
 mod listener;
+#[cfg(feature = "multipath")]
+pub(crate) mod registry;
 
 pub use self::capabilities::SocketCapabilities;
 #[cfg(target_os = "linux")]
