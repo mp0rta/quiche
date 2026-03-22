@@ -120,6 +120,12 @@ impl<F: BufFactory> Connection<F> {
 
                         self.retrans_count += 1;
                         p.retrans_count += 1;
+
+                        #[cfg(feature = "multipath")]
+                        {
+                            self.pending_reinjection_path =
+                                Some(p.path_id);
+                        }
                     },
 
                     frame::Frame::ACK { .. } => {

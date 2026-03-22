@@ -1612,6 +1612,11 @@ where
     #[allow(dead_code)]
     stream_qos_hints:
         std::collections::HashMap<u64, multipath::reinjection::StreamQosHint>,
+
+    /// Path ID where the most recent stream frame loss was detected.
+    /// Consumed by send_on_path() when constructing PacketMeta.
+    #[cfg(feature = "multipath")]
+    pending_reinjection_path: Option<u64>,
 }
 
 /// Creates a new server-side connection.
@@ -2253,6 +2258,8 @@ impl<F: BufFactory> Connection<F> {
             path_info_buf: Vec::new(),
             #[cfg(feature = "multipath")]
             stream_qos_hints: std::collections::HashMap::new(),
+            #[cfg(feature = "multipath")]
+            pending_reinjection_path: None,
         };
 
         if let Some(retry_cids) = retry_cids {
@@ -4329,8 +4336,12 @@ impl<F: BufFactory> Connection<F> {
                                     packet_type,
                                     size_estimate,
                                     is_retransmission: false,
-                                    is_reinjection: false,
-                                    original_path_id: None,
+                                    is_reinjection: self
+                                        .pending_reinjection_path
+                                        .is_some(),
+                                    original_path_id: self
+                                        .pending_reinjection_path
+                                        .take(),
                                     now,
                                 };
                             scheduler.on_conn_event(
