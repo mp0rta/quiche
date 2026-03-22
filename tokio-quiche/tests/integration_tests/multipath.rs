@@ -522,25 +522,31 @@ async fn multipath_path_close_failover() {
         path_stats.len()
     );
 
-    // Close the second path. Traffic should failover to path 0.
-    conn.close_path(path_id, 0)
-        .expect("close_path should succeed");
+    // Create H3 connection before closing the path to ensure H3 settings
+    // are exchanged while both paths are available.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
 
-    // Exchange to propagate the PATH_ABANDON frame.
-    for _ in 0..4 {
+    for _ in 0..3 {
         exchange_both(
             &socket, client_addr, &socket2, client_addr2, &mut conn,
         )
         .await;
     }
 
-    // Create H3 connection on the surviving path and send a request.
-    let h3_config = quiche::h3::Config::new().unwrap();
-    let mut h3_conn =
-        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+    // Close the second path. Traffic should failover to path 0.
+    conn.close_path(path_id, 0)
+        .expect("close_path should succeed");
 
-    for _ in 0..3 {
-        exchange(&socket, client_addr, &mut conn).await;
+    // Exchange on both sockets to propagate the PATH_ABANDON frame and
+    // drain any in-flight packets the server may still send on path 1.
+    for _ in 0..6 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+        while let Some(_ev) = conn.path_event_next() {}
     }
 
     let req = vec![
@@ -551,8 +557,11 @@ async fn multipath_path_close_failover() {
     ];
     h3_conn.send_request(&mut conn, &req, true).unwrap();
 
-    for _ in 0..8 {
-        exchange(&socket, client_addr, &mut conn).await;
+    for _ in 0..12 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
     }
 
     let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
@@ -669,4 +678,222 @@ async fn multipath_runtime_scheduler_switch() {
         "should receive H3 response after scheduler switch"
     );
     assert!(got_fin, "should receive FIN after scheduler switch");
+}
+
+/// Verifies that a second path is properly validated and both paths carry
+/// traffic. Uses per-path `sent` counters on the client side with RoundRobin
+/// scheduler to confirm the client distributes traffic.
+#[tokio::test]
+async fn multipath_both_paths_carry_traffic() {
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+    // RoundRobin ensures client distributes across both paths.
+    client_config.set_multipath_scheduler(
+        quiche::multipath::scheduler::MultipathSchedulerAlgorithm::RoundRobin,
+    );
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    for _ in 0..3 {
+        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
+        conn.new_scid(&extra_scid, 0, false).unwrap();
+    }
+    exchange(&socket, client_addr, &mut conn).await;
+
+    let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr2 = socket2.local_addr().unwrap();
+
+    conn.create_path(client_addr2, server_addr)
+        .expect("create_path should succeed");
+
+    // Exchange until the second path is validated.
+    let mut path1_validated = false;
+    for _ in 0..15 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+        while let Some(ev) = conn.path_event_next() {
+            if matches!(ev, quiche::PathEvent::Validated(..)) {
+                path1_validated = true;
+            }
+        }
+        if path1_validated {
+            break;
+        }
+    }
+    assert!(path1_validated, "path 1 should be validated");
+
+    // Both paths should now be active.
+    let stats: Vec<_> = conn.path_stats().collect();
+    assert!(stats.len() >= 2, "should have 2+ paths");
+
+    // Snapshot sent counts before H3 transfer.
+    let sent_before: Vec<usize> = stats.iter().map(|s| s.sent).collect();
+
+    // Create H3 connection and send request.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    for _ in 0..3 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    for _ in 0..10 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(got_headers, "should receive H3 response headers");
+    assert!(got_fin, "should receive FIN");
+
+    // Check that both paths sent packets (RoundRobin distributes).
+    let stats_after: Vec<_> = conn.path_stats().collect();
+    for (i, (before, after)) in
+        sent_before.iter().zip(stats_after.iter()).enumerate()
+    {
+        assert!(
+            after.sent > *before,
+            "path {} should have sent packets: before={}, after={}",
+            i,
+            before,
+            after.sent
+        );
+    }
+}
+
+/// Verifies that H3 traffic continues without interruption when a path is
+/// closed mid-transfer. Starts a large transfer over two paths, closes one
+/// mid-way, and verifies the full response is received.
+#[tokio::test]
+async fn multipath_mid_transfer_path_close() {
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    for _ in 0..3 {
+        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
+        conn.new_scid(&extra_scid, 0, false).unwrap();
+    }
+    exchange(&socket, client_addr, &mut conn).await;
+
+    let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr2 = socket2.local_addr().unwrap();
+
+    let path_id = conn
+        .create_path(client_addr2, server_addr)
+        .expect("create_path should succeed");
+
+    for _ in 0..6 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    // Create H3 and exchange settings on both paths.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    for _ in 0..3 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    // Start the H3 request.
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    // Exchange a few rounds on both paths (transfer starts).
+    for _ in 0..3 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    // Close the second path mid-transfer.
+    conn.close_path(path_id, 0)
+        .expect("close_path should succeed");
+
+    // Continue exchanging on the primary path only.
+    for _ in 0..10 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(
+        got_headers,
+        "should receive H3 response after mid-transfer path close"
+    );
+    assert!(
+        got_fin,
+        "should receive complete response after mid-transfer path close"
+    );
 }
