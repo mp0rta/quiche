@@ -29,6 +29,27 @@ use serde_with::serde_as;
 use serde_with::DurationMilliSeconds;
 use std::time::Duration;
 
+/// Multipath scheduling algorithm selection.
+#[settings]
+pub enum MultipathScheduler {
+    #[default]
+    MinRtt,
+    RoundRobin,
+}
+
+/// Multipath QUIC configuration.
+#[settings]
+pub struct MultipathSettings {
+    /// Enable multipath QUIC negotiation.
+    pub enabled: bool,
+    /// Path scheduling algorithm.
+    #[serde(default)]
+    pub scheduler: MultipathScheduler,
+    /// Maximum number of active paths. None means no limit.
+    /// Used to derive initial_max_path_id and active_connection_id_limit.
+    pub max_active_paths: Option<usize>,
+}
+
 /// QUIC configuration parameters.
 #[serde_as]
 #[settings]
@@ -313,6 +334,13 @@ pub struct QuicSettings {
     ///
     /// [`set_disable_dcid_reuse()`]: https://docs.rs/quiche/latest/quiche/struct.Config.html#method.disable_dcid_reuse
     pub disable_dcid_reuse: bool,
+
+    /// Multipath QUIC settings. Requires the `multipath` feature to take
+    /// effect. When `multipath` feature is disabled, this field is ignored.
+    ///
+    /// Defaults to disabled.
+    #[serde(default)]
+    pub multipath: MultipathSettings,
 
     /// Specifies the number of bytes used to track unknown transport
     /// parameters.

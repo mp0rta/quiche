@@ -197,6 +197,26 @@ fn make_quiche_config(
     config.set_stateless_reset_token(quic_settings.stateless_reset_token);
     config.set_disable_dcid_reuse(quic_settings.disable_dcid_reuse);
 
+    #[cfg(feature = "multipath")]
+    if quic_settings.multipath.enabled {
+        use crate::settings::quic::MultipathScheduler;
+
+        let max_paths = quic_settings.multipath.max_active_paths.unwrap_or(4);
+        config.set_initial_max_path_id(max_paths as u32);
+        config.set_disable_active_migration(false);
+        config.set_active_connection_id_limit(
+            (max_paths as u64 + 2).max(quic_settings.active_connection_id_limit),
+        );
+        match quic_settings.multipath.scheduler {
+            MultipathScheduler::MinRtt => config.set_multipath_scheduler(
+                quiche::multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+            ),
+            MultipathScheduler::RoundRobin => config.set_multipath_scheduler(
+                quiche::multipath::scheduler::MultipathSchedulerAlgorithm::RoundRobin,
+            ),
+        }
+    }
+
     if let Some(track_unknown_transport_params) =
         quic_settings.track_unknown_transport_parameters
     {

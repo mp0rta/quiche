@@ -34,6 +34,9 @@ capture_keylogs = []
 # Enable scheduling & poll duration histograms for tokio tasks.
 tokio-task-metrics = []
 
+# Enable multipath QUIC support.
+multipath = ["quiche/multipath"]
+
 [lints.rust]
 # capture_keylogs: enable SSLKEYLOGFILE capturing for QUIC connections.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(capture_keylogs)'] }
