@@ -23,65 +23,86 @@ impl Scheduler for RoundRobinScheduler {
 
         let now = packet.now;
 
-        // First try: ready (not pacing-delayed) Available paths.
-        let ready: Vec<&PathInfo> = paths
-            .iter()
-            .filter(|p| {
-                p.state >= PathState::Validated
-                    && p.cwnd_available > 0
-                    && p.app_status == PathAppStatus::Available
-                    && p.next_send_time.map_or(true, |t| t <= now)
-            })
-            .collect();
+        // For reinjections, try to avoid the path the original was lost on.
+        let skip_path_id = if packet.is_reinjection {
+            packet.original_path_id
+        } else {
+            None
+        };
 
-        if !ready.is_empty() {
-            self.last_index %= ready.len();
-            let chosen = ready[self.last_index].path_id;
-            self.last_index = (self.last_index + 1) % ready.len();
-            return SchedulerDecision::Send(chosen);
-        }
-
-        // Second: all Available paths with cwnd (including delayed).
-        let usable: Vec<&PathInfo> = paths
-            .iter()
-            .filter(|p| {
-                p.state >= PathState::Validated
-                    && p.cwnd_available > 0
-                    && p.app_status == PathAppStatus::Available
-            })
-            .collect();
-
-        if !usable.is_empty() {
-            self.last_index %= usable.len();
-            let chosen = usable[self.last_index].path_id;
-            self.last_index = (self.last_index + 1) % usable.len();
-            return SchedulerDecision::Send(chosen);
-        }
-
-        // Third: Backup paths.
-        let backup: Vec<&PathInfo> = paths
-            .iter()
-            .filter(|p| {
-                p.state >= PathState::Validated
-                    && p.cwnd_available > 0
-                    && p.app_status == PathAppStatus::Backup
-            })
-            .collect();
-
-        if backup.is_empty() {
-            let any_validated =
-                paths.iter().any(|p| p.state >= PathState::Validated);
-            return if any_validated {
-                SchedulerDecision::AllBlocked
-            } else {
-                SchedulerDecision::NoAvailablePath
+        for pass in 0..2usize {
+            let skip = |p: &&PathInfo| -> bool {
+                pass == 0 && Some(p.path_id) == skip_path_id
             };
+
+            // Tier 1: ready (not pacing-delayed) Available paths.
+            let ready: Vec<&PathInfo> = paths
+                .iter()
+                .filter(|p| {
+                    !skip(p)
+                        && p.state >= PathState::Validated
+                        && p.cwnd_available > 0
+                        && p.app_status == PathAppStatus::Available
+                        && p.next_send_time.map_or(true, |t| t <= now)
+                })
+                .collect();
+
+            if !ready.is_empty() {
+                self.last_index %= ready.len();
+                let chosen = ready[self.last_index].path_id;
+                self.last_index = (self.last_index + 1) % ready.len();
+                return SchedulerDecision::Send(chosen);
+            }
+
+            // Tier 2: all Available paths with cwnd (including pacing-delayed).
+            let usable: Vec<&PathInfo> = paths
+                .iter()
+                .filter(|p| {
+                    !skip(p)
+                        && p.state >= PathState::Validated
+                        && p.cwnd_available > 0
+                        && p.app_status == PathAppStatus::Available
+                })
+                .collect();
+
+            if !usable.is_empty() {
+                self.last_index %= usable.len();
+                let chosen = usable[self.last_index].path_id;
+                self.last_index = (self.last_index + 1) % usable.len();
+                return SchedulerDecision::Send(chosen);
+            }
+
+            // Tier 3: Backup paths.
+            let backup: Vec<&PathInfo> = paths
+                .iter()
+                .filter(|p| {
+                    !skip(p)
+                        && p.state >= PathState::Validated
+                        && p.cwnd_available > 0
+                        && p.app_status == PathAppStatus::Backup
+                })
+                .collect();
+
+            if !backup.is_empty() {
+                self.last_index %= backup.len();
+                let chosen = backup[self.last_index].path_id;
+                self.last_index = (self.last_index + 1) % backup.len();
+                return SchedulerDecision::Send(chosen);
+            }
+
+            // No candidates found in this pass.
+            // If there's no path to skip, no point doing a second pass.
+            if skip_path_id.is_none() {
+                break;
+            }
         }
 
-        self.last_index %= backup.len();
-        let chosen = backup[self.last_index].path_id;
-        self.last_index = (self.last_index + 1) % backup.len();
-        SchedulerDecision::Send(chosen)
+        let any_validated = paths.iter().any(|p| p.state >= PathState::Validated);
+        if any_validated {
+            SchedulerDecision::AllBlocked
+        } else {
+            SchedulerDecision::NoAvailablePath
+        }
     }
 }
 
@@ -208,5 +229,34 @@ mod tests {
             sched.select_path(&[], &default_packet()),
             SchedulerDecision::NoAvailablePath,
         );
+    }
+
+    #[test]
+    fn reinjection_avoids_original_path() {
+        let mut sched = RoundRobinScheduler::default();
+        let paths = vec![
+            make_path(0, 10, 10000, PathAppStatus::Available),
+            make_path(1, 50, 10000, PathAppStatus::Available),
+        ];
+        let packet = PacketMeta {
+            is_reinjection: true,
+            original_path_id: Some(0),
+            ..default_packet()
+        };
+        assert_eq!(sched.select_path(&paths, &packet), SchedulerDecision::Send(1));
+    }
+
+    #[test]
+    fn reinjection_fallback_single_path() {
+        let mut sched = RoundRobinScheduler::default();
+        let paths = vec![
+            make_path(0, 10, 10000, PathAppStatus::Available),
+        ];
+        let packet = PacketMeta {
+            is_reinjection: true,
+            original_path_id: Some(0),
+            ..default_packet()
+        };
+        assert_eq!(sched.select_path(&paths, &packet), SchedulerDecision::Send(0));
     }
 }
