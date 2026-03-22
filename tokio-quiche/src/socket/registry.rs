@@ -66,11 +66,6 @@ impl<Tx: ?Sized> SocketRegistry<Tx> {
     pub fn remove(&mut self, local_addr: &SocketAddr) -> Option<Arc<Tx>> {
         self.sockets.remove(local_addr)
     }
-
-    /// Returns all registered local addresses.
-    pub fn local_addrs(&self) -> impl Iterator<Item = &SocketAddr> {
-        self.sockets.keys()
-    }
 }
 
 #[cfg(test)]
@@ -115,17 +110,4 @@ mod tests {
         assert!(registry.lookup(&a).is_none());
     }
 
-    #[test]
-    fn local_addrs_returns_registered_addresses() {
-        let mut registry = SocketRegistry::new();
-        let a1 = addr(6000);
-        let a2 = addr(7000);
-        registry.insert(a1, Arc::new(6000u16));
-        registry.insert(a2, Arc::new(7000u16));
-
-        let addrs: Vec<_> = registry.local_addrs().collect();
-        assert_eq!(addrs.len(), 2);
-        assert!(addrs.contains(&&a1));
-        assert!(addrs.contains(&&a2));
-    }
 }

@@ -170,15 +170,21 @@ where
     // Don't apply_max_capabilities(): some NICs don't support GSO
     let socket: Socket<Tx, Rx> = socket.try_into()?;
 
-    let (h3_driver, h3_controller) =
+    #[cfg_attr(not(feature = "multipath"), allow(unused_mut))]
+    let (h3_driver, mut h3_controller) =
         ClientH3Driver::new(Http3Settings::default());
     let mut params = ConnectionParams::default();
     params.settings.max_idle_timeout = Some(Duration::from_secs(30));
 
-    Ok((
-        connect_with_config(socket, host, &params, h3_driver).await?,
-        h3_controller,
-    ))
+    let quic_conn =
+        connect_with_config(socket, host, &params, h3_driver).await?;
+
+    #[cfg(feature = "multipath")]
+    if let Some(mp_handle) = quic_conn.multipath_handle() {
+        h3_controller.set_multipath_handle(mp_handle.clone());
+    }
+
+    Ok((quic_conn, h3_controller))
 }
 
 /// Connects to a QUIC server using `socket` and the provided

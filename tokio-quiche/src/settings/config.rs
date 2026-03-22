@@ -201,6 +201,16 @@ fn make_quiche_config(
     if quic_settings.multipath.enabled {
         use crate::settings::quic::MultipathScheduler;
 
+        if quic_settings.disable_active_migration {
+            log::warn!(
+                "multipath requires active migration; \
+                 overriding disable_active_migration=true"
+            );
+        }
+        if matches!(quic_settings.multipath.max_active_paths, Some(0 | 1)) {
+            return Err("multipath max_active_paths must be >= 2".into());
+        }
+
         let max_paths = quic_settings.multipath.max_active_paths.unwrap_or(4);
         config.set_initial_max_path_id(max_paths as u32);
         config.set_disable_active_migration(false);
