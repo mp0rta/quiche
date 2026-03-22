@@ -62,6 +62,7 @@ fn multipath_server_settings() -> QuicSettings {
     settings
 }
 
+/// Emit all pending packets from a connection on a single socket (single-path).
 async fn emit_flight(
     socket: &tokio::net::UdpSocket, conn: &mut quiche::Connection,
 ) {
@@ -71,11 +72,12 @@ async fn emit_flight(
         Err(e) => panic!("failed to emit flight: {e:?}"),
     };
 
-    for p in flight {
-        socket.send_to(&p.0, p.1.to).await.unwrap();
+    for (pkt, info) in flight {
+        socket.send_to(&pkt, info.to).await.unwrap();
     }
 }
 
+/// Receive packets from a socket with a timeout to avoid hanging.
 async fn process_flight(
     socket: &tokio::net::UdpSocket, local_addr: SocketAddr,
     conn: &mut quiche::Connection,
@@ -103,6 +105,7 @@ async fn process_flight(
     }
 }
 
+/// Emit + receive on a single socket (single-path exchange).
 async fn exchange(
     socket: &tokio::net::UdpSocket, local_addr: SocketAddr,
     conn: &mut quiche::Connection,
@@ -111,24 +114,31 @@ async fn exchange(
     process_flight(socket, local_addr, conn).await;
 }
 
-/// Emit and receive on both sockets, with timeouts to avoid hanging.
+/// Emit all pending packets, routing each to the correct socket based on
+/// `SendInfo.from`. Then receive on both sockets.
+///
+/// This is the key fix: `emit_flight()` drains ALL paths and each packet's
+/// `SendInfo.from` tells us which local address (and therefore socket) to
+/// use. Sending all packets through socket1 would break path validation
+/// for path 1.
 async fn exchange_both(
     sock1: &tokio::net::UdpSocket, addr1: SocketAddr,
     sock2: &tokio::net::UdpSocket, addr2: SocketAddr,
-    server_addr: SocketAddr, conn: &mut quiche::Connection,
+    conn: &mut quiche::Connection,
 ) {
-    // Emit on default path.
-    emit_flight(sock1, conn).await;
+    // Drain all paths at once — each packet carries its own SendInfo.
+    let flight = match quiche::test_utils::emit_flight(conn) {
+        Ok(v) => v,
+        Err(quiche::Error::Done) => vec![],
+        Err(e) => panic!("failed to emit flight: {e:?}"),
+    };
 
-    // Emit on second path.
-    let flight2 = quiche::test_utils::emit_flight_on_path(
-        conn,
-        Some(addr2),
-        Some(server_addr),
-    );
-    if let Ok(pkts) = flight2 {
-        for p in pkts {
-            sock2.send_to(&p.0, p.1.to).await.unwrap();
+    for (pkt, info) in flight {
+        // Route to the correct socket based on the source address.
+        if info.from == addr2 {
+            sock2.send_to(&pkt, info.to).await.unwrap();
+        } else {
+            sock1.send_to(&pkt, info.to).await.unwrap();
         }
     }
 
@@ -137,7 +147,7 @@ async fn exchange_both(
     process_flight(sock2, addr2, conn).await;
 }
 
-fn process_h3_events(
+fn drain_h3_events(
     h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection,
 ) -> (bool, bool) {
     let mut buf = [0; 65535];
@@ -156,7 +166,7 @@ fn process_h3_events(
     }
 }
 
-/// Tests multipath negotiation and H3 request over the initial path with a
+/// Tests multipath negotiation and an H3 request over the initial path with a
 /// multipath-enabled tokio-quiche server.
 #[tokio::test]
 async fn multipath_negotiation_and_h3_request() {
@@ -167,7 +177,6 @@ async fn multipath_negotiation_and_h3_request() {
         handle_connection,
     );
     let server_addr = extract_host_ipv4(&url);
-
     let mut client_config = multipath_client_config();
 
     let client_scid = SimpleConnectionIdGenerator.new_connection_id();
@@ -183,22 +192,17 @@ async fn multipath_negotiation_and_h3_request() {
     )
     .unwrap();
 
-    // Complete the handshake.
     while !conn.is_established() {
         exchange(&socket, client_addr, &mut conn).await;
     }
-
     assert!(conn.is_multipath(), "multipath should be negotiated");
 
-    // Create H3 connection.
     let h3_config = quiche::h3::Config::new().unwrap();
     let mut h3_conn =
         quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
 
-    // Exchange H3 settings.
     exchange(&socket, client_addr, &mut conn).await;
 
-    // Send request on initial path.
     let req = vec![
         quiche::h3::Header::new(b":method", b"GET"),
         quiche::h3::Header::new(b":scheme", b"https"),
@@ -211,14 +215,15 @@ async fn multipath_negotiation_and_h3_request() {
         exchange(&socket, client_addr, &mut conn).await;
     }
 
-    let (got_headers, got_fin) = process_h3_events(&mut h3_conn, &mut conn);
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
     assert!(got_headers, "should receive response headers");
     assert!(got_fin, "should receive FIN");
 }
 
-/// Tests that a second path can be created and validated with the server.
+/// Tests that a second path can be created, validated, and used to
+/// successfully transfer H3 data with a tokio-quiche server.
 #[tokio::test]
-async fn multipath_create_second_path() {
+async fn multipath_two_path_h3_transfer() {
     let (url, _) = start_server_with_settings(
         multipath_server_settings(),
         Http3Settings::default(),
@@ -226,7 +231,6 @@ async fn multipath_create_second_path() {
         handle_connection,
     );
     let server_addr = extract_host_ipv4(&url);
-
     let mut client_config = multipath_client_config();
 
     let client_scid = SimpleConnectionIdGenerator.new_connection_id();
@@ -242,20 +246,20 @@ async fn multipath_create_second_path() {
     )
     .unwrap();
 
-    // Complete the handshake.
+    // Handshake on path 0.
     while !conn.is_established() {
         exchange(&socket, client_addr, &mut conn).await;
     }
     assert!(conn.is_multipath(), "multipath should be negotiated");
 
-    // Supply extra SCIDs after handshake.
+    // Supply extra SCIDs (needed for second path).
     for _ in 0..3 {
         let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
         conn.new_scid(&extra_scid, 0, false).unwrap();
     }
     exchange(&socket, client_addr, &mut conn).await;
 
-    // Create second path from new local address.
+    // Create second path from a new local address.
     let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_addr2 = socket2.local_addr().unwrap();
 
@@ -267,12 +271,7 @@ async fn multipath_create_second_path() {
     // Exchange PATH_CHALLENGE/RESPONSE to validate the new path.
     for _ in 0..6 {
         exchange_both(
-            &socket,
-            client_addr,
-            &socket2,
-            client_addr2,
-            server_addr,
-            &mut conn,
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
         )
         .await;
     }
@@ -284,4 +283,36 @@ async fn multipath_create_second_path() {
         "should have at least 2 paths, got {}",
         path_stats.len()
     );
+
+    // Create H3 connection and exchange settings over both paths.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    for _ in 0..3 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    // Send H3 request — the scheduler may route data over either path.
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    for _ in 0..8 {
+        exchange_both(
+            &socket, client_addr, &socket2, client_addr2, &mut conn,
+        )
+        .await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(got_headers, "should receive H3 response headers via multipath");
+    assert!(got_fin, "should receive FIN via multipath");
 }
