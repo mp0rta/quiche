@@ -730,17 +730,26 @@ where
 
     /// Selects a network path, if none already selected.
     ///
-    /// This will return the first path available in the write state's
-    /// `pending_paths` iterator. If that is empty a new iterator will be
-    /// created by querying quiche itself.
+    /// When multipath is enabled, returns `None` so that quiche's built-in
+    /// scheduler decides which path to use. The first call to
+    /// `send_on_path(None, None)` invokes the scheduler; subsequent calls
+    /// within the same GSO batch reuse the path from [`SendInfo`].
     ///
-    /// When multipath is enabled and a socket registry is present, this
-    /// iterates over all registered local addresses to find available paths.
+    /// Without multipath, this iterates `pending_paths` to find the next
+    /// available peer address on the configured local address.
     fn select_path(
         &mut self, qconn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
         if self.write_state.selected_path.is_some() {
             return self.write_state.selected_path;
+        }
+
+        // With multipath, delegate path selection to quiche's scheduler.
+        // send_on_path(None, None) will consult the scheduler and return
+        // the chosen path in SendInfo.
+        #[cfg(feature = "multipath")]
+        if self.socket_registry.is_some() {
+            return None;
         }
 
         // Try the current pending_paths iterator first, using the local
@@ -752,20 +761,6 @@ where
                 .unwrap_or(self.cfg.local_addr);
             self.write_state.selected_path = Some((local, to));
             return self.write_state.selected_path;
-        }
-
-        #[cfg(feature = "multipath")]
-        if let Some(ref registry) = self.socket_registry {
-            // Try all registered local addresses for available paths.
-            let addrs: Vec<_> = registry.local_addrs().copied().collect();
-            for local_addr in addrs {
-                self.write_state.pending_paths = qconn.paths_iter(local_addr);
-                self.write_state.pending_local_addr = Some(local_addr);
-                if let Some(to) = self.write_state.pending_paths.next() {
-                    self.write_state.selected_path = Some((local_addr, to));
-                    return self.write_state.selected_path;
-                }
-            }
         }
 
         // Default: use configured local address.
@@ -830,8 +825,17 @@ where
                 // Flush the current buffer to network. If no other path needs
                 // to be flushed to the network also yield the work loop task.
                 //
-                // Otherwise the write loop will start again and the next path
-                // will be selected.
+                // With multipath, the scheduler has already considered all
+                // paths — Done means nothing left on any path.
+                // Without multipath, check the pending_paths iterator.
+                #[cfg(feature = "multipath")]
+                let has_pending_paths = if self.socket_registry.is_some() {
+                    false
+                } else {
+                    self.write_state.pending_paths.len() > 0
+                };
+
+                #[cfg(not(feature = "multipath"))]
                 let has_pending_paths = self.write_state.pending_paths.len() > 0;
 
                 // Keep writing if there are paths left to try.
