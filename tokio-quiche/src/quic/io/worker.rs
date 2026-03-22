@@ -102,6 +102,10 @@ pub(crate) struct WriteState {
     selected_path: Option<(SocketAddr, SocketAddr)>,
     // Iterator over the network paths that haven't been flushed yet.
     pending_paths: quiche::SocketAddrIter,
+    // The local address that `pending_paths` was created for. Used by
+    // `select_path` to pair remaining iterator entries with the correct
+    // source address.
+    pending_local_addr: Option<SocketAddr>,
 }
 
 pub(crate) struct IoWorkerParams<Tx, M> {
@@ -679,11 +683,15 @@ where
             return self.write_state.selected_path;
         }
 
-        // Try the current pending_paths iterator first.
+        // Try the current pending_paths iterator first, using the local
+        // address it was created for.
         if let Some(to) = self.write_state.pending_paths.next() {
-            return self.write_state.selected_path.or(Some(
-                (self.cfg.local_addr, to),
-            ));
+            let local = self
+                .write_state
+                .pending_local_addr
+                .unwrap_or(self.cfg.local_addr);
+            self.write_state.selected_path = Some((local, to));
+            return self.write_state.selected_path;
         }
 
         #[cfg(feature = "multipath")]
@@ -692,6 +700,7 @@ where
             let addrs: Vec<_> = registry.local_addrs().copied().collect();
             for local_addr in addrs {
                 self.write_state.pending_paths = qconn.paths_iter(local_addr);
+                self.write_state.pending_local_addr = Some(local_addr);
                 if let Some(to) = self.write_state.pending_paths.next() {
                     self.write_state.selected_path = Some((local_addr, to));
                     return self.write_state.selected_path;
@@ -701,6 +710,7 @@ where
 
         // Default: use configured local address.
         self.write_state.pending_paths = qconn.paths_iter(self.cfg.local_addr);
+        self.write_state.pending_local_addr = Some(self.cfg.local_addr);
         let to = self.write_state.pending_paths.next()?;
         self.write_state.selected_path = Some((self.cfg.local_addr, to));
         self.write_state.selected_path
@@ -798,14 +808,18 @@ where
             let to = to.unwrap_or(self.cfg.peer_addr);
             let from_for_pktinfo = from.filter(|_| self.cfg.with_pktinfo);
 
-            // When multipath is enabled, try to use the socket registered for
-            // this path's local address. Fall back to the default socket.
+            // When multipath is enabled, use the socket registered for this
+            // path's local address. Only look up explicitly registered
+            // addresses — the main socket (self.cfg.local_addr) is not in
+            // the registry and must fall through to the default send path.
             #[cfg(feature = "multipath")]
-            let mp_socket = from.and_then(|addr| {
-                self.socket_registry
-                    .as_ref()
-                    .map(|r| r.get(&addr).clone())
-            });
+            let mp_socket = from
+                .filter(|addr| *addr != self.cfg.local_addr)
+                .and_then(|addr| {
+                    self.socket_registry
+                        .as_ref()
+                        .and_then(|r| r.lookup(&addr).cloned())
+                });
 
             #[cfg(feature = "multipath")]
             let send_res = if let Some(ref udp_socket) = mp_socket {

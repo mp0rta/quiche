@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::ConnectionIdGenerator as _;
+use tokio_quiche::ServerH3Connection;
 
 use crate::fixtures::*;
 
@@ -315,4 +316,145 @@ async fn multipath_two_path_h3_transfer() {
     let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
     assert!(got_headers, "should receive H3 response headers via multipath");
     assert!(got_fin, "should receive FIN via multipath");
+}
+
+/// Tests that the server can dynamically add a socket and the client can
+/// create a path to the server's new address for multipath H3 transfer.
+#[tokio::test]
+async fn multipath_server_dynamic_socket() {
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    // Channel for the server to communicate its new address to the client.
+    let (addr_tx, mut addr_rx) =
+        tokio::sync::mpsc::channel::<SocketAddr>(1);
+    let ready = Arc::new(Notify::new());
+    let ready_clone = ready.clone();
+
+    let handler = move |mut connection: ServerH3Connection| {
+        let addr_tx = addr_tx.clone();
+        let ready = ready_clone.clone();
+        async move {
+            let mp = connection
+                .quic_connection
+                .multipath_handle()
+                .expect("multipath handle should be available")
+                .clone();
+
+            let new_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let new_addr = new_socket.local_addr().unwrap();
+            mp.add_socket(new_socket, new_addr).await.unwrap();
+
+            // Tell the client about the new address.
+            addr_tx.send(new_addr).await.unwrap();
+
+            // Wait for the client to signal it has created the path and
+            // exchanged enough packets.
+            ready.notified().await;
+
+            let _ = serve_connection_details(
+                &mut connection.h3_controller,
+                Default::default(),
+            )
+            .await;
+        }
+    };
+
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handler,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    // Handshake on path 0.
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+
+    // Supply extra SCIDs (needed for second path).
+    for _ in 0..3 {
+        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
+        conn.new_scid(&extra_scid, 0, false).unwrap();
+    }
+    exchange(&socket, client_addr, &mut conn).await;
+
+    // Wait for the server to report its new address.
+    let server_addr2 = tokio::time::timeout(
+        Duration::from_secs(2),
+        addr_rx.recv(),
+    )
+    .await
+    .expect("timeout waiting for server address")
+    .expect("server address channel closed");
+
+    // Client creates a path to the server's new address.
+    let path_id = conn
+        .create_path(client_addr, server_addr2)
+        .expect("create_path to server's new address should succeed");
+    assert!(path_id > 0, "second path should have non-zero path_id");
+
+    // Signal the server that it can start serving H3.
+    ready.notify_one();
+
+    // Exchange packets to validate the new path. The server's recv task
+    // on the new socket will feed incoming packets to the IoWorker.
+    for _ in 0..8 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    // Verify we have multiple paths.
+    let path_stats: Vec<_> = conn.path_stats().collect();
+    assert!(
+        path_stats.len() >= 2,
+        "should have at least 2 paths, got {}",
+        path_stats.len()
+    );
+
+    // Create H3 connection and exchange settings.
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    for _ in 0..3 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    // Send H3 request.
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    for _ in 0..8 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(
+        got_headers,
+        "should receive response headers with server dynamic socket"
+    );
+    assert!(got_fin, "should receive FIN with server dynamic socket");
 }

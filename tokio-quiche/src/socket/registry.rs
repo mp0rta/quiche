@@ -62,6 +62,12 @@ impl<Tx: ?Sized> SocketRegistry<Tx> {
         self.sockets.get(local_addr).unwrap_or(&self.default_socket)
     }
 
+    /// Look up an explicitly registered socket. Returns `None` if the
+    /// address is not in the registry (does not fall back to the default).
+    pub fn lookup(&self, local_addr: &SocketAddr) -> Option<&Arc<Tx>> {
+        self.sockets.get(local_addr)
+    }
+
     /// Remove a socket registration. Returns the socket if it existed.
     pub fn remove(&mut self, local_addr: &SocketAddr) -> Option<Arc<Tx>> {
         self.sockets.remove(local_addr)
@@ -112,6 +118,18 @@ mod tests {
 
         // Falls back to default after removal
         assert_eq!(**registry.get(&a), 5000);
+    }
+
+    #[test]
+    fn lookup_returns_none_for_unregistered() {
+        let default = Arc::new(5000u16);
+        let mut registry = SocketRegistry::new(default);
+        let a = addr(6000);
+        let b = addr(7000);
+        registry.insert(a, Arc::new(6000u16));
+
+        assert_eq!(**registry.lookup(&a).unwrap(), 6000);
+        assert!(registry.lookup(&b).is_none());
     }
 
     #[test]
