@@ -75,6 +75,8 @@ use crate::quic::io::worker::WriterConfig;
 use crate::quic::io::worker::INCOMING_QUEUE_SIZE;
 use crate::quic::router::ConnectionMapCommand;
 use crate::QuicResult;
+#[cfg(feature = "multipath")]
+use tokio::sync::oneshot;
 
 /// Wrapper for connection statistics recorded by [quiche].
 #[derive(Debug)]
@@ -317,12 +319,21 @@ where
     ) {
         self.params.metrics.connections_in_memory().inc();
 
+        #[cfg(feature = "multipath")]
+        let (mp_cmd_tx, mp_cmd_rx) = mpsc::channel(16);
+        #[cfg(feature = "multipath")]
+        let incoming_ev_sender = self.incoming_ev_sender.clone();
+
         let conn = QuicConnection {
             local_addr: self.params.local_addr,
             peer_addr: self.params.peer_addr,
             audit_log_stats: Arc::clone(&self.audit_log_stats),
             stats: Arc::clone(&self.stats),
             scid: self.params.scid,
+            #[cfg(feature = "multipath")]
+            multipath_handle: Some(MultipathHandle {
+                cmd_sender: mp_cmd_tx,
+            }),
         };
         let context = ConnectionStageContext {
             in_pkt: self.params.initial_pkt,
@@ -333,6 +344,7 @@ where
         let conn_stage = Handshake {
             handshake_info: self.params.handshake_info,
         };
+
         let params = IoWorkerParams {
             socket: MaybeConnectedSocket::new(self.params.socket),
             shutdown_tx: self.params.shutdown_tx,
@@ -344,6 +356,10 @@ where
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: self.params.init_rx_time,
             metrics: self.params.metrics.clone(),
+            #[cfg(feature = "multipath")]
+            cmd_receiver: Some(mp_cmd_rx),
+            #[cfg(feature = "multipath")]
+            incoming_ev_sender: Some(incoming_ev_sender),
         };
 
         let handshake_fut = async move {
@@ -496,6 +512,8 @@ pub struct QuicConnection {
     audit_log_stats: Arc<QuicAuditStats>,
     stats: QuicConnectionStatsShared,
     scid: ConnectionId<'static>,
+    #[cfg(feature = "multipath")]
+    multipath_handle: Option<MultipathHandle>,
 }
 
 impl QuicConnection {
@@ -537,6 +555,107 @@ impl QuicConnection {
     #[inline]
     pub fn scid(&self) -> &ConnectionId<'static> {
         &self.scid
+    }
+
+    /// Returns the multipath handle, if multipath is enabled.
+    #[cfg(feature = "multipath")]
+    #[inline]
+    pub fn multipath_handle(&self) -> Option<&MultipathHandle> {
+        self.multipath_handle.as_ref()
+    }
+}
+
+/// Commands sent from [`MultipathHandle`] to the IoWorker.
+#[cfg(feature = "multipath")]
+pub enum MultipathCommand {
+    /// Add a new UDP socket for a local address.
+    AddSocket {
+        socket: tokio::net::UdpSocket,
+        local_addr: SocketAddr,
+        reply: oneshot::Sender<QuicResult<()>>,
+    },
+    /// Create a new path between local and peer addresses.
+    CreatePath {
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        reply: oneshot::Sender<QuicResult<u64>>,
+    },
+    /// Close an existing path.
+    ClosePath {
+        path_id: u64,
+        reply: oneshot::Sender<QuicResult<()>>,
+    },
+}
+
+/// Handle for applications to manage multipath connections.
+///
+/// Communicates with the IoWorker via a command channel.
+#[cfg(feature = "multipath")]
+#[derive(Clone)]
+pub struct MultipathHandle {
+    cmd_sender: mpsc::Sender<MultipathCommand>,
+}
+
+#[cfg(feature = "multipath")]
+impl MultipathHandle {
+    /// Add a UDP socket bound to a local address for multipath use.
+    ///
+    /// After adding a socket, call [`create_path()`](Self::create_path) to
+    /// establish a path using this socket's local address.
+    pub async fn add_socket(
+        &self, socket: tokio::net::UdpSocket, local_addr: SocketAddr,
+    ) -> QuicResult<()> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::AddSocket {
+                socket,
+                local_addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?
+    }
+
+    /// Create a new path from `local_addr` to `peer_addr`.
+    ///
+    /// The `local_addr` must correspond to a previously added socket.
+    /// Returns the path ID on success.
+    pub async fn create_path(
+        &self, local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> QuicResult<u64> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::CreatePath {
+                local_addr,
+                peer_addr,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?
+    }
+
+    /// Close a path by its path ID.
+    pub async fn close_path(&self, path_id: u64) -> QuicResult<()> {
+        use crate::BoxError;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_sender
+            .send(MultipathCommand::ClosePath {
+                path_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?;
+        reply_rx
+            .await
+            .map_err(|_| -> BoxError { Box::new(quiche::Error::Done) })?
     }
 }
 

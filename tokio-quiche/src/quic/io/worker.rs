@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
-#[cfg(feature = "perf-quic-listener-metrics")]
+#[cfg(any(feature = "perf-quic-listener-metrics", feature = "multipath"))]
 use std::time::SystemTime;
 
 use super::connection_stage::Close;
@@ -115,6 +115,10 @@ pub(crate) struct IoWorkerParams<Tx, M> {
     #[cfg(feature = "perf-quic-listener-metrics")]
     pub(crate) init_rx_time: Option<SystemTime>,
     pub(crate) metrics: M,
+    #[cfg(feature = "multipath")]
+    pub(crate) cmd_receiver: Option<mpsc::Receiver<crate::quic::connection::MultipathCommand>>,
+    #[cfg(feature = "multipath")]
+    pub(crate) incoming_ev_sender: Option<mpsc::Sender<Incoming>>,
 }
 
 pub(crate) struct IoWorker<Tx, M, S> {
@@ -135,6 +139,10 @@ pub(crate) struct IoWorker<Tx, M, S> {
     bw_estimator: BandwidthReporter,
     #[cfg(feature = "multipath")]
     socket_registry: Option<crate::socket::registry::SocketRegistry<tokio::net::UdpSocket>>,
+    #[cfg(feature = "multipath")]
+    cmd_receiver: Option<mpsc::Receiver<crate::quic::connection::MultipathCommand>>,
+    #[cfg(feature = "multipath")]
+    incoming_ev_sender: Option<mpsc::Sender<Incoming>>,
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -164,6 +172,10 @@ where
             bw_estimator,
             #[cfg(feature = "multipath")]
             socket_registry: None,
+            #[cfg(feature = "multipath")]
+            cmd_receiver: params.cmd_receiver,
+            #[cfg(feature = "multipath")]
+            incoming_ev_sender: params.incoming_ev_sender,
         }
     }
 
@@ -320,32 +332,163 @@ where
 
             let incoming_recv = &mut ctx.incoming_pkt_receiver;
             let application = &mut ctx.application;
-            select! {
-                biased;
-                () = &mut sleep => {
-                    // It's very important that we keep the timeout arm at the top of this loop so
-                    // that we poll it every time we need to. Since this is a biased `select!`, if
-                    // we put this behind another arm, we could theoretically starve the sleep arm
-                    // and hang connections.
-                    //
-                    // See https://docs.rs/tokio/latest/tokio/macro.select.html#fairness for more
-                    qconn.on_timeout();
 
-                    self.write_state.next_release_time = None;
-                    current_deadline = None;
-                    sleep.as_mut().reset((now + DEFAULT_SLEEP).into());
+            // Macro-level select! — two versions because #[cfg] is not
+            // supported on individual select! arms.
+            macro_rules! base_select {
+                ($($extra:tt)*) => {
+                    select! {
+                        biased;
+                        () = &mut sleep => {
+                            // It's very important that we keep the timeout arm at the top of this
+                            // loop so that we poll it every time we need to. Since this is a
+                            // biased `select!`, if we put this behind another arm, we could
+                            // theoretically starve the sleep arm and hang connections.
+                            //
+                            // See https://docs.rs/tokio/latest/tokio/macro.select.html#fairness
+                            // for more
+                            qconn.on_timeout();
+
+                            self.write_state.next_release_time = None;
+                            current_deadline = None;
+                            sleep.as_mut().reset((now + DEFAULT_SLEEP).into());
+                        }
+                        Some(pkt) = incoming_recv.recv() => ctx.in_pkt = Some(pkt),
+                        $($extra)*
+                        // TODO(erittenhouse): would be nice to decouple wait_for_data from the
+                        // application, but wait_for_quiche relies on IOW methods, so we can't
+                        // write a default implementation for ConnectionStage
+                        status = self.wait_for_data_or_handshake(qconn, application) => status?,
+                    }
+                };
+            }
+
+            #[cfg(feature = "multipath")]
+            {
+                // Take the receiver out of self so that the select! arms
+                // don't conflict with the &mut self borrow in
+                // wait_for_data_or_handshake.
+                let mut cmd_rx = self.cmd_receiver.take();
+                base_select! {
+                    Some(cmd) = async {
+                        match cmd_rx {
+                            Some(ref mut rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.handle_multipath_cmd(cmd, qconn);
+                    },
                 }
-                Some(pkt) = incoming_recv.recv() => ctx.in_pkt = Some(pkt),
-                // TODO(erittenhouse): would be nice to decouple wait_for_data from the
-                // application, but wait_for_quiche relies on IOW methods, so we can't write a
-                // default implementation for ConnectionStage
-                status = self.wait_for_data_or_handshake(qconn, application) => status?,
-            };
+                self.cmd_receiver = cmd_rx;
+            }
+
+            #[cfg(not(feature = "multipath"))]
+            base_select! {}
 
             if let ControlFlow::Break(reason) = self.conn_stage.post_wait(qconn) {
                 return reason;
             }
         }
+    }
+
+    #[cfg(feature = "multipath")]
+    fn handle_multipath_cmd(
+        &mut self, cmd: crate::quic::connection::MultipathCommand,
+        qconn: &mut QuicheConnection,
+    ) {
+        use crate::quic::connection::MultipathCommand;
+
+        match cmd {
+            MultipathCommand::AddSocket {
+                socket,
+                local_addr,
+                reply,
+            } => {
+                let result = self.add_multipath_socket(socket, local_addr);
+                let _ = reply.send(result);
+            },
+            MultipathCommand::CreatePath {
+                local_addr,
+                peer_addr,
+                reply,
+            } => {
+                let result = qconn
+                    .create_path(local_addr, peer_addr)
+                    .map_err(|e| Box::new(e) as _);
+                let _ = reply.send(result);
+            },
+            MultipathCommand::ClosePath { path_id, reply } => {
+                let result = qconn
+                    .close_path(
+                        path_id,
+                        quiche::WireErrorCode::ApplicationError as u64,
+                    )
+                    .map_err(|e| Box::new(e) as _);
+                let _ = reply.send(result);
+            },
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    fn add_multipath_socket(
+        &mut self, socket: tokio::net::UdpSocket, local_addr: SocketAddr,
+    ) -> QuicResult<()> {
+        let socket = Arc::new(socket);
+
+        // Initialize registry if needed, using the main socket as a
+        // placeholder default (it won't be looked up by address).
+        if self.socket_registry.is_none() {
+            // We need a default Arc<UdpSocket> for the registry. Since the
+            // main socket may not be a UdpSocket (it's MaybeConnectedSocket<Tx>),
+            // we create the registry lazily and the first added socket becomes
+            // the reference.
+            self.socket_registry = Some(
+                crate::socket::registry::SocketRegistry::new(socket.clone()),
+            );
+        }
+
+        if let Some(ref mut registry) = self.socket_registry {
+            registry.insert(local_addr, Arc::clone(&socket));
+        }
+
+        // Spawn recv task feeding into the existing incoming channel.
+        if let Some(ref sender) = self.incoming_ev_sender {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, peer_addr)) => {
+                            let mut pooled_buf =
+                                crate::buf_factory::BufFactory::get_empty_buf();
+                            pooled_buf.extend(buf[..len].iter());
+                            let pkt = Incoming {
+                                peer_addr,
+                                local_addr,
+                                rx_time: Some(SystemTime::now()),
+                                buf: pooled_buf,
+                                gro: None,
+                                #[cfg(target_os = "linux")]
+                                so_mark_data: None,
+                            };
+                            if sender.send(pkt).await.is_err() {
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!(
+                                "multipath recv socket error";
+                                "error" => %e,
+                                "local_addr" => %local_addr
+                            );
+                            break;
+                        },
+                    }
+                }
+            });
+        }
+
+        Ok(())
     }
 
     #[cfg(feature = "perf-quic-listener-metrics")]
@@ -949,6 +1092,10 @@ impl<Tx, M, S> From<IoWorker<Tx, M, S>> for IoWorkerParams<Tx, M> {
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time: value.init_rx_time,
             metrics: value.metrics,
+            #[cfg(feature = "multipath")]
+            cmd_receiver: value.cmd_receiver,
+            #[cfg(feature = "multipath")]
+            incoming_ev_sender: value.incoming_ev_sender,
         }
     }
 }
