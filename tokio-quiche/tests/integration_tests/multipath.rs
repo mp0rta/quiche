@@ -562,3 +562,111 @@ async fn multipath_path_close_failover() {
     );
     assert!(got_fin, "should receive FIN after path close failover");
 }
+
+/// Tests runtime scheduler switching and path stats querying via the
+/// MultipathHandle API on the server side.
+#[tokio::test]
+async fn multipath_runtime_scheduler_switch() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = barrier.clone();
+
+    let handler = move |mut connection: ServerH3Connection| {
+        let barrier = barrier_clone.clone();
+        async move {
+            let mp = connection
+                .quic_connection
+                .multipath_handle()
+                .expect("multipath handle should be available")
+                .clone();
+
+            // Query path stats before scheduler switch.
+            let stats = mp.path_stats().await.expect("path_stats should succeed");
+            assert!(!stats.is_empty(), "should have at least one path");
+
+            // Switch from MinRtt (default) to RoundRobin.
+            mp.set_scheduler(
+                quiche::multipath::scheduler::MultipathSchedulerAlgorithm::RoundRobin,
+            )
+            .await
+            .expect("set_scheduler to RoundRobin should succeed");
+
+            // Switch back to MinRtt.
+            mp.set_scheduler(
+                quiche::multipath::scheduler::MultipathSchedulerAlgorithm::MinRtt,
+            )
+            .await
+            .expect("set_scheduler back to MinRtt should succeed");
+
+            // Signal the client that scheduler switching is done.
+            barrier.wait().await;
+
+            // Now serve the H3 request.
+            let _ = serve_connection_details(
+                &mut connection.h3_controller,
+                Default::default(),
+            )
+            .await;
+        }
+    };
+
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handler,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    // Handshake.
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+
+    // Wait for the server to finish scheduler switching.
+    tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+        .await
+        .expect("server should complete scheduler switching within timeout");
+
+    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut h3_conn =
+        quiche::h3::Connection::with_transport(&mut conn, &h3_config).unwrap();
+
+    exchange(&socket, client_addr, &mut conn).await;
+
+    let req = vec![
+        quiche::h3::Header::new(b":method", b"GET"),
+        quiche::h3::Header::new(b":scheme", b"https"),
+        quiche::h3::Header::new(b":authority", b"test.com"),
+        quiche::h3::Header::new(b":path", b"/1"),
+    ];
+    h3_conn.send_request(&mut conn, &req, true).unwrap();
+
+    for _ in 0..8 {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+
+    let (got_headers, got_fin) = drain_h3_events(&mut h3_conn, &mut conn);
+    assert!(
+        got_headers,
+        "should receive H3 response after scheduler switch"
+    );
+    assert!(got_fin, "should receive FIN after scheduler switch");
+}
