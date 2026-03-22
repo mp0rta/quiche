@@ -13459,3 +13459,40 @@ mod scheduler_event_tests {
         assert!(has_closed, "Expected Closed event for path_id={}", path_id);
     }
 }
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_reinjection_flag_lifecycle() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(4);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    // Exchange CIDs and create second path.
+    let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
+    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.advance().unwrap();
+
+    let local2: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+    let peer2: std::net::SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    pipe.client.create_path(local2, peer2).unwrap();
+    pipe.advance().unwrap();
+
+    // Verify flag starts as None.
+    assert!(pipe.client.pending_reinjection_path.is_none());
+
+    // Simulate: set the flag as if a stream frame was lost on path 0.
+    pipe.client.pending_reinjection_path = Some(0);
+    assert!(pipe.client.pending_reinjection_path.is_some());
+
+    // Send a packet — this consumes the flag via take().
+    let mut buf = [0u8; 65535];
+    pipe.client.stream_send(0, b"test data", true).unwrap();
+    let _ = pipe.client.send_on_path(&mut buf, None, None);
+
+    // After send, flag should be consumed (None).
+    assert!(pipe.client.pending_reinjection_path.is_none());
+}
