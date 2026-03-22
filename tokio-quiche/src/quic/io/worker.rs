@@ -133,6 +133,8 @@ pub(crate) struct IoWorker<Tx, M, S> {
     metrics: M,
     conn_stage: S,
     bw_estimator: BandwidthReporter,
+    #[cfg(feature = "multipath")]
+    socket_registry: Option<crate::socket::registry::SocketRegistry<tokio::net::UdpSocket>>,
 }
 
 impl<Tx, M, S> IoWorker<Tx, M, S>
@@ -160,6 +162,8 @@ where
             metrics: params.metrics,
             conn_stage,
             bw_estimator,
+            #[cfg(feature = "multipath")]
+            socket_registry: None,
         }
     }
 
@@ -517,9 +521,8 @@ where
     /// `pending_paths` iterator. If that is empty a new iterator will be
     /// created by querying quiche itself.
     ///
-    /// Note that the connection's statically configured local address will be
-    /// used to query quiche for available paths, so this can't handle multiple
-    /// local addresses currently.
+    /// When multipath is enabled and a socket registry is present, this
+    /// iterates over all registered local addresses to find available paths.
     fn select_path(
         &mut self, qconn: &QuicheConnection,
     ) -> Option<(SocketAddr, SocketAddr)> {
@@ -527,16 +530,31 @@ where
             return self.write_state.selected_path;
         }
 
-        let from = self.cfg.local_addr;
-
-        // Initialize paths iterator.
-        if self.write_state.pending_paths.len() == 0 {
-            self.write_state.pending_paths = qconn.paths_iter(from);
+        // Try the current pending_paths iterator first.
+        if let Some(to) = self.write_state.pending_paths.next() {
+            return self.write_state.selected_path.or(Some(
+                (self.cfg.local_addr, to),
+            ));
         }
 
-        let to = self.write_state.pending_paths.next()?;
+        #[cfg(feature = "multipath")]
+        if let Some(ref registry) = self.socket_registry {
+            // Try all registered local addresses for available paths.
+            let addrs: Vec<_> = registry.local_addrs().copied().collect();
+            for local_addr in addrs {
+                self.write_state.pending_paths = qconn.paths_iter(local_addr);
+                if let Some(to) = self.write_state.pending_paths.next() {
+                    self.write_state.selected_path = Some((local_addr, to));
+                    return self.write_state.selected_path;
+                }
+            }
+        }
 
-        Some((from, to))
+        // Default: use configured local address.
+        self.write_state.pending_paths = qconn.paths_iter(self.cfg.local_addr);
+        let to = self.write_state.pending_paths.next()?;
+        self.write_state.selected_path = Some((self.cfg.local_addr, to));
+        self.write_state.selected_path
     }
 
     #[cfg(not(feature = "gcongestion"))]
@@ -629,8 +647,51 @@ where
             let (from, to) = self.write_state.selected_path.unzip();
 
             let to = to.unwrap_or(self.cfg.peer_addr);
-            let from = from.filter(|_| self.cfg.with_pktinfo);
+            let from_for_pktinfo = from.filter(|_| self.cfg.with_pktinfo);
 
+            // When multipath is enabled, try to use the socket registered for
+            // this path's local address. Fall back to the default socket.
+            #[cfg(feature = "multipath")]
+            let mp_socket = from.and_then(|addr| {
+                self.socket_registry
+                    .as_ref()
+                    .map(|r| r.get(&addr).clone())
+            });
+
+            #[cfg(feature = "multipath")]
+            let send_res = if let Some(ref udp_socket) = mp_socket {
+                send_to(
+                    udp_socket,
+                    to,
+                    from_for_pktinfo,
+                    current_send_buf,
+                    self.write_state.segment_size,
+                    self.write_state.tx_time,
+                    self.metrics
+                        .write_errors(labels::QuicWriteError::WouldBlock),
+                    self.metrics.send_to_wouldblock_duration_s(),
+                )
+                .await
+            } else if let (Some(udp_socket), true) =
+                (self.socket.as_udp_socket(), self.cfg.with_gso)
+            {
+                send_to(
+                    udp_socket,
+                    to,
+                    from_for_pktinfo,
+                    current_send_buf,
+                    self.write_state.segment_size,
+                    self.write_state.tx_time,
+                    self.metrics
+                        .write_errors(labels::QuicWriteError::WouldBlock),
+                    self.metrics.send_to_wouldblock_duration_s(),
+                )
+                .await
+            } else {
+                self.socket.send_to(current_send_buf, to).await
+            };
+
+            #[cfg(not(feature = "multipath"))]
             let send_res = if let (Some(udp_socket), true) =
                 (self.socket.as_udp_socket(), self.cfg.with_gso)
             {
@@ -638,7 +699,7 @@ where
                 send_to(
                     udp_socket,
                     to,
-                    from,
+                    from_for_pktinfo,
                     current_send_buf,
                     self.write_state.segment_size,
                     self.write_state.tx_time,
