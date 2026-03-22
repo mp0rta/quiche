@@ -259,6 +259,9 @@ pub enum H3Event {
     /// don't result from RST_STREAM frames, unlike the
     /// [`H3Event::ResetStream`] variant.
     StreamClosed { stream_id: u64 },
+    /// A multipath path event occurred.
+    #[cfg(feature = "multipath")]
+    PathEvent(quiche::PathEvent),
 }
 
 impl H3Event {
@@ -403,6 +406,8 @@ impl<H: DriverHooks> H3Driver<H> {
             H3Controller {
                 cmd_sender,
                 h3_event_recv: Some(h3_event_recv),
+                #[cfg(feature = "multipath")]
+                multipath_handle: None,
             },
         )
     }
@@ -1291,6 +1296,16 @@ impl<H: DriverHooks> ApplicationOverQuic for H3Driver<H> {
         }
     }
 
+    #[cfg(feature = "multipath")]
+    fn on_path_event(
+        &mut self, _qconn: &mut QuicheConnection, event: quiche::PathEvent,
+    ) -> QuicResult<()> {
+        let _ = self
+            .h3_event_sender
+            .send(H3Event::PathEvent(event).into());
+        Ok(())
+    }
+
     /// Wait for incoming data from the [H3Controller]. The next iteration of
     /// the I/O loop commences when one of the `select!`ed futures triggers.
     #[inline]
@@ -1417,6 +1432,9 @@ pub struct H3Controller<H: DriverHooks> {
     /// Receives [`H3Event`]s from the [H3Driver]. Can be extracted and
     /// used independently of the [H3Controller].
     h3_event_recv: Option<UnboundedReceiver<H::Event>>,
+    /// Handle for managing multipath paths on this connection.
+    #[cfg(feature = "multipath")]
+    multipath_handle: Option<crate::quic::connection::MultipathHandle>,
 }
 
 impl<H: DriverHooks> H3Controller<H> {
@@ -1454,6 +1472,23 @@ impl<H: DriverHooks> H3Controller<H> {
             sender: self.cmd_sender.clone(),
             _r: Default::default(),
         }
+    }
+
+    /// Returns the multipath handle, if one has been set.
+    #[cfg(feature = "multipath")]
+    pub fn multipath(&self) -> Option<&crate::quic::connection::MultipathHandle> {
+        self.multipath_handle.as_ref()
+    }
+
+    /// Sets the multipath handle on this controller.
+    ///
+    /// Call this after the QUIC handshake completes, passing the handle
+    /// obtained from [`QuicConnection::multipath_handle()`].
+    #[cfg(feature = "multipath")]
+    pub fn set_multipath_handle(
+        &mut self, handle: crate::quic::connection::MultipathHandle,
+    ) {
+        self.multipath_handle = Some(handle);
     }
 
     /// Shuts down a stream in the specified direction(s) and removes it from
