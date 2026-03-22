@@ -17,98 +17,126 @@ impl Scheduler for MinRttScheduler {
     ) -> SchedulerDecision {
         let now = packet.now;
 
-        let mut best_ready_avail: Option<(u64, std::time::Duration)> = None;
-        let mut best_ready_backup: Option<(u64, std::time::Duration)> = None;
-        let mut best_delayed_avail: Option<(u64, Option<std::time::Instant>)> =
-            None;
-        let mut best_delayed_backup: Option<(
-            u64,
-            Option<std::time::Instant>,
-        )> = None;
+        // For reinjections, try to avoid the path that lost the original
+        // packet.  We do two passes: pass 0 skips the origin path, pass 1
+        // is an unrestricted fallback.
+        let skip_path_id = if packet.is_reinjection {
+            packet.original_path_id
+        } else {
+            None
+        };
+
         let mut has_validated = false;
 
-        for p in paths {
-            if p.state < PathState::Validated {
-                continue;
-            }
-            has_validated = true;
+        for pass in 0..2u8 {
+            let mut best_ready_avail: Option<(u64, std::time::Duration)> =
+                None;
+            let mut best_ready_backup: Option<(u64, std::time::Duration)> =
+                None;
+            let mut best_delayed_avail: Option<(
+                u64,
+                Option<std::time::Instant>,
+            )> = None;
+            let mut best_delayed_backup: Option<(
+                u64,
+                Option<std::time::Instant>,
+            )> = None;
 
-            if p.cwnd_available == 0 {
-                continue;
-            }
+            for p in paths {
+                if p.state < PathState::Validated {
+                    continue;
+                }
+                // Track validated paths across both passes for the final
+                // AllBlocked / NoAvailablePath decision.
+                has_validated = true;
 
-            let is_ready = p.next_send_time.map_or(true, |t| t <= now);
+                // Pass 0: skip the loss-origin path.
+                if pass == 0 && Some(p.path_id) == skip_path_id {
+                    continue;
+                }
 
-            match p.app_status {
-                PathAppStatus::Available => {
-                    if is_ready {
-                        match best_ready_avail {
-                            Some((_, rtt)) if p.srtt < rtt => {
-                                best_ready_avail =
-                                    Some((p.path_id, p.srtt));
+                if p.cwnd_available == 0 {
+                    continue;
+                }
+
+                let is_ready = p.next_send_time.map_or(true, |t| t <= now);
+
+                match p.app_status {
+                    PathAppStatus::Available => {
+                        if is_ready {
+                            match best_ready_avail {
+                                Some((_, rtt)) if p.srtt < rtt => {
+                                    best_ready_avail =
+                                        Some((p.path_id, p.srtt));
+                                },
+                                None => {
+                                    best_ready_avail =
+                                        Some((p.path_id, p.srtt));
+                                },
+                                _ => {},
+                            }
+                        }
+                        match best_delayed_avail {
+                            Some((_, t)) if p.next_send_time < t => {
+                                best_delayed_avail =
+                                    Some((p.path_id, p.next_send_time));
                             },
                             None => {
-                                best_ready_avail =
-                                    Some((p.path_id, p.srtt));
+                                best_delayed_avail =
+                                    Some((p.path_id, p.next_send_time));
                             },
                             _ => {},
                         }
-                    }
-                    match best_delayed_avail {
-                        Some((_, t)) if p.next_send_time < t => {
-                            best_delayed_avail =
-                                Some((p.path_id, p.next_send_time));
-                        },
-                        None => {
-                            best_delayed_avail =
-                                Some((p.path_id, p.next_send_time));
-                        },
-                        _ => {},
-                    }
-                },
-                PathAppStatus::Backup => {
-                    if is_ready {
-                        match best_ready_backup {
-                            Some((_, rtt)) if p.srtt < rtt => {
-                                best_ready_backup =
-                                    Some((p.path_id, p.srtt));
+                    },
+                    PathAppStatus::Backup => {
+                        if is_ready {
+                            match best_ready_backup {
+                                Some((_, rtt)) if p.srtt < rtt => {
+                                    best_ready_backup =
+                                        Some((p.path_id, p.srtt));
+                                },
+                                None => {
+                                    best_ready_backup =
+                                        Some((p.path_id, p.srtt));
+                                },
+                                _ => {},
+                            }
+                        }
+                        match best_delayed_backup {
+                            Some((_, t)) if p.next_send_time < t => {
+                                best_delayed_backup =
+                                    Some((p.path_id, p.next_send_time));
                             },
                             None => {
-                                best_ready_backup =
-                                    Some((p.path_id, p.srtt));
+                                best_delayed_backup =
+                                    Some((p.path_id, p.next_send_time));
                             },
                             _ => {},
                         }
-                    }
-                    match best_delayed_backup {
-                        Some((_, t)) if p.next_send_time < t => {
-                            best_delayed_backup =
-                                Some((p.path_id, p.next_send_time));
-                        },
-                        None => {
-                            best_delayed_backup =
-                                Some((p.path_id, p.next_send_time));
-                        },
-                        _ => {},
-                    }
-                },
+                    },
+                }
             }
-        }
 
-        // Prefer ready paths (sorted by RTT).
-        if let Some((id, _)) = best_ready_avail {
-            return SchedulerDecision::Send(id);
-        }
-        if let Some((id, _)) = best_ready_backup {
-            return SchedulerDecision::Send(id);
-        }
+            // Prefer ready paths (sorted by RTT), then pacing-delayed.
+            if let Some((id, _)) = best_ready_avail {
+                return SchedulerDecision::Send(id);
+            }
+            if let Some((id, _)) = best_ready_backup {
+                return SchedulerDecision::Send(id);
+            }
+            if let Some((id, _)) = best_delayed_avail {
+                return SchedulerDecision::Send(id);
+            }
+            if let Some((id, _)) = best_delayed_backup {
+                return SchedulerDecision::Send(id);
+            }
 
-        // All pacing-delayed — pick earliest ready time.
-        if let Some((id, _)) = best_delayed_avail {
-            return SchedulerDecision::Send(id);
-        }
-        if let Some((id, _)) = best_delayed_backup {
-            return SchedulerDecision::Send(id);
+            // No candidates found in this pass.  If we were not filtering
+            // (no skip_path_id), there is no point doing a second pass.
+            if skip_path_id.is_none() {
+                break;
+            }
+            // Otherwise, pass 1 will retry without the filter.
         }
 
         if has_validated {
@@ -341,5 +369,34 @@ mod tests {
             sched.select_path(&paths, &default_packet()),
             SchedulerDecision::Send(0),
         );
+    }
+
+    #[test]
+    fn reinjection_avoids_original_path() {
+        let mut sched = MinRttScheduler;
+        let paths = vec![
+            make_path(0, 10, 10000, PathAppStatus::Available),
+            make_path(1, 50, 10000, PathAppStatus::Available),
+        ];
+        let packet = PacketMeta {
+            is_reinjection: true,
+            original_path_id: Some(0),
+            ..default_packet()
+        };
+        assert_eq!(sched.select_path(&paths, &packet), SchedulerDecision::Send(1));
+    }
+
+    #[test]
+    fn reinjection_fallback_single_path() {
+        let mut sched = MinRttScheduler;
+        let paths = vec![
+            make_path(0, 10, 10000, PathAppStatus::Available),
+        ];
+        let packet = PacketMeta {
+            is_reinjection: true,
+            original_path_id: Some(0),
+            ..default_packet()
+        };
+        assert_eq!(sched.select_path(&paths, &packet), SchedulerDecision::Send(0));
     }
 }
