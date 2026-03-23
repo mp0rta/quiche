@@ -207,9 +207,12 @@ impl ServerHooks {
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, STREAM_CAPACITY);
 
-        if let Some(flow_id) = datagram::extract_flow_id(stream_id, &headers) {
-            let _ = driver.get_or_insert_flow(flow_id)?;
-            stream_ctx.associated_dgram_flow_id = Some(flow_id);
+        if let Some(flow_info) =
+            datagram::extract_flow_info(stream_id, &headers)
+        {
+            let _ = driver.get_or_insert_flow(flow_info.flow_id)?;
+            stream_ctx.associated_dgram_flow_id = Some(flow_info.flow_id);
+            stream_ctx.has_context_id = flow_info.has_context_id;
         }
 
         let latest_priority_update: Option<RawPriorityValue> = driver

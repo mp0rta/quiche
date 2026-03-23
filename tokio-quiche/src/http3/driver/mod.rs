@@ -903,21 +903,45 @@ impl<H: DriverHooks> H3Driver<H> {
                         // RFC 9297 §2.1: MUST NOT send when stream send
                         // side is not open.
                         let stream_id = flow_id * 4;
-                        let send_open = self
-                            .stream_map
-                            .get(&stream_id)
-                            .map(|c| !c.fin_or_reset_sent)
-                            .unwrap_or(false);
+                        let ctx = self.stream_map.get(&stream_id);
+                        let send_open =
+                            ctx.map(|c| !c.fin_or_reset_sent).unwrap_or(false);
                         if send_open {
-                            let res =
-                                datagram::send_h3_dgram(qconn, flow_id, dgram);
-                            if let Err(e) = res {
-                                if e != quiche::Error::Done {
-                                    log::warn!(
-                                        "failed to send datagram";
-                                        "flow_id" => flow_id,
-                                        "error" => ?e,
-                                    );
+                            let has_ctx_id = ctx
+                                .map(|c| c.has_context_id)
+                                .unwrap_or(false);
+
+                            // RFC 9298 §5: MUST NOT send UDP Proxying
+                            // Payload longer than 65527 with Context ID 0.
+                            if has_ctx_id
+                                && dgram.as_ref().len()
+                                    > datagram::MAX_UDP_PAYLOAD_SIZE
+                            {
+                                log::debug!(
+                                    "dropping oversized UDP datagram";
+                                    "flow_id" => flow_id,
+                                    "len" => dgram.as_ref().len(),
+                                );
+                            } else {
+                                let res = if has_ctx_id {
+                                    // RFC 9298 §5: Context ID 0 =
+                                    // UDP payload.
+                                    datagram::send_dgram_with_context_id(
+                                        qconn, flow_id, 0, dgram,
+                                    )
+                                } else {
+                                    datagram::send_h3_dgram(
+                                        qconn, flow_id, dgram,
+                                    )
+                                };
+                                if let Err(e) = res {
+                                    if e != quiche::Error::Done {
+                                        log::warn!(
+                                            "failed to send datagram";
+                                            "flow_id" => flow_id,
+                                            "error" => ?e,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1107,6 +1131,50 @@ impl<H: DriverHooks> H3Driver<H> {
                             continue;
                         }
                     }
+
+                    // RFC 9298 §5: datagrams on CONNECT-UDP flows carry
+                    // a Context ID varint after the Quarter Stream ID.
+                    // Strip it before delivering the payload to the flow.
+                    let ctx_meta = self.stream_map.get(&stream_id);
+                    let has_context_id = ctx_meta
+                        .map(|c| c.has_context_id)
+                        .unwrap_or(false);
+                    let dgram = if has_context_id {
+                        match datagram::strip_context_id(dgram) {
+                            Ok((context_id, payload)) => {
+                                // RFC 9298 §5: UDP Proxying Payload with
+                                // Context ID 0 MUST NOT exceed 65527
+                                // bytes.
+                                let payload_len = match &payload {
+                                    InboundFrame::Datagram(d) =>
+                                        d.as_ref().len(),
+                                    _ => 0,
+                                };
+                                if context_id == 0
+                                    && payload_len
+                                        > datagram::MAX_UDP_PAYLOAD_SIZE
+                                {
+                                    self.shutdown_stream(
+                                        qconn,
+                                        stream_id,
+                                        StreamShutdown::Both {
+                                            read_error_code:
+                                                WireErrorCode::NoError
+                                                    as u64,
+                                            write_error_code:
+                                                WireErrorCode::NoError
+                                                    as u64,
+                                        },
+                                    )?;
+                                    continue;
+                                }
+                                payload
+                            },
+                            Err(_) => continue, // malformed, drop
+                        }
+                    } else {
+                        dgram
+                    };
 
                     // Deliver to existing flows, or create a new flow if the
                     // stream was set up for datagrams.

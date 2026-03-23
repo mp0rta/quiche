@@ -60,14 +60,36 @@ pub(crate) fn has_capsule_header_conflict(headers: &[h3::Header]) -> bool {
     has_capsule_protocol && has_forbidden
 }
 
+/// Result of inspecting request headers for DATAGRAM/Capsule-Protocol usage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlowInfo {
+    /// The Quarter Stream ID used as the DATAGRAM flow identifier.
+    pub flow_id: u64,
+    /// Whether the request uses the Capsule Protocol.
+    pub capsule_protocol: bool,
+    /// Whether datagrams on this flow carry a Context ID varint after the
+    /// Quarter Stream ID (RFC 9298 §5). False for draft CONNECT-UDP which
+    /// predates the Context ID mechanism.
+    pub has_context_id: bool,
+}
+
 /// Extracts the DATAGRAM flow ID proxied over the given `stream_id`,
 /// or `None` if this is not a proxy request.
 pub(crate) fn extract_flow_id(
     stream_id: u64, headers: &[h3::Header],
 ) -> Option<u64> {
+    extract_flow_info(stream_id, headers).map(|info| info.flow_id)
+}
+
+/// Extracts full flow information from request headers, including
+/// Capsule-Protocol and protocol type detection.
+pub(crate) fn extract_flow_info(
+    stream_id: u64, headers: &[h3::Header],
+) -> Option<FlowInfo> {
     let mut method = None;
     let mut datagram_flow_id: Option<u64> = None;
     let mut protocol = None;
+    let mut has_capsule_protocol = false;
 
     for header in headers {
         match header.name() {
@@ -77,24 +99,33 @@ pub(crate) fn extract_flow_id(
                 datagram_flow_id = std::str::from_utf8(header.value())
                     .ok()
                     .and_then(|v| v.parse().ok()),
+            b"capsule-protocol" => {
+                // RFC 9297 Section 3.4: value is a boolean structured field
+                has_capsule_protocol = header.value() == b"?1";
+            },
             _ => {},
         };
-
-        // We have all of the information needed to get a flow_id or
-        // quarter_stream_id
-        if method.is_some() && (datagram_flow_id.is_some() || protocol.is_some())
-        {
-            break;
-        }
     }
 
     // draft-ietf-masque-connect-udp-03 CONNECT-UDP
     if method == Some(b"CONNECT-UDP") && datagram_flow_id.is_some() {
-        datagram_flow_id
+        Some(FlowInfo {
+            flow_id: datagram_flow_id.unwrap(),
+            capsule_protocol: has_capsule_protocol,
+            // Draft predates Context ID; datagrams carry only flow_id + payload.
+            has_context_id: false,
+        })
     // RFC 9298 CONNECT-UDP
-    } else if method == Some(b"CONNECT") && protocol == Some(b"connect-udp") {
-        // RFC 9297 Section 2.1: Quarter Stream ID
-        Some(stream_id / 4)
+    } else if method == Some(b"CONNECT")
+        && protocol == Some(b"connect-udp")
+    {
+        Some(FlowInfo {
+            // RFC 9297 Section 2.1: Quarter Stream ID
+            flow_id: stream_id / 4,
+            capsule_protocol: has_capsule_protocol,
+            // RFC 9298 §5: Context ID follows Quarter Stream ID.
+            has_context_id: true,
+        })
     } else {
         None
     }
@@ -114,6 +145,58 @@ pub(crate) fn send_h3_dgram(
         let mut inner = dgram.into_inner().into_vec();
         inner.splice(..0, flow_id.iter().copied());
         conn.dgram_send_vec(inner)
+    }
+}
+
+/// Sends a datagram with a Context ID prefix (RFC 9298 §5).
+///
+/// Wire format: Quarter Stream ID (varint) + Context ID (varint) + payload.
+pub(crate) fn send_dgram_with_context_id(
+    conn: &mut QuicheConnection, flow_id: u64, context_id: u64,
+    mut dgram: PooledDgram,
+) -> quiche::Result<()> {
+    let mut prefix = [0u8; 16];
+    let prefix_len = {
+        let mut buf = octets::OctetsMut::with_slice(&mut prefix);
+        buf.put_varint(flow_id)?;
+        buf.put_varint(context_id)?;
+        buf.off()
+    };
+    let prefix_bytes = &prefix[..prefix_len];
+
+    if dgram.add_prefix(prefix_bytes) {
+        conn.dgram_send(&dgram)
+    } else {
+        let mut inner = dgram.into_inner().into_vec();
+        inner.splice(..0, prefix_bytes.iter().copied());
+        conn.dgram_send_vec(inner)
+    }
+}
+
+/// Maximum UDP Proxying Payload length for Context ID 0 (RFC 9298 §5).
+/// Derived from the maximum UDP payload: 65535 − 8 (UDP header) = 65527.
+pub(crate) const MAX_UDP_PAYLOAD_SIZE: usize = 65527;
+
+/// Strips the Context ID varint prefix from a datagram payload
+/// (RFC 9298 §5). Returns the Context ID and the remaining payload
+/// as an [`InboundFrame`].
+///
+/// Returns `quiche::Error::InvalidFrame` if the Context ID cannot be parsed.
+pub(crate) fn strip_context_id(
+    frame: InboundFrame,
+) -> Result<(u64, InboundFrame), quiche::Error> {
+    match frame {
+        InboundFrame::Datagram(dgram) => {
+            let buf = dgram.as_ref();
+            let mut oct = octets::Octets::with_slice(buf);
+            let context_id = oct
+                .get_varint()
+                .map_err(|_| quiche::Error::InvalidFrame)?;
+            let off = oct.off();
+            let payload = BufFactory::dgram_from_slice(&buf[off..]);
+            Ok((context_id, InboundFrame::Datagram(payload)))
+        },
+        other => Ok((0, other)),
     }
 }
 
@@ -155,6 +238,104 @@ pub(crate) fn receive_h3_dgram(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_info_connect_udp_draft() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT-UDP"),
+            h3::Header::new(b"datagram-flow-id", b"42"),
+        ];
+        let info = extract_flow_info(0, &headers).unwrap();
+        assert_eq!(info.flow_id, 42);
+        assert!(!info.capsule_protocol);
+        assert!(!info.has_context_id);
+    }
+
+    #[test]
+    fn flow_info_connect_udp_rfc9298() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-udp"),
+        ];
+        let info = extract_flow_info(4, &headers).unwrap();
+        assert_eq!(info.flow_id, 1);
+        assert!(!info.capsule_protocol);
+        assert!(info.has_context_id);
+    }
+
+    #[test]
+    fn flow_info_capsule_protocol_enabled() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-udp"),
+            h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let info = extract_flow_info(0, &headers).unwrap();
+        assert!(info.capsule_protocol);
+    }
+
+    #[test]
+    fn flow_info_capsule_protocol_disabled() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-udp"),
+            h3::Header::new(b"capsule-protocol", b"?0"),
+        ];
+        let info = extract_flow_info(0, &headers).unwrap();
+        assert!(!info.capsule_protocol);
+    }
+
+    #[test]
+    fn flow_info_non_proxy_request() {
+        let headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":path", b"/"),
+        ];
+        assert!(extract_flow_info(0, &headers).is_none());
+    }
+
+    #[test]
+    fn flow_info_connect_unknown_protocol() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"websocket"),
+        ];
+        assert!(extract_flow_info(0, &headers).is_none());
+    }
+
+    #[test]
+    fn flow_info_connect_without_protocol() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+        ];
+        assert!(extract_flow_info(0, &headers).is_none());
+    }
+
+    #[test]
+    fn flow_id_delegates_to_flow_info() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-udp"),
+        ];
+        assert_eq!(extract_flow_id(12, &headers), Some(3));
+    }
+
+    #[test]
+    fn flow_info_draft_connect_udp_without_flow_id() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT-UDP"),
+        ];
+        assert!(extract_flow_info(0, &headers).is_none());
+    }
+
+    #[test]
+    fn flow_info_draft_connect_udp_invalid_flow_id() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT-UDP"),
+            h3::Header::new(b"datagram-flow-id", b"not-a-number"),
+        ];
+        assert!(extract_flow_info(0, &headers).is_none());
+    }
 
     #[test]
     fn max_quarter_stream_id_value() {
