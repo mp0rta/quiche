@@ -886,13 +886,74 @@ impl<H: DriverHooks> H3Driver<H> {
     fn dgram_ready(
         &mut self, qconn: &mut QuicheConnection, frame: OutboundFrame,
     ) -> H3ConnectionResult<()> {
+        // RFC 9297 §2.1.1: MUST NOT send QUIC DATAGRAM frames until
+        // SETTINGS_H3_DATAGRAM=1 has been both sent and received.
+        let dgram_negotiated = self
+            .conn
+            .as_ref()
+            .map_or(false, |c| c.dgram_enabled_by_peer(qconn));
+
         let mut frame = Ok(frame);
 
         loop {
             match frame {
                 Ok(OutboundFrame::Datagram(dgram, flow_id)) => {
-                    // Drop datagrams if there is no capacity
-                    let _ = datagram::send_h3_dgram(qconn, flow_id, dgram);
+                    if !dgram_negotiated {
+                        // Drop: SETTINGS not yet exchanged.
+                        log::debug!(
+                            "dropping outbound datagram: SETTINGS_H3_DATAGRAM not negotiated";
+                            "flow_id" => flow_id,
+                        );
+                    } else {
+                        // RFC 9297 §2.1: MUST NOT send when stream send
+                        // side is not open.
+                        let stream_id = flow_id * 4;
+                        let ctx = self.stream_map.get(&stream_id);
+                        let send_open =
+                            ctx.map(|c| !c.fin_or_reset_sent).unwrap_or(false);
+                        if send_open {
+                            let has_ctx_id = ctx
+                                .map(|c| c.has_context_id)
+                                .unwrap_or(false);
+
+                            // RFC 9298 §5: MUST NOT send UDP Proxying
+                            // Payload longer than 65527 with Context ID 0.
+                            if has_ctx_id
+                                && !ctx
+                                    .map(|c| c.is_connect_ip)
+                                    .unwrap_or(false)
+                                && dgram.as_ref().len()
+                                    > datagram::MAX_UDP_PAYLOAD_SIZE
+                            {
+                                log::debug!(
+                                    "dropping oversized UDP datagram";
+                                    "flow_id" => flow_id,
+                                    "len" => dgram.as_ref().len(),
+                                );
+                            } else {
+                                let res = if has_ctx_id {
+                                    // RFC 9298 §5 / RFC 9484 §6:
+                                    // Context ID 0 = UDP/IP payload.
+                                    datagram::send_connect_ip_dgram(
+                                        qconn, flow_id, 0, dgram,
+                                    )
+                                } else {
+                                    datagram::send_h3_dgram(
+                                        qconn, flow_id, dgram,
+                                    )
+                                };
+                                if let Err(e) = res {
+                                    if e != quiche::Error::Done {
+                                        log::warn!(
+                                            "failed to send datagram";
+                                            "flow_id" => flow_id,
+                                            "error" => ?e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
                 Ok(OutboundFrame::FlowShutdown { flow_id, stream_id }) => {
                     self.shutdown_stream(
@@ -1061,15 +1122,119 @@ impl<H: DriverHooks> H3Driver<H> {
 impl<H: DriverHooks> H3Driver<H> {
     /// Reads all buffered datagrams out of `qconn` and distributes them to
     /// their flow channels.
+    ///
+    /// RFC 9297 Section 2.1: datagrams received for a stream whose receive
+    /// side is closed are silently dropped.
     fn process_available_dgrams(
         &mut self, qconn: &mut QuicheConnection,
     ) -> H3ConnectionResult<()> {
         loop {
             match datagram::receive_h3_dgram(qconn) {
                 Ok((flow_id, dgram)) => {
-                    self.get_or_insert_flow(flow_id)?.send_best_effort(dgram);
+                    // RFC 9297 Section 2.1: if the corresponding stream's
+                    // receive side is closed, silently drop the datagram.
+                    let stream_id = flow_id * 4;
+                    if let Some(ctx) = self.stream_map.get(&stream_id) {
+                        if ctx.fin_or_reset_recv {
+                            // Stream closed — silently drop per RFC 9297.
+                            continue;
+                        }
+                    }
+
+                    // RFC 9298 §5 / RFC 9484 §6: datagrams on
+                    // CONNECT-UDP and CONNECT-IP flows carry a Context
+                    // ID varint after the Quarter Stream ID. Strip it
+                    // before delivering the payload to the flow.
+                    let ctx_meta = self.stream_map.get(&stream_id);
+                    let has_context_id = ctx_meta
+                        .map(|c| c.has_context_id)
+                        .unwrap_or(false);
+                    let dgram = if has_context_id {
+                        match datagram::strip_context_id(dgram) {
+                            Ok((context_id, payload)) => {
+                                // RFC 9298 §5: UDP Proxying Payload with
+                                // Context ID 0 MUST NOT exceed 65527
+                                // bytes. Abort the stream if it does.
+                                let is_connect_ip = ctx_meta
+                                    .map(|c| c.is_connect_ip)
+                                    .unwrap_or(false);
+                                let payload_len = match &payload {
+                                    InboundFrame::Datagram(d) =>
+                                        d.as_ref().len(),
+                                    _ => 0,
+                                };
+                                if context_id == 0
+                                    && !is_connect_ip
+                                    && payload_len
+                                        > datagram::MAX_UDP_PAYLOAD_SIZE
+                                {
+                                    self.shutdown_stream(
+                                        qconn,
+                                        stream_id,
+                                        StreamShutdown::Both {
+                                            read_error_code:
+                                                WireErrorCode::NoError
+                                                    as u64,
+                                            write_error_code:
+                                                WireErrorCode::NoError
+                                                    as u64,
+                                        },
+                                    )?;
+                                    continue;
+                                }
+                                payload
+                            },
+                            Err(_) => continue, // malformed, drop
+                        }
+                    } else {
+                        dgram
+                    };
+
+                    // Deliver to existing flows, or create a new flow if the
+                    // stream was set up for datagrams.
+                    if self.flow_map.contains_key(&flow_id) {
+                        if let Some(flow) = self.flow_map.get_mut(&flow_id) {
+                            flow.send_best_effort(dgram);
+                        }
+                    } else if let Some(ctx) =
+                        self.stream_map.get(&stream_id)
+                    {
+                        if ctx.associated_dgram_flow_id.is_some() {
+                            // Stream supports datagrams — create flow.
+                            self.get_or_insert_flow(flow_id)?
+                                .send_best_effort(dgram);
+                        } else {
+                            // RFC 9297 §2: stream exists but has no
+                            // datagram semantics — abort with
+                            // H3_DATAGRAM_ERROR.
+                            self.shutdown_stream(
+                                qconn,
+                                stream_id,
+                                StreamShutdown::Both {
+                                    read_error_code:
+                                        WireErrorCode::DatagramError as u64,
+                                    write_error_code:
+                                        WireErrorCode::DatagramError as u64,
+                                },
+                            )?;
+                        }
+                    }
+                    // else: no stream — silently drop per RFC 9297 §2.1.
                 },
                 Err(quiche::Error::Done) => return Ok(()),
+                Err(quiche::Error::InvalidFrame) => {
+                    // RFC 9297 §2.1: truncated Quarter Stream ID or
+                    // value > 2^60-1 MUST be treated as an HTTP/3
+                    // connection error of type H3_DATAGRAM_ERROR.
+                    let _ = qconn.close(
+                        true,
+                        WireErrorCode::DatagramError as u64,
+                        b"Malformed HTTP/3 datagram",
+                    );
+                    return Err(H3ConnectionError::H3(
+                        h3::Error::DatagramError,
+                    ));
+                },
                 Err(err) => return Err(H3ConnectionError::from(err)),
             }
         }

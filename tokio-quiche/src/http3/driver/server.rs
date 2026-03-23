@@ -188,12 +188,32 @@ impl ServerHooks {
             return Ok(());
         }
 
+        // RFC 9297 §3.2: capsule-protocol with Content-Length,
+        // Content-Type, or Transfer-Encoding is malformed.
+        if datagram::has_capsule_header_conflict(&headers) {
+            let _ = qconn.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Read,
+                quiche::h3::WireErrorCode::MessageError as u64,
+            );
+            let _ = qconn.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Write,
+                quiche::h3::WireErrorCode::MessageError as u64,
+            );
+            return Ok(());
+        }
+
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, STREAM_CAPACITY);
 
-        if let Some(flow_id) = datagram::extract_flow_id(stream_id, &headers) {
-            let _ = driver.get_or_insert_flow(flow_id)?;
-            stream_ctx.associated_dgram_flow_id = Some(flow_id);
+        if let Some(flow_info) =
+            datagram::extract_flow_info(stream_id, &headers)
+        {
+            let _ = driver.get_or_insert_flow(flow_info.flow_id)?;
+            stream_ctx.associated_dgram_flow_id = Some(flow_info.flow_id);
+            stream_ctx.has_context_id = flow_info.has_context_id;
+            stream_ctx.is_connect_ip = flow_info.is_connect_ip;
         }
 
         let latest_priority_update: Option<RawPriorityValue> = driver
