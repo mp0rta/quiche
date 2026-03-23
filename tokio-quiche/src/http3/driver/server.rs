@@ -213,6 +213,7 @@ impl ServerHooks {
             let _ = driver.get_or_insert_flow(flow_info.flow_id)?;
             stream_ctx.associated_dgram_flow_id = Some(flow_info.flow_id);
             stream_ctx.has_context_id = flow_info.has_context_id;
+            stream_ctx.is_connect_ip = flow_info.is_connect_ip;
         }
 
         let latest_priority_update: Option<RawPriorityValue> = driver

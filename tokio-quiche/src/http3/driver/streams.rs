@@ -64,9 +64,13 @@ pub(crate) struct StreamCtx {
     /// the stream has no associated DATAGRAM flow.
     pub(crate) associated_dgram_flow_id: Option<u64>,
     /// Whether datagrams on this stream include a Context ID varint after
-    /// the Quarter Stream ID (RFC 9298 §5). False for legacy draft
+    /// the Quarter Stream ID (RFC 9298 §5, RFC 9484 §6). False for draft
     /// CONNECT-UDP which predates the Context ID mechanism.
     pub(crate) has_context_id: bool,
+    /// Whether this stream is a CONNECT-IP tunnel (RFC 9484), as opposed
+    /// to CONNECT-UDP (RFC 9298). Used for protocol-specific validation
+    /// such as the 65527-byte UDP payload limit.
+    pub(crate) is_connect_ip: bool,
 }
 
 impl StreamCtx {
@@ -92,6 +96,7 @@ impl StreamCtx {
 
             associated_dgram_flow_id: None,
             has_context_id: false,
+            is_connect_ip: false,
         };
 
         (ctx, PollSender::new(backward_sender), forward_receiver)

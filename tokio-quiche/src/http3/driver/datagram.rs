@@ -67,9 +67,11 @@ pub(crate) struct FlowInfo {
     pub flow_id: u64,
     /// Whether the request uses the Capsule Protocol.
     pub capsule_protocol: bool,
+    /// Whether this is a CONNECT-IP request (vs CONNECT-UDP).
+    pub is_connect_ip: bool,
     /// Whether datagrams on this flow carry a Context ID varint after the
-    /// Quarter Stream ID (RFC 9298 §5). False for draft CONNECT-UDP which
-    /// predates the Context ID mechanism.
+    /// Quarter Stream ID (RFC 9298 §5, RFC 9484 §6). False for draft
+    /// CONNECT-UDP which predates the Context ID mechanism.
     pub has_context_id: bool,
 }
 
@@ -112,20 +114,30 @@ pub(crate) fn extract_flow_info(
         Some(FlowInfo {
             flow_id: datagram_flow_id.unwrap(),
             capsule_protocol: has_capsule_protocol,
+            is_connect_ip: false,
             // Draft predates Context ID; datagrams carry only flow_id + payload.
             has_context_id: false,
         })
-    // RFC 9298 CONNECT-UDP
-    } else if method == Some(b"CONNECT")
-        && protocol == Some(b"connect-udp")
-    {
-        Some(FlowInfo {
-            // RFC 9297 Section 2.1: Quarter Stream ID
-            flow_id: stream_id / 4,
-            capsule_protocol: has_capsule_protocol,
-            // RFC 9298 §5: Context ID follows Quarter Stream ID.
-            has_context_id: true,
-        })
+    // RFC 9298 CONNECT-UDP / RFC 9484 CONNECT-IP
+    } else if method == Some(b"CONNECT") && protocol.is_some() {
+        let proto = protocol.unwrap();
+        let is_connect_ip = proto == b"connect-ip";
+        let is_connect_udp = proto == b"connect-udp";
+
+        if is_connect_udp || is_connect_ip {
+            Some(FlowInfo {
+                // RFC 9297 Section 2.1: Quarter Stream ID
+                flow_id: stream_id / 4,
+                // CONNECT-IP always uses Capsule Protocol (RFC 9484 Section 4)
+                capsule_protocol: has_capsule_protocol || is_connect_ip,
+                is_connect_ip,
+                // RFC 9298 §5 / RFC 9484 §6: Context ID follows Quarter
+                // Stream ID in all QUIC DATAGRAM frames.
+                has_context_id: true,
+            })
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -248,6 +260,7 @@ mod tests {
         let info = extract_flow_info(0, &headers).unwrap();
         assert_eq!(info.flow_id, 42);
         assert!(!info.capsule_protocol);
+        assert!(!info.is_connect_ip);
         assert!(!info.has_context_id);
     }
 
@@ -260,7 +273,43 @@ mod tests {
         let info = extract_flow_info(4, &headers).unwrap();
         assert_eq!(info.flow_id, 1);
         assert!(!info.capsule_protocol);
+        assert!(!info.is_connect_ip);
         assert!(info.has_context_id);
+    }
+
+    #[test]
+    fn flow_info_connect_ip() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-ip"),
+        ];
+        let info = extract_flow_info(8, &headers).unwrap();
+        assert_eq!(info.flow_id, 2);
+        assert!(info.capsule_protocol);
+        assert!(info.is_connect_ip);
+        assert!(info.has_context_id);
+    }
+
+    #[test]
+    fn flow_info_connect_ip_implicit_capsule_protocol() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-ip"),
+        ];
+        let info = extract_flow_info(0, &headers).unwrap();
+        assert!(info.capsule_protocol);
+    }
+
+    #[test]
+    fn flow_info_connect_ip_with_explicit_capsule_header() {
+        let headers = vec![
+            h3::Header::new(b":method", b"CONNECT"),
+            h3::Header::new(b":protocol", b"connect-ip"),
+            h3::Header::new(b"capsule-protocol", b"?1"),
+        ];
+        let info = extract_flow_info(0, &headers).unwrap();
+        assert!(info.capsule_protocol);
+        assert!(info.is_connect_ip);
     }
 
     #[test]

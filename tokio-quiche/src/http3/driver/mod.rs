@@ -911,9 +911,15 @@ impl<H: DriverHooks> H3Driver<H> {
                                 .map(|c| c.has_context_id)
                                 .unwrap_or(false);
 
+                            let is_connect_ip = ctx
+                                .map(|c| c.is_connect_ip)
+                                .unwrap_or(false);
+
                             // RFC 9298 §5: MUST NOT send UDP Proxying
                             // Payload longer than 65527 with Context ID 0.
+                            // Does not apply to CONNECT-IP (RFC 9484).
                             if has_ctx_id
+                                && !is_connect_ip
                                 && dgram.as_ref().len()
                                     > datagram::MAX_UDP_PAYLOAD_SIZE
                             {
@@ -1144,13 +1150,17 @@ impl<H: DriverHooks> H3Driver<H> {
                             Ok((context_id, payload)) => {
                                 // RFC 9298 §5: UDP Proxying Payload with
                                 // Context ID 0 MUST NOT exceed 65527
-                                // bytes.
+                                // bytes. Does not apply to CONNECT-IP.
+                                let is_connect_ip = ctx_meta
+                                    .map(|c| c.is_connect_ip)
+                                    .unwrap_or(false);
                                 let payload_len = match &payload {
                                     InboundFrame::Datagram(d) =>
                                         d.as_ref().len(),
                                     _ => 0,
                                 };
                                 if context_id == 0
+                                    && !is_connect_ip
                                     && payload_len
                                         > datagram::MAX_UDP_PAYLOAD_SIZE
                                 {
