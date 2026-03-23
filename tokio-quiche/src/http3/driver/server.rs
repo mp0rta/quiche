@@ -188,6 +188,22 @@ impl ServerHooks {
             return Ok(());
         }
 
+        // RFC 9297 §3.2: capsule-protocol with Content-Length,
+        // Content-Type, or Transfer-Encoding is malformed.
+        if datagram::has_capsule_header_conflict(&headers) {
+            let _ = qconn.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Read,
+                quiche::h3::WireErrorCode::MessageError as u64,
+            );
+            let _ = qconn.stream_shutdown(
+                stream_id,
+                quiche::Shutdown::Write,
+                quiche::h3::WireErrorCode::MessageError as u64,
+            );
+            return Ok(());
+        }
+
         let (mut stream_ctx, send, recv) =
             StreamCtx::new(stream_id, STREAM_CAPACITY);
 

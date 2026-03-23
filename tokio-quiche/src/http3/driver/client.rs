@@ -255,9 +255,26 @@ impl DriverHooks for ClientHooks {
     }
 
     fn headers_received(
-        driver: &mut H3Driver<Self>, _qconn: &mut QuicheConnection,
+        driver: &mut H3Driver<Self>, qconn: &mut QuicheConnection,
         headers: InboundHeaders,
     ) -> H3ConnectionResult<()> {
+        // RFC 9297 §3.2: capsule-protocol with Content-Length,
+        // Content-Type, or Transfer-Encoding is malformed.
+        if datagram::has_capsule_header_conflict(&headers.headers) {
+            driver.hooks.pending_requests.remove(&headers.stream_id);
+            driver.shutdown_stream(
+                qconn,
+                headers.stream_id,
+                super::StreamShutdown::Both {
+                    read_error_code:
+                        h3::WireErrorCode::MessageError as u64,
+                    write_error_code:
+                        h3::WireErrorCode::MessageError as u64,
+                },
+            )?;
+            return Ok(());
+        }
+
         let Some(pending_request) =
             driver.hooks.pending_requests.remove(&headers.stream_id)
         else {

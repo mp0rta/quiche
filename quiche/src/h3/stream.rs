@@ -170,6 +170,12 @@ pub struct Stream {
 
     /// Whether a trailing HEADER field has been received.
     trailers_received: bool,
+
+    /// Whether this stream uses the Capsule Protocol (RFC 9297).
+    capsule_mode: bool,
+
+    /// Capsule parser state for streams using the Capsule Protocol.
+    capsule_parser: Option<super::capsule::CapsuleParser>,
 }
 
 impl Stream {
@@ -217,6 +223,9 @@ impl Stream {
 
             trailers_sent: false,
             trailers_received: false,
+
+            capsule_mode: false,
+            capsule_parser: None,
         }
     }
 
@@ -533,6 +542,30 @@ impl Stream {
 
     pub fn trailers_sent(&self) -> bool {
         self.trailers_sent
+    }
+
+    /// Returns whether this stream uses the Capsule Protocol.
+    #[allow(dead_code)]
+    pub fn capsule_mode(&self) -> bool {
+        self.capsule_mode
+    }
+
+    /// Sets whether this stream uses the Capsule Protocol.
+    pub fn set_capsule_mode(&mut self, enabled: bool) {
+        self.capsule_mode = enabled;
+        if enabled && self.capsule_parser.is_none() {
+            self.capsule_parser = Some(super::capsule::CapsuleParser::new());
+        }
+    }
+
+    /// Returns a reference to the capsule parser, if any.
+    pub fn capsule_parser(&self) -> Option<&super::capsule::CapsuleParser> {
+        self.capsule_parser.as_ref()
+    }
+
+    /// Returns a mutable reference to the capsule parser, if any.
+    pub fn capsule_parser_mut(&mut self) -> Option<&mut super::capsule::CapsuleParser> {
+        self.capsule_parser.as_mut()
     }
 
     /// Tries to fill the state buffer by reading data from the given cursor.
