@@ -14036,3 +14036,101 @@ fn multipath_path_cid_frames_without_negotiation_are_invalid() {
         }]);
     assert_eq!(res, Err(Error::InvalidFrame));
 }
+
+/// B1 (e2e): a peer legally retiring our only path-1 SCID via a frame
+/// carried on path 0 must not close the connection.
+///
+/// RFC 9000 §19.16 per path + draft-21 §4.5: only seq-never-issued and
+/// CID == carrying-packet-DCID are error conditions; becoming empty is
+/// not an error — we simply have to issue a replacement.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_last_scid_keeps_connection_alive() {
+    let mut pipe = mp_cid_pipe(4);
+
+    // Issue exactly one SCID for path 1 and drain the advertise queue
+    // so the state is clean.
+    let (cid0, tok0) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.ids.mp_new_scid(1, cid0.clone(), tok0), Ok(0));
+    pipe.server.ids.mp_mark_advertise_new_scid(1, 0, false);
+
+    let scids_left_before = pipe.server.mp_scids_left(1);
+    assert_eq!(scids_left_before, 4, "4 SCIDs budgeted, 1 active → 4 left");
+
+    // The client sends PATH_RETIRE_CONNECTION_ID(path_id=1, seq=0)
+    // carried over path 0.  This retires the only SCID on path 1.
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+        path_id: 1,
+        seq_num: 0,
+    }])
+    .unwrap();
+
+    // The connection must remain alive.
+    assert_eq!(
+        pipe.server.local_error(),
+        None,
+        "retiring the last per-path SCID must not close the connection",
+    );
+
+    // The retired CID is surfaced to the application.
+    assert_eq!(pipe.server.retired_scid_next(), Some(cid0));
+    assert_eq!(pipe.server.retired_scid_next(), None);
+
+    // Full headroom is now available: the application should supply a
+    // replacement.
+    assert_eq!(
+        pipe.server.mp_scids_left(1),
+        scids_left_before + 1,
+        "headroom must increase after retiring the last per-path SCID",
+    );
+}
+
+/// N3(a): PATH_RETIRE_CONNECTION_ID with path_id > local max is a
+/// connection error of type PROTOCOL_VIOLATION (mirrors the
+/// PATH_NEW_CONNECTION_ID over-limit test).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_beyond_local_max_path_id_is_protocol_violation()
+{
+    let mut pipe = mp_cid_pipe(2);
+
+    // Issue an SCID on path 1 so the server has something to retire.
+    let (cid0, tok0) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.ids.mp_new_scid(1, cid0, tok0), Ok(0));
+
+    // Retire with path_id=3, which exceeds the server's advertised limit (2).
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+            path_id: 3,
+            seq_num: 0,
+        }]);
+    assert!(res.is_err());
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// N3(b): PATH_RETIRE_CONNECTION_ID received when multipath was not
+/// negotiated is an invalid frame error (mirrors the NEW arm in
+/// multipath_path_cid_frames_without_negotiation_are_invalid).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_without_negotiation_is_invalid() {
+    // No initial_max_path_id advertised: multipath is not negotiated.
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+            path_id: 0,
+            seq_num: 1,
+        }]);
+    assert_eq!(res, Err(Error::InvalidFrame));
+}

@@ -7240,6 +7240,7 @@ impl<F: BufFactory> Connection<F> {
                 self.multipath_enabled = true;
                 self.paths.peer_max_path_id = peer_max as u64;
                 self.paths.local_max_path_id = local_max as u64;
+                // Task 3.2 (MAX_PATH_ID send) must raise this when we advertise a higher limit.
                 // Set initial path's path_id to 0
                 let active_pid =
                     self.paths.get_active_path_id().unwrap_or(0);

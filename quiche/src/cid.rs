@@ -221,6 +221,31 @@ impl BoundedNonEmptyConnectionIdVecDeque {
             .position(|e| e.seq == seq)
             .and_then(|index| self.inner.remove(index)))
     }
+
+    /// Removes the element in the collection having the provided `seq`,
+    /// allowing the collection to become empty.
+    ///
+    /// Unlike [`remove`], this does **not** enforce the non-empty invariant.
+    /// It is intended for per-path SCID pools only: the non-empty invariant
+    /// is correct for the legacy CID space (where the carrying packet's DCID
+    /// always remains), but per-path pools may legitimately drain to zero
+    /// when a peer retires our only SCID for that path (RFC 9000 §19.16 per
+    /// path; draft-ietf-quic-multipath-21 §4.5). Only seq-never-issued and
+    /// CID == carrying-packet-DCID are wire error conditions, not emptiness.
+    ///
+    /// Returns `Some` if the element was present and removed, `None`
+    /// otherwise.
+    ///
+    /// [`remove`]: #method.remove
+    #[cfg(feature = "multipath")]
+    fn remove_allow_empty(
+        &mut self, seq: u64,
+    ) -> Option<ConnectionIdEntry> {
+        self.inner
+            .iter()
+            .position(|e| e.seq == seq)
+            .and_then(|index| self.inner.remove(index))
+    }
 }
 
 #[derive(Default)]
@@ -1313,7 +1338,12 @@ impl ConnectionIdentifiers {
             return Err(Error::InvalidState);
         }
 
-        let cid = if let Some(e) = pool.scids.remove(seq)? {
+        // Use `remove_allow_empty` here: per-path SCID pools may legally
+        // drain to zero when the peer retires our only SCID for that path
+        // (draft-ietf-quic-multipath-21 §4.5). The non-empty invariant
+        // enforced by `remove` is only correct for the legacy CID space (path
+        // ID 0), where the carrying packet's DCID always remains.
+        let cid = if let Some(e) = pool.scids.remove_allow_empty(seq) {
             if e.cid == *pkt_dcid {
                 return Err(Error::InvalidState);
             }
@@ -1322,7 +1352,11 @@ impl ConnectionIdentifiers {
             self.retired_scids.push_back(e.cid.clone());
 
             // Retiring this SCID may increase the path's retire prior to.
-            let lowest_scid_seq = pool
+            // If the pool is now empty there is no active CID to anchor the
+            // retire_prior_to value to, so we leave it unchanged: when the
+            // application supplies a replacement SCID the value will be
+            // recomputed on the next retirement.
+            if let Some(lowest_scid_seq) = pool
                 .scids
                 .iter()
                 .filter_map(|e| {
@@ -1333,8 +1367,9 @@ impl ConnectionIdentifiers {
                     }
                 })
                 .min()
-                .ok_or(Error::InvalidState)?;
-            pool.retire_prior_to = lowest_scid_seq;
+            {
+                pool.retire_prior_to = lowest_scid_seq;
+            }
 
             Some(e.cid)
         } else {
@@ -2483,6 +2518,55 @@ mod tests {
         let (d2, rt2) = create_cid_and_reset_token(16);
         assert_eq!(ids.mp_new_dcid(1, d2, 2, rt2, 2, &mut retired), Ok(()));
         assert_eq!(retired, vec![(1, 0, Some(4)), (1, 1, None)]);
+    }
+
+    /// B1: retiring the sole SCID on a per-path pool must succeed; the pool
+    /// becomes empty, headroom opens up to the full limit, and the sequence
+    /// number space continues (no reuse of seq 0).
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_retire_last_per_path_scid_pool_empties() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+        let other_cid = {
+            let (c, _) = create_cid_and_reset_token(16);
+            c
+        };
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(2);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Issue exactly 1 SCID on path 1.
+        let (c0, rt0) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, c0.clone(), rt0), Ok(0));
+        assert_eq!(ids.mp_scids_left(1), 1); // 2 limit, 1 active → 1 left
+
+        // Retiring the only SCID must succeed (carried on another CID).
+        assert_eq!(
+            ids.mp_retire_scid(1, 0, &other_cid),
+            Ok(Some(c0.clone())),
+            "retiring the last per-path SCID must not error",
+        );
+
+        // The retired CID is surfaced to the application.
+        assert_eq!(ids.pop_retired_scid(), Some(c0));
+        assert_eq!(ids.pop_retired_scid(), None);
+
+        // Pool is now empty: full headroom is available.
+        assert_eq!(
+            ids.mp_scids_left(1),
+            2,
+            "after draining the pool, full limit headroom must be available",
+        );
+
+        // Sequence number space continues; a fresh issue must use seq 1.
+        let (c1, rt1) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_scid(1, c1, rt1),
+            Ok(1),
+            "next issued SCID on path 1 must use seq 1, not reuse seq 0",
+        );
     }
 
     /// `mp_scids_left` mirrors the legacy accounting per path: it reports
