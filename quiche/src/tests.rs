@@ -14134,3 +14134,286 @@ fn multipath_path_retire_cid_without_negotiation_is_invalid() {
         }]);
     assert_eq!(res, Err(Error::InvalidFrame));
 }
+
+// ----- draft-ietf-quic-multipath-21 §4.4/§4.5 send-side tests (Task 1.3) ----
+
+/// §4.4: `new_scid_on_path()` issues a per-path SCID and the transport
+/// advertises it through a PATH_NEW_CONNECTION_ID frame; the peer stores
+/// it in its per-path DCID pool.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_scid_on_path_sends_path_new_connection_id() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Ok(0)
+    );
+    assert!(pipe.client.ids.mp_has_new_scids());
+
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The advertisement queue is drained after sending.
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    // The server stored the CID in its per-path DCID pool.
+    let e = pipe.server.ids.mp_get_dcid(1, 0).unwrap();
+    assert_eq!(e.cid, cid);
+    assert_eq!(e.reset_token, Some(reset_token));
+    assert_eq!(pipe.server.ids.mp_lowest_available_dcid_seq(1), Some(0));
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §4.4: sequence numbers are per path and each path's space starts at 0.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_scid_on_path_seq_increments_per_path() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let (cid10, tok10) = test_utils::create_cid_and_reset_token(16);
+    let (cid11, tok11) = test_utils::create_cid_and_reset_token(16);
+    let (cid20, tok20) = test_utils::create_cid_and_reset_token(16);
+
+    assert_eq!(pipe.client.new_scid_on_path(1, &cid10, tok10, false), Ok(0));
+    assert_eq!(pipe.client.new_scid_on_path(1, &cid11, tok11, false), Ok(1));
+    assert_eq!(pipe.client.new_scid_on_path(2, &cid20, tok20, false), Ok(0));
+
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.server.ids.mp_get_dcid(1, 0).unwrap().cid, cid10);
+    assert_eq!(pipe.server.ids.mp_get_dcid(1, 1).unwrap().cid, cid11);
+    assert_eq!(pipe.server.ids.mp_get_dcid(2, 0).unwrap().cid, cid20);
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §4.4: we only issue CIDs for path IDs the peer may use, which is
+/// bounded by the limit WE advertised; beyond it nothing is queued and an
+/// InvalidState is raised.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_scid_on_path_beyond_local_max_path_id_fails() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(3, &cid, reset_token, false),
+        Err(Error::InvalidState)
+    );
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    // No frame goes out and the server never sees a path-3 CID.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.server.ids.mp_get_dcid(3, 0).is_err());
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// `new_scid_on_path()` with a non-zero path ID requires a negotiated
+/// multipath extension; path ID 0 delegates to the legacy `new_scid()`
+/// regardless.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_scid_on_path_requires_multipath() {
+    // No initial_max_path_id advertised: multipath is not negotiated.
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_active_connection_id_limit(5);
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Err(Error::InvalidState)
+    );
+
+    // Path ID 0 still works, exactly like the legacy API.
+    let seq = pipe
+        .client
+        .new_scid_on_path(0, &cid, reset_token, false)
+        .unwrap();
+    assert_eq!(pipe.client.ids.get_scid(seq).unwrap().cid, cid);
+    assert!(pipe.client.ids.has_new_scids());
+}
+
+/// PATH_NEW_CONNECTION_ID is retransmitted when the packet carrying it is
+/// lost, like the legacy NEW_CONNECTION_ID.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_new_cid_retransmit_on_loss() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_cid_pipe(2);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Ok(0)
+    );
+
+    // Client sends PATH_NEW_CONNECTION_ID, but the packet is lost.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathNewConnectionId {
+                path_id: 1,
+                seq_num: 0,
+                ..
+            })),
+        "expected PATH_NEW_CONNECTION_ID in packet"
+    );
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    // Trigger ack-based loss detection.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    // Client retransmits PATH_NEW_CONNECTION_ID.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathNewConnectionId {
+                path_id: 1,
+                seq_num: 0,
+                ..
+            })),
+        "PATH_NEW_CONNECTION_ID should be retransmitted"
+    );
+}
+
+/// §4.4/§4.5: a PATH_NEW_CONNECTION_ID with a rising Retire Prior To makes
+/// the receiver emit PATH_RETIRE_CONNECTION_ID for the retired sequence
+/// numbers on its next send.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_sent_after_rising_retire_prior_to() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_cid_pipe(2);
+
+    // The server advertises a path-1 CID to the client...
+    let (cid_a, tok_a) = test_utils::create_cid_and_reset_token(16);
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::PathNewConnectionId {
+            path_id: 1,
+            seq_num: 0,
+            retire_prior_to: 0,
+            conn_id: cid_a.to_vec(),
+            reset_token: tok_a,
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    // ...then a second one with a rising Retire Prior To retiring seq 0.
+    let (cid_b, tok_b) = test_utils::create_cid_and_reset_token(16);
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::PathNewConnectionId {
+            path_id: 1,
+            seq_num: 1,
+            retire_prior_to: 1,
+            conn_id: cid_b.to_vec(),
+            reset_token: tok_b,
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    // Seq 0 is queued for PATH_RETIRE_CONNECTION_ID emission...
+    assert!(pipe.client.ids.mp_has_retire_dcids());
+
+    // ...and goes out on the client's next send.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathRetireConnectionId {
+                path_id: 1,
+                seq_num: 0,
+            }
+        )),
+        "expected PATH_RETIRE_CONNECTION_ID in packet"
+    );
+    assert!(!pipe.client.ids.mp_has_retire_dcids());
+}
+
+/// PATH_RETIRE_CONNECTION_ID is retransmitted when the packet carrying it
+/// is lost, like the legacy RETIRE_CONNECTION_ID.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_retransmit_on_loss() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_cid_pipe(2);
+
+    // The server advertises path-1 CIDs with a rising Retire Prior To, so
+    // the client queues a PATH_RETIRE_CONNECTION_ID for seq 0.
+    let (cid_a, tok_a) = test_utils::create_cid_and_reset_token(16);
+    let (cid_b, tok_b) = test_utils::create_cid_and_reset_token(16);
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[
+            frame::Frame::PathNewConnectionId {
+                path_id: 1,
+                seq_num: 0,
+                retire_prior_to: 0,
+                conn_id: cid_a.to_vec(),
+                reset_token: tok_a,
+            },
+            frame::Frame::PathNewConnectionId {
+                path_id: 1,
+                seq_num: 1,
+                retire_prior_to: 1,
+                conn_id: cid_b.to_vec(),
+                reset_token: tok_b,
+            },
+        ],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    // Client sends PATH_RETIRE_CONNECTION_ID, but the packet is lost.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathRetireConnectionId {
+                path_id: 1,
+                seq_num: 0,
+            }
+        )),
+        "expected PATH_RETIRE_CONNECTION_ID in packet"
+    );
+    assert!(!pipe.client.ids.mp_has_retire_dcids());
+
+    // Trigger ack-based loss detection.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    // Client retransmits PATH_RETIRE_CONNECTION_ID.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathRetireConnectionId {
+                path_id: 1,
+                seq_num: 0,
+            }
+        )),
+        "PATH_RETIRE_CONNECTION_ID should be retransmitted"
+    );
+}

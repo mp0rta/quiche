@@ -199,6 +199,27 @@ impl<F: BufFactory> Connection<F> {
                         self.ids.mark_retire_dcid_seq(seq_num, true)?;
                     },
 
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathNewConnectionId {
+                        path_id,
+                        seq_num,
+                        ..
+                    } => {
+                        // Only re-advertise the SCID if it is still in the
+                        // per-path pool: the peer may have retired it in
+                        // the meantime.
+                        if self.ids.mp_get_scid(path_id, seq_num).is_ok() {
+                            self.ids.mp_mark_advertise_new_scid(
+                                path_id, seq_num, true,
+                            );
+                        }
+                    },
+
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
+                        self.ids.mp_mark_retire_dcid(path_id, seq_num, true)?;
+                    },
+
                     frame::Frame::Ping {
                         mtu_probe: Some(failed_probe),
                     } =>
@@ -715,6 +736,31 @@ impl<F: BufFactory> Connection<F> {
                     break;
                 }
             }
+
+            // Create PATH_NEW_CONNECTION_ID frames as needed
+            // (draft-ietf-quic-multipath-21, Section 4.4).
+            #[cfg(feature = "multipath")]
+            if self.multipath_enabled {
+                while let Some((mp_path_id, seq_num)) =
+                    self.ids.mp_next_advertise_new_scid()
+                {
+                    let frame =
+                        self.ids.mp_get_path_new_connection_id_frame_for(
+                            mp_path_id, seq_num,
+                        )?;
+
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        self.ids.mp_mark_advertise_new_scid(
+                            mp_path_id, seq_num, false,
+                        );
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
 
         // HANDSHAKE_DONE must only go on the active migration path.
@@ -939,6 +985,46 @@ impl<F: BufFactory> Connection<F> {
                     in_flight = true;
                 } else {
                     break;
+                }
+            }
+
+            // Create PATH_RETIRE_CONNECTION_ID frames as needed
+            // (draft-ietf-quic-multipath-21, Section 4.5).
+            #[cfg(feature = "multipath")]
+            if self.multipath_enabled {
+                let mp_retire_dcid_seqs = self.ids.mp_retire_dcid_seqs();
+
+                for (mp_path_id, seq_num) in mp_retire_dcid_seqs {
+                    // Like RETIRE_CONNECTION_ID, the sequence number MUST
+                    // NOT refer to the Destination Connection ID of the
+                    // packet in which the frame is contained. Per-path
+                    // (non-zero) pools are not linked to (4-tuple) sending
+                    // paths yet (Task 2.x): packets are always sent with
+                    // path-0 DCIDs, so only path-0 pairs can collide with
+                    // the carrying packet's DCID.
+                    if mp_path_id == 0 {
+                        let dcid_seq =
+                            path.active_dcid_seq.ok_or(Error::InvalidState)?;
+
+                        if seq_num == dcid_seq {
+                            continue;
+                        }
+                    }
+
+                    let frame = frame::Frame::PathRetireConnectionId {
+                        path_id: mp_path_id,
+                        seq_num,
+                    };
+
+                    if push_frame_to_pkt!(b, frames, frame, left) {
+                        self.ids
+                            .mp_mark_retire_dcid(mp_path_id, seq_num, false)?;
+
+                        ack_eliciting = true;
+                        in_flight = true;
+                    } else {
+                        break;
+                    }
                 }
             }
         }

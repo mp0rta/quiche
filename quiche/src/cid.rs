@@ -1540,6 +1540,38 @@ impl ConnectionIdentifiers {
     pub fn mp_has_retire_dcids(&self) -> bool {
         !self.mp_retire_dcid_seqs.is_empty()
     }
+
+    /// Gets the PATH_NEW_CONNECTION_ID frame related to the source
+    /// Connection ID of the provided path ID with sequence `seq_num`,
+    /// mirroring [`get_new_connection_id_frame_for()`] per path.
+    ///
+    /// Path ID 0 reads from the legacy SCID space, as path ID 0 frames
+    /// operate on the very same sequence number space as legacy
+    /// NEW_CONNECTION_ID frames (draft-ietf-quic-multipath-21, Section
+    /// 4.4); note that path-0 CIDs are normally advertised through legacy
+    /// frames instead.
+    ///
+    /// [`get_new_connection_id_frame_for()`]: struct.ConnectionIdentifiers.html#method.get_new_connection_id_frame_for
+    pub fn mp_get_path_new_connection_id_frame_for(
+        &self, path_id: u64, seq_num: u64,
+    ) -> Result<frame::Frame> {
+        let (entry, retire_prior_to) = if path_id == 0 {
+            (self.scids.get(seq_num), self.retire_prior_to)
+        } else {
+            let pool = self.mp_pools.get(&path_id).ok_or(Error::InvalidState)?;
+            (pool.scids.get(seq_num), pool.retire_prior_to)
+        };
+
+        let e = entry.ok_or(Error::InvalidState)?;
+
+        Ok(frame::Frame::PathNewConnectionId {
+            path_id,
+            seq_num,
+            retire_prior_to,
+            conn_id: e.cid.to_vec(),
+            reset_token: e.reset_token.ok_or(Error::InvalidState)?,
+        })
+    }
 }
 
 #[cfg(test)]

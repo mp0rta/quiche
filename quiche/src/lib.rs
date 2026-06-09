@@ -6280,6 +6280,66 @@ impl<F: BufFactory> Connection<F> {
         self.ids.mp_scids_left(path_id)
     }
 
+    /// Provides an additional source Connection ID that the peer can use
+    /// to reach this host on the provided multipath path ID
+    /// (draft-ietf-quic-multipath-21, Section 4.4).
+    ///
+    /// For non-zero path IDs this triggers sending a
+    /// PATH_NEW_CONNECTION_ID frame. Path ID 0 operates on the very same
+    /// sequence number space as legacy NEW_CONNECTION_ID frames, so it
+    /// delegates to [`new_scid()`] exactly, `retire_if_needed` included;
+    /// non-zero path IDs additionally require a negotiated multipath
+    /// extension, returning an [`InvalidState`] otherwise.
+    ///
+    /// We issue Connection IDs for the path IDs the peer may use, which is
+    /// bounded by the limit *we* advertised through `initial_max_path_id`
+    /// (or a later MAX_PATH_ID frame): a `path_id` greater than it returns
+    /// an [`InvalidState`]. Note that the peer only opens paths up to the
+    /// minimum of both advertised limits (Section 3.2.1); issuing CIDs for
+    /// within-bound path IDs beyond the peer's own advertised limit is
+    /// legal but useless, and is left to the caller's discretion.
+    ///
+    /// The per-path active connection ID limit applies (Section 3.2): when
+    /// no headroom is left on the path, an [`IdLimit`] is returned. For
+    /// non-zero path IDs this happens regardless of `retire_if_needed`, as
+    /// requesting the retirement of previously issued per-path Connection
+    /// IDs is not supported yet.
+    ///
+    /// Like [`new_scid()`], the caller is responsible for not repeating
+    /// the provided `scid` over the connection: Connection ID values must
+    /// be unique across all paths and both directions (Section 3.2.1), and
+    /// a duplicate raises an [`InvalidState`].
+    ///
+    /// Returns the sequence number associated to the provided Connection
+    /// ID in the path's own sequence number space.
+    ///
+    /// [`new_scid()`]: struct.Connection.html#method.new_scid
+    /// [`IdLimit`]: enum.Error.html#IdLimit
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    #[cfg(feature = "multipath")]
+    pub fn new_scid_on_path(
+        &mut self, path_id: u64, scid: &ConnectionId, reset_token: u128,
+        retire_if_needed: bool,
+    ) -> Result<u64> {
+        if path_id == 0 {
+            return self.new_scid(scid, reset_token, retire_if_needed);
+        }
+
+        if !self.multipath_enabled {
+            return Err(Error::InvalidState);
+        }
+
+        // We issue CIDs for path IDs the peer may use, which is bounded by
+        // the limit we advertised (§4.4: a peer receiving a path ID above
+        // that limit must treat it as a PROTOCOL_VIOLATION).
+        if path_id > self.paths.local_max_path_id {
+            return Err(Error::InvalidState);
+        }
+
+        self.ids
+            .mp_new_scid(path_id, scid.to_vec().into(), reset_token)
+    }
+
     /// Requests the retirement of the destination Connection ID used by the
     /// host to reach its peer.
     ///
@@ -7504,6 +7564,15 @@ impl<F: BufFactory> Connection<F> {
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         let send_path = self.paths.get(send_pid)?;
+
+        // Pending per-path PATH_NEW_CONNECTION_ID /
+        // PATH_RETIRE_CONNECTION_ID advertisements also trigger sending.
+        #[cfg(feature = "multipath")]
+        let mp_has_cid_frames =
+            self.ids.mp_has_new_scids() || self.ids.mp_has_retire_dcids();
+        #[cfg(not(feature = "multipath"))]
+        let mp_has_cid_frames = false;
+
         if (self.is_established() || self.is_in_early_data()) &&
             (self.should_send_handshake_done() ||
                 self.flow_control.should_update_max_data() ||
@@ -7524,6 +7593,7 @@ impl<F: BufFactory> Connection<F> {
                 self.streams.has_stopped() ||
                 self.ids.has_new_scids() ||
                 self.ids.has_retire_dcids() ||
+                mp_has_cid_frames ||
                 send_path
                     .pmtud
                     .as_ref()
