@@ -45,15 +45,15 @@ use smallvec::SmallVec;
 const RETIRED_CONN_ID_LIMIT_MULTIPLIER: u64 = 3;
 
 #[derive(Default)]
-struct BoundedConnectionIdSeqSet {
+struct BoundedSeqSet<T: Eq + std::hash::Hash> {
     /// The inner set.
-    inner: HashSet<u64>,
+    inner: HashSet<T>,
 
     /// The maximum number of elements that the set can have.
     capacity: usize,
 }
 
-impl BoundedConnectionIdSeqSet {
+impl<T: Eq + std::hash::Hash> BoundedSeqSet<T> {
     /// Creates a set bounded by `capacity`.
     fn new(capacity: usize) -> Self {
         Self {
@@ -62,7 +62,7 @@ impl BoundedConnectionIdSeqSet {
         }
     }
 
-    fn insert(&mut self, e: u64) -> Result<bool> {
+    fn insert(&mut self, e: T) -> Result<bool> {
         if self.inner.len() >= self.capacity {
             return Err(Error::IdLimit);
         }
@@ -70,7 +70,7 @@ impl BoundedConnectionIdSeqSet {
         Ok(self.inner.insert(e))
     }
 
-    fn remove(&mut self, e: &u64) -> bool {
+    fn remove(&mut self, e: &T) -> bool {
         self.inner.remove(e)
     }
 
@@ -78,6 +78,10 @@ impl BoundedConnectionIdSeqSet {
         self.inner.is_empty()
     }
 }
+
+/// Type alias for the single-sequence-number variant used by the legacy
+/// connection ID pools.
+type BoundedConnectionIdSeqSet = BoundedSeqSet<u64>;
 
 /// A structure holding a `ConnectionId` and all its related metadata.
 #[derive(Debug, Default)]
@@ -253,9 +257,10 @@ pub struct ConnectionIdentifiers {
 
     /// Per-path retired destination CIDs that should be advertised to the
     /// peer through PATH_RETIRE_CONNECTION_ID frames, as (path_id, seq)
-    /// pairs.
+    /// pairs. Bounded to `destination_conn_id_limit *
+    /// RETIRED_CONN_ID_LIMIT_MULTIPLIER` to prevent unbounded growth.
     #[cfg(feature = "multipath")]
-    mp_retire_dcid_seqs: HashSet<(u64, u64)>,
+    mp_retire_dcid_seqs: BoundedSeqSet<(u64, u64)>,
 }
 
 /// Per-Path ID connection ID pool (draft-ietf-quic-multipath-21, Sections
@@ -351,6 +356,8 @@ impl ConnectionIdentifiers {
             next_scid_seq,
             source_conn_id_limit,
             zero_length_scid,
+            #[cfg(feature = "multipath")]
+            mp_retire_dcid_seqs: BoundedSeqSet::new(size),
             ..Default::default()
         }
     }
@@ -444,6 +451,23 @@ impl ConnectionIdentifiers {
                 return Err(Error::InvalidState);
             }
             return Ok(e.seq);
+        }
+
+        // When multipath is enabled, CID bytes must be globally unique across
+        // all paths and both directions (draft-ietf-quic-multipath-21 §3.2.1).
+        // The legacy-scids check above already handles the path-0 SCID space;
+        // here we reject any CID that appears in the legacy DCID pool or in
+        // any per-path (non-zero) SCID/DCID pool.
+        #[cfg(feature = "multipath")]
+        {
+            let in_dcids = self.dcids.iter().any(|e| e.cid == cid);
+            let in_mp_pools = self.mp_pools.values().any(|p| {
+                p.scids.iter().any(|e| e.cid == cid) ||
+                    p.dcids.iter().any(|e| e.cid == cid)
+            });
+            if in_dcids || in_mp_pools {
+                return Err(Error::InvalidState);
+            }
         }
 
         self.scids.insert(ConnectionIdEntry {
@@ -1037,7 +1061,7 @@ impl ConnectionIdentifiers {
         // path MUST send a corresponding PATH_RETIRE_CONNECTION_ID frame,
         // unless it has already done so for that sequence number.
         if seq < pool.largest_peer_retire_prior_to {
-            self.mp_retire_dcid_seqs.insert((path_id, seq));
+            self.mp_retire_dcid_seqs.insert((path_id, seq))?;
             return Ok(());
         }
 
@@ -1070,7 +1094,7 @@ impl ConnectionIdentifiers {
 
             for e in pool.dcids.inner.drain(..index) {
                 retired.push((path_id, e.seq));
-                self.mp_retire_dcid_seqs.insert((path_id, e.seq));
+                self.mp_retire_dcid_seqs.insert((path_id, e.seq))?;
             }
 
             pool.largest_peer_retire_prior_to = retire_prior_to;
@@ -1254,7 +1278,7 @@ impl ConnectionIdentifiers {
 
         let e = pool.dcids.remove(seq)?.ok_or(Error::InvalidState)?;
 
-        self.mp_retire_dcid_seqs.insert((path_id, seq));
+        self.mp_retire_dcid_seqs.insert((path_id, seq))?;
 
         Ok(e.path_id)
     }
@@ -1335,7 +1359,7 @@ impl ConnectionIdentifiers {
         &mut self, path_id: u64, seq: u64, retire: bool,
     ) -> Result<()> {
         if retire {
-            self.mp_retire_dcid_seqs.insert((path_id, seq));
+            self.mp_retire_dcid_seqs.insert((path_id, seq))?;
         } else {
             self.mp_retire_dcid_seqs.remove(&(path_id, seq));
         }
@@ -1350,7 +1374,7 @@ impl ConnectionIdentifiers {
     /// account for newly inserted or removed pairs, a new copy needs to be
     /// created.
     pub fn mp_retire_dcid_seqs(&self) -> HashSet<(u64, u64)> {
-        self.mp_retire_dcid_seqs.clone()
+        self.mp_retire_dcid_seqs.inner.clone()
     }
 
     /// Returns true if there are retired per-path destination Connection IDs
@@ -2107,5 +2131,70 @@ mod tests {
 
         ids.mp_mark_advertise_new_scid(1, 0, false);
         assert_eq!(ids.mp_next_advertise_new_scid(), None);
+    }
+
+    /// Issue 1: CIDs issued in a per-path pool must not be re-issuable on
+    /// path 0, neither through `mp_new_scid(0, …)` nor through `new_scid`.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_path0_rejects_cid_already_in_per_path_pool() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(4);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Issue CID bytes X on path 1.
+        let (x, rtx) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, x.clone(), rtx), Ok(0));
+
+        // Re-issuing the same bytes on path 0 via the multipath shim must fail.
+        assert_eq!(
+            ids.mp_new_scid(0, x.clone(), rtx),
+            Err(Error::InvalidState),
+            "mp_new_scid(0) must reject CID bytes already in a per-path pool",
+        );
+
+        // Re-issuing the same bytes directly via new_scid must also fail.
+        let other_token: u128 = rtx.wrapping_add(1);
+        assert_eq!(
+            ids.new_scid(x.clone(), Some(other_token), true, None, false),
+            Err(Error::InvalidState),
+            "new_scid must reject CID bytes already in a per-path pool",
+        );
+    }
+
+    /// Issue 2: `mp_retire_dcid_seqs` must be bounded; once the cap is
+    /// reached, further inserts via `mp_mark_retire_dcid` must return
+    /// `Error::IdLimit`.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_retire_dcid_seqs_bounded() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        // destination_conn_id_limit = 2 → cap = 2 * 3 = 6.
+        let dcid_limit = 2usize;
+        let cap = dcid_limit * (RETIRED_CONN_ID_LIMIT_MULTIPLIER as usize);
+
+        let mut ids = ConnectionIdentifiers::new(dcid_limit, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Fill the set to the cap — all inserts must succeed.
+        for seq in 0..cap as u64 {
+            assert_eq!(
+                ids.mp_mark_retire_dcid(1, seq, true),
+                Ok(()),
+                "insert {seq} should succeed (cap = {cap})",
+            );
+        }
+
+        // One more insert must return IdLimit.
+        assert_eq!(
+            ids.mp_mark_retire_dcid(1, cap as u64, true),
+            Err(Error::IdLimit),
+            "insert past cap must return IdLimit",
+        );
     }
 }
