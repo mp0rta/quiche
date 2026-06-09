@@ -16046,3 +16046,322 @@ fn multipath_path_status_lost_resends_latest_only() {
         "the latest PATH_STATUS must be retransmitted on loss"
     );
 }
+
+// ----- draft-ietf-quic-multipath-21 §4.6 MAX_PATH_ID tests -----
+
+/// §4.6: a Maximum Path Identifier value exceeding 2^32-1 is invalid and
+/// MUST be treated as a connection error of type PROTOCOL_VIOLATION.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_path_id_exceeding_nonce_limit_is_protocol_violation() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let res = mp_inject_to_server(&mut pipe, &[frame::Frame::MaxPathId {
+        path_id: 1u64 << 32,
+    }]);
+    assert!(
+        res.is_err(),
+        "MAX_PATH_ID above 2^32-1 must be a connection error, got {res:?}"
+    );
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+    assert_eq!(
+        pipe.client.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.6: a Maximum Path Identifier value lower than the value advertised
+/// in the sender's initial_max_path_id transport parameter is invalid and
+/// MUST be treated as a connection error of type PROTOCOL_VIOLATION.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_path_id_below_initial_tp_is_protocol_violation() {
+    // The client advertised initial_max_path_id=2; a MAX_PATH_ID frame
+    // from the client with a lower value is invalid.
+    let mut pipe = mp_cid_pipe(2);
+
+    let res = mp_inject_to_server(&mut pipe, &[frame::Frame::MaxPathId {
+        path_id: 1,
+    }]);
+    assert!(
+        res.is_err(),
+        "MAX_PATH_ID below the initial_max_path_id transport parameter \
+         must be a connection error, got {res:?}"
+    );
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+    assert_eq!(
+        pipe.client.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.6: MAX_PATH_ID frames that do not increase the path limit MUST be
+/// ignored (no error, limit unchanged), as loss or reordering can deliver
+/// a stale frame.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_path_id_non_increasing_is_ignored() {
+    let mut pipe = mp_cid_pipe(2);
+
+    // Raise the limit to 5 first.
+    mp_inject_to_server(&mut pipe, &[frame::Frame::MaxPathId {
+        path_id: 5,
+    }])
+    .unwrap();
+    assert_eq!(pipe.server.paths.peer_max_path_id, 5);
+
+    // A stale value within [initial TP, current max] is ignored.
+    for stale in [2, 3, 5] {
+        mp_inject_to_server(&mut pipe, &[frame::Frame::MaxPathId {
+            path_id: stale,
+        }])
+        .unwrap();
+        assert_eq!(
+            pipe.server.paths.peer_max_path_id, 5,
+            "non-increasing MAX_PATH_ID (value {stale}) must be ignored"
+        );
+        assert_eq!(pipe.server.local_error(), None);
+    }
+}
+
+/// §4.6 send side: `set_max_path_id` emits a MAX_PATH_ID frame in a 1-RTT
+/// packet, and once delivered the peer can fund and open the newly
+/// permitted path IDs end-to-end.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_set_max_path_id_emits_frame_and_extends_paths() {
+    // The server initially allows a single extra path (path ID 1).
+    let mut pipe = mp_pipe_with_per_path_cids(4, 1, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Path ID 1 was the last one the server allows: the client is
+    // peer-limited.
+    assert_eq!(
+        pipe.client.create_path(client_addr_3, server_addr),
+        Err(Error::PathLimitExceeded)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The server raises its limit, which is reflected locally right away.
+    assert_eq!(pipe.server.set_max_path_id(3), Ok(()));
+    assert_eq!(pipe.server.local_max_path_id(), 3);
+
+    // The MAX_PATH_ID frame is emitted in a 1-RTT packet.
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    let mut found = false;
+    for (pkt, _) in &flight {
+        let mut inspect = pkt.clone();
+        if let Ok(frames) =
+            test_utils::decode_pkt(&mut pipe.client, &mut inspect)
+        {
+            found |= frames
+                .iter()
+                .any(|f| matches!(f, frame::Frame::MaxPathId { path_id: 3 }));
+        }
+    }
+    assert!(found, "expected MAX_PATH_ID in the server's flight");
+
+    // Deliver it: the client's peer limit is raised.
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+    assert_eq!(pipe.client.peer_max_path_id(), 3);
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Fund path ID 2 on both sides, then the client can open it.
+    let (c_cid, c_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.client.new_scid_on_path(2, &c_cid, c_tok, false), Ok(0));
+    let (s_cid, s_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.new_scid_on_path(2, &s_cid, s_tok, false), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.client.create_path(client_addr_3, server_addr), Ok(2));
+    assert_eq!(pipe.advance(), Ok(()));
+}
+
+/// §4.6: MAX_PATH_ID frames SHOULD be retransmitted when lost (and no
+/// more recent MAX_PATH_ID frame has been sent in the meantime).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_path_id_lost_is_retransmitted() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_cid_pipe(2);
+
+    assert_eq!(pipe.server.set_max_path_id(4), Ok(()));
+
+    // The packet carrying MAX_PATH_ID never reaches the client.
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::MaxPathId { path_id: 4 })),
+        "expected MAX_PATH_ID in packet, got {frames:?}"
+    );
+
+    // Declare it lost: the frame is retransmitted.
+    test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::MaxPathId { path_id: 4 })),
+        "MAX_PATH_ID must be retransmitted on loss, got {frames:?}"
+    );
+}
+
+/// §4.6: a lost MAX_PATH_ID frame is NOT retransmitted when a more recent
+/// (higher) MAX_PATH_ID frame was sent in the meantime.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_max_path_id_lost_superseded_not_retransmitted() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_cid_pipe(2);
+
+    // First raise: the packet is lost.
+    assert_eq!(pipe.server.set_max_path_id(3), Ok(()));
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, frame::Frame::MaxPathId { path_id: 3 })));
+
+    // Second raise: the packet is delivered.
+    assert_eq!(pipe.server.set_max_path_id(5), Ok(()));
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let mut inspect = buf[..len].to_vec();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut inspect).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, frame::Frame::MaxPathId { path_id: 5 })));
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    // Loss detection declares the first packet lost; the stale value must
+    // not be retransmitted (a newer one was sent and acknowledged).
+    test_utils::trigger_ack_based_loss(&mut pipe.server, &mut pipe.client);
+
+    pipe.server.send_ack_eliciting().unwrap();
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::MaxPathId { .. })),
+        "a superseded MAX_PATH_ID must not be retransmitted, got {frames:?}"
+    );
+}
+
+/// `set_max_path_id` argument validation: the limit can never be lowered
+/// and can never exceed 2^32-1 (§4.6); setting the current value is a
+/// no-op.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_set_max_path_id_validates_value() {
+    let mut pipe = mp_cid_pipe(4);
+
+    // Lowering the limit is forbidden.
+    assert_eq!(pipe.client.set_max_path_id(2), Err(Error::InvalidState));
+    assert_eq!(pipe.client.local_max_path_id(), 4);
+
+    // Values above 2^32-1 are invalid on the wire (§2.4 nonce limits).
+    assert_eq!(
+        pipe.client.set_max_path_id(1u64 << 32),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(pipe.client.local_max_path_id(), 4);
+
+    // Setting the current value changes nothing and emits nothing.
+    assert_eq!(pipe.client.set_max_path_id(4), Ok(()));
+    assert_eq!(pipe.client.local_max_path_id(), 4);
+    assert!(pipe.client.mp_max_path_id_pending.is_none());
+
+    // Multipath not negotiated: the call is invalid.
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+    assert_eq!(
+        pipe.client.set_max_path_id(4),
+        Err(Error::MultipathNotNegotiated)
+    );
+}
+
+/// §3.2.1: when the *local* maximum path ID limit is the binding
+/// constraint, opening a path fails with a distinguishable error
+/// ([`Error::InvalidState`]) and no PATHS_BLOCKED frame is queued: the
+/// peer cannot help; the caller should raise the limit via
+/// `set_max_path_id` instead.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_create_path_self_limited_is_invalid_state() {
+    // Client advertises 1, server advertises 4: after opening path ID 1
+    // the client is limited by its own advertisement.
+    let mut pipe = mp_pipe_with_per_path_cids(1, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(
+        pipe.client.create_path(client_addr_3, server_addr),
+        Err(Error::InvalidState),
+        "self-limited path exhaustion must be distinguishable from the \
+         peer-limited case"
+    );
+
+    // No PATHS_BLOCKED is queued: the local limit is not the peer's
+    // doing (§3.2.1 suggests sending MAX_PATH_ID instead).
+    assert!(pipe.client.mp_paths_blocked_pending.is_none());
+
+    // Raising the local limit (which emits MAX_PATH_ID) unblocks the
+    // caller once path ID 2 is funded.
+    assert_eq!(pipe.client.set_max_path_id(2), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let (c_cid, c_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.client.new_scid_on_path(2, &c_cid, c_tok, false), Ok(0));
+    let (s_cid, s_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.new_scid_on_path(2, &s_cid, s_tok, false), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.client.create_path(client_addr_3, server_addr), Ok(2));
+}

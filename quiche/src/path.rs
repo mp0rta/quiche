@@ -800,6 +800,14 @@ pub struct PathMap {
     #[cfg(feature = "multipath")]
     pub(crate) peer_max_path_id: u64,
 
+    /// The value the peer advertised in its `initial_max_path_id`
+    /// transport parameter. A later MAX_PATH_ID frame carrying a lower
+    /// value is a connection error (draft-ietf-quic-multipath-21 §4.6),
+    /// so the initial value is kept alongside the moving
+    /// `peer_max_path_id` limit.
+    #[cfg(feature = "multipath")]
+    pub(crate) peer_initial_max_path_id: u64,
+
     /// Multipath path IDs that have been abandoned and fully torn down
     /// (draft-ietf-quic-multipath-21 §3.4). Abandoned path IDs MUST NOT be
     /// reused for new paths, and frames referring to them are silently
@@ -840,6 +848,8 @@ impl PathMap {
             local_max_path_id: 0,
             #[cfg(feature = "multipath")]
             peer_max_path_id: 0,
+            #[cfg(feature = "multipath")]
+            peer_initial_max_path_id: 0,
             #[cfg(feature = "multipath")]
             abandoned_ids: std::collections::BTreeSet::new(),
         }

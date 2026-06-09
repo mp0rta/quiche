@@ -186,6 +186,19 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     #[cfg(feature = "multipath")]
+                    frame::Frame::MaxPathId { path_id } => {
+                        // §4.6: MAX_PATH_ID frames SHOULD be retransmitted
+                        // when lost, unless a more recent MAX_PATH_ID
+                        // frame has been sent (or the value was
+                        // acknowledged) in the meantime.
+                        if Some(path_id) == self.mp_max_path_id_sent &&
+                            !self.mp_max_path_id_acked
+                        {
+                            self.mp_max_path_id_pending = Some(path_id);
+                        }
+                    },
+
+                    #[cfg(feature = "multipath")]
                     frame::Frame::PathCidsBlocked { .. } => {
                         mp_cids_blocked_lost = true;
                     },
@@ -758,6 +771,29 @@ impl<F: BufFactory> Connection<F> {
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.mp_path_cids_blocked_pending = None;
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Generate a MAX_PATH_ID frame if the application raised the
+            // local maximum path ID limit (draft-ietf-quic-multipath-21,
+            // Section 4.6). One-shot: the pending flag is cleared once
+            // the frame is built, and re-armed on loss only when no more
+            // recent MAX_PATH_ID frame was sent in the meantime.
+            if let Some(mp_max_path_id) = self.mp_max_path_id_pending {
+                let frame = frame::Frame::MaxPathId {
+                    path_id: mp_max_path_id,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.mp_max_path_id_pending = None;
+
+                    // The pending value can only grow, so the frame just
+                    // built always carries the most recent value.
+                    self.mp_max_path_id_sent = Some(mp_max_path_id);
+                    self.mp_max_path_id_acked = false;
+
                     ack_eliciting = true;
                     in_flight = true;
                 }

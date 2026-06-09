@@ -1654,6 +1654,25 @@ where
     /// was already deleted (draft-ietf-quic-multipath-21 §3.4).
     #[cfg(feature = "multipath")]
     mp_abandon_queue: Vec<(u64, u64)>,
+
+    /// Pending MAX_PATH_ID frame carrying the raised local maximum path
+    /// ID limit (draft-ietf-quic-multipath-21 §4.6). One-shot: cleared
+    /// once the frame is built, re-armed on loss only when no more recent
+    /// MAX_PATH_ID frame was sent in the meantime.
+    #[cfg(feature = "multipath")]
+    mp_max_path_id_pending: Option<u64>,
+
+    /// Value carried by the most recent MAX_PATH_ID frame built. Loss of
+    /// a MAX_PATH_ID frame carrying an older (superseded) value does not
+    /// re-arm the retransmission (§4.6: "no more recent MAX_PATH_ID frame
+    /// has been sent in the meantime").
+    #[cfg(feature = "multipath")]
+    mp_max_path_id_sent: Option<u64>,
+
+    /// Whether the most recent MAX_PATH_ID frame was acknowledged, in
+    /// which case its loss-triggered retransmission is disarmed.
+    #[cfg(feature = "multipath")]
+    mp_max_path_id_acked: bool,
 }
 
 /// Outcome of selecting the next multipath path ID to consume when opening
@@ -2318,6 +2337,12 @@ impl<F: BufFactory> Connection<F> {
             mp_path_cids_blocked_pending: None,
             #[cfg(feature = "multipath")]
             mp_abandon_queue: Vec::new(),
+            #[cfg(feature = "multipath")]
+            mp_max_path_id_pending: None,
+            #[cfg(feature = "multipath")]
+            mp_max_path_id_sent: None,
+            #[cfg(feature = "multipath")]
+            mp_max_path_id_acked: false,
         };
 
         if let Some(retry_cids) = retry_cids {
@@ -4010,6 +4035,21 @@ impl<F: BufFactory> Connection<F> {
                     frame::Frame::PathStatusAvailable { path_id, seq_num } |
                     frame::Frame::PathStatusBackup { path_id, seq_num } => {
                         mp_status_acked.push((path_id, seq_num));
+                    },
+
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::MaxPathId { path_id } => {
+                        // Only the latest MAX_PATH_ID matters: an
+                        // acknowledgment for a superseded value must not
+                        // disarm the retransmission of the current one
+                        // (§4.6).
+                        if Some(path_id) == self.mp_max_path_id_sent {
+                            self.mp_max_path_id_acked = true;
+
+                            if self.mp_max_path_id_pending == Some(path_id) {
+                                self.mp_max_path_id_pending = None;
+                            }
+                        }
                     },
 
                     frame::Frame::ResetStream { stream_id, .. } => {
@@ -6250,7 +6290,11 @@ impl<F: BufFactory> Connection<F> {
     /// raises a [`PathLimitExceeded`] and queues a PATHS_BLOCKED frame; if
     /// no Connection ID is available for the next unused path ID, this
     /// raises an [`OutOfIdentifiers`] and queues a PATH_CIDS_BLOCKED frame
-    /// (Section 3.2.1).
+    /// (Section 3.2.1). If the local limit is the binding constraint
+    /// instead, this raises an [`InvalidState`]; the caller should raise
+    /// the limit via [`set_max_path_id()`].
+    ///
+    /// [`set_max_path_id()`]: struct.Connection.html#method.set_max_path_id
     ///
     /// [`PathEvent::New`]: enum.PathEvent.html#variant.New
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
@@ -7142,6 +7186,66 @@ impl<F: BufFactory> Connection<F> {
         self.paths.peer_max_path_id
     }
 
+    /// Raises the maximum multipath path ID the peer is allowed to use,
+    /// queueing a MAX_PATH_ID frame carrying the new limit
+    /// (draft-ietf-quic-multipath-21, Section 4.6).
+    ///
+    /// The local limit ([`local_max_path_id()`]) is raised immediately:
+    /// frames received for the newly permitted path IDs are valid even
+    /// before the MAX_PATH_ID frame reaches the peer. The frame is
+    /// retransmitted on loss unless a more recent (higher) MAX_PATH_ID
+    /// frame was sent in the meantime (Section 4.6).
+    ///
+    /// Applications should call this when path opening fails with
+    /// [`Error::InvalidState`] from [`create_path()`] or [`probe_path()`]:
+    /// that error reports that the *local* limit (not the peer's) is the
+    /// binding constraint, which only this method can raise (Section
+    /// 3.2.1 suggests sending a MAX_PATH_ID frame "when limited by the
+    /// sender").
+    ///
+    /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
+    /// negotiated. Returns [`Error::InvalidState`] if `v` is lower than
+    /// the current local limit (the limit can never decrease) or exceeds
+    /// 2^32-1, the maximum path ID allowed by the nonce calculation
+    /// (Section 2.4). Setting the current limit again is a no-op.
+    ///
+    /// [`local_max_path_id()`]: struct.Connection.html#method.local_max_path_id
+    /// [`create_path()`]: struct.Connection.html#method.create_path
+    /// [`probe_path()`]: struct.Connection.html#method.probe_path
+    /// [`Error::MultipathNotNegotiated`]: enum.Error.html#variant.MultipathNotNegotiated
+    /// [`Error::InvalidState`]: enum.Error.html#variant.InvalidState
+    #[cfg(feature = "multipath")]
+    pub fn set_max_path_id(&mut self, v: u64) -> Result<()> {
+        if !self.multipath_enabled {
+            return Err(Error::MultipathNotNegotiated);
+        }
+
+        // §4.6: the Maximum Path Identifier MUST NOT exceed 2^32-1.
+        if v > u32::MAX as u64 {
+            return Err(Error::InvalidState);
+        }
+
+        // The advertised limit can never decrease (§4.6: a value lower
+        // than the initial transport parameter is invalid, and
+        // non-increasing frames are ignored by the receiver anyway).
+        if v < self.paths.local_max_path_id {
+            return Err(Error::InvalidState);
+        }
+
+        if v == self.paths.local_max_path_id {
+            return Ok(());
+        }
+
+        // Raise the local limit first: §4 receive-side checks key off it,
+        // so frames referencing the newly permitted path IDs are valid as
+        // soon as we decided to advertise them. Emission races are
+        // harmless for the same reason.
+        self.paths.local_max_path_id = v;
+        self.mp_max_path_id_pending = Some(v);
+
+        Ok(())
+    }
+
     /// Sets a QoS hint for the given stream.
     ///
     /// Returns [`Error::MultipathNotNegotiated`] if multipath has not been
@@ -7176,11 +7280,17 @@ impl<F: BufFactory> Connection<F> {
     /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
     /// negotiated, or [`Error::InvalidState`] if called on a server.
     ///
-    /// If every path ID allowed by the peer is consumed, this raises a
+    /// If every path ID allowed by the *peer* is consumed, this raises a
     /// [`Error::PathLimitExceeded`] and queues a PATHS_BLOCKED frame; if no
     /// Connection ID is available for the next unused path ID, this raises
     /// an [`Error::OutOfIdentifiers`] and queues a PATH_CIDS_BLOCKED frame
-    /// (Section 3.2.1).
+    /// (Section 3.2.1). If the *local* limit is the binding constraint
+    /// instead, this raises an [`Error::InvalidState`] and queues nothing:
+    /// the peer cannot help, and the caller should raise the local limit
+    /// via [`set_max_path_id()`] (Section 3.2.1 suggests sending a
+    /// MAX_PATH_ID frame "when limited by the sender").
+    ///
+    /// [`set_max_path_id()`]: struct.Connection.html#method.set_max_path_id
     #[cfg(feature = "multipath")]
     pub fn create_path(
         &mut self, local: SocketAddr, peer: SocketAddr,
@@ -7738,8 +7848,12 @@ impl<F: BufFactory> Connection<F> {
             ) {
                 self.multipath_enabled = true;
                 self.paths.peer_max_path_id = peer_max as u64;
+                // §4.6: a MAX_PATH_ID value lower than the peer's
+                // initial_max_path_id transport parameter is a connection
+                // error, so the initial value is recorded separately from
+                // the moving limit.
+                self.paths.peer_initial_max_path_id = peer_max as u64;
                 self.paths.local_max_path_id = local_max as u64;
-                // Task 3.2 (MAX_PATH_ID send) must raise this when we advertise a higher limit.
                 // Set initial path's path_id to 0
                 let active_pid =
                     self.paths.get_active_path_id().unwrap_or(0);
@@ -8006,13 +8120,15 @@ impl<F: BufFactory> Connection<F> {
 
         // Pending per-path PATH_NEW_CONNECTION_ID /
         // PATH_RETIRE_CONNECTION_ID advertisements also trigger sending, as
-        // do pending PATHS_BLOCKED / PATH_CIDS_BLOCKED frames (§3.2.1) and
-        // pending PATH_ABANDON / PATH_STATUS frames (§3.4/§4.3).
+        // do pending PATHS_BLOCKED / PATH_CIDS_BLOCKED frames (§3.2.1),
+        // pending MAX_PATH_ID frames (§4.6) and pending PATH_ABANDON /
+        // PATH_STATUS frames (§3.4/§4.3).
         #[cfg(feature = "multipath")]
         let mp_has_cid_frames = self.ids.mp_has_new_scids() ||
             self.ids.mp_has_retire_dcids() ||
             self.mp_paths_blocked_pending.is_some() ||
             self.mp_path_cids_blocked_pending.is_some() ||
+            self.mp_max_path_id_pending.is_some() ||
             !self.mp_abandon_queue.is_empty() ||
             self.paths.iter().any(|(_, p)| {
                 p.mp_path_abandon_pending || p.mp_path_status_pending
@@ -8976,6 +9092,26 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
+
+                // §4.6: the Maximum Path Identifier MUST NOT exceed
+                // 2^32-1 (nonce-calculation restriction, §2.4). An
+                // invalid value is a connection error of type
+                // PROTOCOL_VIOLATION (`Error::InvalidState` reaches the
+                // wire as 0xa).
+                if path_id > u32::MAX as u64 {
+                    return Err(Error::InvalidState);
+                }
+
+                // §4.6: the value "MUST NOT be lower than the value
+                // advertised in the initial_max_path_id transport
+                // parameter".
+                if path_id < self.paths.peer_initial_max_path_id {
+                    return Err(Error::InvalidState);
+                }
+
+                // §4.6: frames that do not increase the path limit MUST
+                // be ignored (loss or reordering can deliver stale
+                // values).
                 if path_id > self.paths.peer_max_path_id {
                     self.paths.peer_max_path_id = path_id;
                 }
@@ -9819,12 +9955,16 @@ impl<F: BufFactory> Connection<F> {
     /// multipath path ID and a Connection ID from that path's pool
     /// (draft-21 §3.1).
     ///
-    /// When blocked, this queues the corresponding PATHS_BLOCKED or
-    /// PATH_CIDS_BLOCKED frame (§3.2.1) and fails with
-    /// [`PathLimitExceeded`] or [`OutOfIdentifiers`], respectively.
+    /// When blocked on the peer's limit or missing Connection IDs, this
+    /// queues the corresponding PATHS_BLOCKED or PATH_CIDS_BLOCKED frame
+    /// (§3.2.1) and fails with [`PathLimitExceeded`] or
+    /// [`OutOfIdentifiers`], respectively. When blocked on the *local*
+    /// limit instead, it fails with [`InvalidState`] and queues nothing:
+    /// the caller should raise the limit via `set_max_path_id()`.
     ///
     /// [`PathLimitExceeded`]: enum.Error.html#PathLimitExceeded
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
+    /// [`InvalidState`]: enum.Error.html#InvalidState
     #[cfg(feature = "multipath")]
     fn mp_create_path_on_client(
         &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
@@ -9841,11 +9981,25 @@ impl<F: BufFactory> Connection<F> {
             },
 
             outcome @ MpNewPathId::Exhausted => {
+                // §3.2.1: when the *local* limit is the binding
+                // constraint, the peer cannot help: no PATHS_BLOCKED is
+                // queued (the draft suggests sending MAX_PATH_ID "when
+                // limited by the sender" instead) and the failure is
+                // reported as InvalidState, distinguishable from the
+                // peer-limited PathLimitExceeded, so the caller knows to
+                // raise the limit via set_max_path_id().
+                let self_limited = self.paths.local_max_path_id <
+                    self.paths.peer_max_path_id;
+
                 // Blocked on the peer's Maximum Path Identifier: tell the
                 // peer through PATHS_BLOCKED (§3.2.1).
                 self.mp_queue_blocked_signal(outcome);
 
-                return Err(Error::PathLimitExceeded);
+                return Err(if self_limited {
+                    Error::InvalidState
+                } else {
+                    Error::PathLimitExceeded
+                });
             },
         };
 
