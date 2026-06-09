@@ -63,11 +63,29 @@ impl<T: Eq + std::hash::Hash> BoundedSeqSet<T> {
     }
 
     fn insert(&mut self, e: T) -> Result<bool> {
+        // An element that is already present does not consume any additional
+        // capacity, so re-inserting it (e.g., upon retransmission of a frame
+        // that retires the same sequence number again) must not fail, even
+        // when the set is full.
+        if self.inner.contains(&e) {
+            return Ok(false);
+        }
+
         if self.inner.len() >= self.capacity {
             return Err(Error::IdLimit);
         }
 
         Ok(self.inner.insert(e))
+    }
+
+    /// Updates the maximum capacity of the set to `new_capacity`. The
+    /// capacity only grows: this does nothing if `new_capacity` is lower
+    /// than or equal to the current one.
+    #[cfg(feature = "multipath")]
+    fn set_capacity(&mut self, new_capacity: usize) {
+        if new_capacity > self.capacity {
+            self.capacity = new_capacity;
+        }
     }
 
     fn remove(&mut self, e: &T) -> bool {
@@ -455,19 +473,14 @@ impl ConnectionIdentifiers {
 
         // When multipath is enabled, CID bytes must be globally unique across
         // all paths and both directions (draft-ietf-quic-multipath-21 §3.2.1).
-        // The legacy-scids check above already handles the path-0 SCID space;
-        // here we reject any CID that appears in the legacy DCID pool or in
-        // any per-path (non-zero) SCID/DCID pool.
+        // The legacy-scids check above already short-circuited any CID
+        // present in the path-0 SCID space, so `mp_cid_in_use()`'s extra
+        // scids scan is always false here and the check is equivalent to
+        // scanning the legacy DCID pool and every per-path (non-zero)
+        // SCID/DCID pool.
         #[cfg(feature = "multipath")]
-        {
-            let in_dcids = self.dcids.iter().any(|e| e.cid == cid);
-            let in_mp_pools = self.mp_pools.values().any(|p| {
-                p.scids.iter().any(|e| e.cid == cid) ||
-                    p.dcids.iter().any(|e| e.cid == cid)
-            });
-            if in_dcids || in_mp_pools {
-                return Err(Error::InvalidState);
-            }
+        if self.mp_cid_in_use(&cid) {
+            return Err(Error::InvalidState);
         }
 
         self.scids.insert(ConnectionIdEntry {
@@ -507,6 +520,9 @@ impl ConnectionIdentifiers {
     /// Returns a list of tuples (DCID sequence number, Path ID), containing the
     /// sequence number of retired DCIDs that were linked to their respective
     /// Path ID.
+    // Keep in sync with `mp_new_dcid()`, which replicates this logic (in
+    // particular the delayed propagation of the retire-queue `IdLimit`
+    // error) for non-zero multipath path IDs.
     pub fn new_dcid(
         &mut self, cid: ConnectionId<'static>, seq: u64, reset_token: u128,
         retire_prior_to: u64, retired_path_ids: &mut SmallVec<[(u64, usize); 1]>,
@@ -932,8 +948,38 @@ impl ConnectionIdentifiers {
             })
     }
 
+    /// Ensures that a connection ID pool exists for the provided non-zero
+    /// path ID, creating an empty one if needed.
+    ///
+    /// Whenever a new pool is created, the capacity of the pending
+    /// PATH_RETIRE_CONNECTION_ID set is grown to `(1 + number of pools) *
+    /// destination_conn_id_limit * RETIRED_CONN_ID_LIMIT_MULTIPLIER`, so
+    /// that a legitimate retirement wave spanning several paths cannot
+    /// spuriously exhaust a single path's budget and close the connection
+    /// with an [`IdLimit`].
+    ///
+    /// [`IdLimit`]: enum.Error.html#IdLimit
+    fn mp_ensure_pool(&mut self, path_id: u64) {
+        if self.mp_pools.contains_key(&path_id) {
+            return;
+        }
+
+        self.mp_pools.insert(path_id, PathCidPool::default());
+
+        // Guard against overflow, like in `new()`. `self.dcids.capacity` is
+        // the destination connection ID limit.
+        let value = (1 + self.mp_pools.len() as u64)
+            .saturating_mul(self.dcids.capacity as u64)
+            .saturating_mul(RETIRED_CONN_ID_LIMIT_MULTIPLIER);
+        let size = cmp::min(usize::MAX as u64, value) as usize;
+        self.mp_retire_dcid_seqs.set_capacity(size);
+    }
+
     /// Adds a new source identifier for the provided path ID and queues its
-    /// advertisement through a PATH_NEW_CONNECTION_ID frame.
+    /// advertisement through a PATH_NEW_CONNECTION_ID frame. For path ID 0,
+    /// the advertisement is instead queued through the legacy
+    /// NEW_CONNECTION_ID queue, as legacy frames are the ones carrying
+    /// path-0 CIDs.
     ///
     /// The sequence number spaces are per path and start at 0. The number of
     /// active source CIDs is limited per path by the maximum number of
@@ -969,7 +1015,11 @@ impl ConnectionIdentifiers {
         }
 
         let limit = self.source_conn_id_limit;
-        let pool = self.mp_pools.entry(path_id).or_default();
+        self.mp_ensure_pool(path_id);
+        let pool = self
+            .mp_pools
+            .get_mut(&path_id)
+            .expect("pool exists after mp_ensure_pool");
 
         // The active connection ID limit applies per path.
         if pool.scids.len() >= limit {
@@ -999,17 +1049,28 @@ impl ConnectionIdentifiers {
     /// Returns an error if the provided Connection ID or its metadata are
     /// invalid.
     ///
-    /// Sequence numbers of retired DCIDs are appended to `retired` as
-    /// (path ID, sequence number) pairs, and queued for later
-    /// PATH_RETIRE_CONNECTION_ID emission.
+    /// DCIDs retired by the Retire Prior To field are appended to `retired`
+    /// as `(path ID, sequence number, slab path ID)` triples — the last
+    /// element being the (4-tuple) path that was using the retired DCID, if
+    /// any — and queued for later PATH_RETIRE_CONNECTION_ID emission. The
+    /// caller must unlink/re-fund any affected 4-tuple path, even when this
+    /// method returns an error: entries may have been retired before the
+    /// error was detected.
     ///
     /// For path ID 0, this delegates to [`new_dcid()`], operating on the
     /// very same sequence number space as legacy NEW_CONNECTION_ID frames.
+    /// Note an asymmetry, kept from the legacy method: for path 0 only
+    /// drained entries that were linked to a 4-tuple path are reported
+    /// (always with `Some` slab path ID), while for non-zero path IDs every
+    /// drained entry is reported, linked or not.
     ///
     /// [`new_dcid()`]: struct.ConnectionIdentifiers.html#method.new_dcid
+    // Keep in sync with `new_dcid()`, in particular its delayed propagation
+    // of the retire-queue `IdLimit` error.
     pub fn mp_new_dcid(
         &mut self, path_id: u64, cid: ConnectionId<'static>, seq: u64,
-        reset_token: u128, retire_prior_to: u64, retired: &mut Vec<(u64, u64)>,
+        reset_token: u128, retire_prior_to: u64,
+        retired: &mut Vec<(u64, u64, Option<usize>)>,
     ) -> Result<()> {
         if path_id == 0 {
             let mut retired_path_ids = SmallVec::new();
@@ -1021,7 +1082,11 @@ impl ConnectionIdentifiers {
                 &mut retired_path_ids,
             );
             // The legacy call may have retired entries even on error.
-            retired.extend(retired_path_ids.iter().map(|(seq, _)| (0, *seq)));
+            retired.extend(
+                retired_path_ids
+                    .iter()
+                    .map(|(seq, pid)| (0, *seq, Some(*pid))),
+            );
             return res;
         }
 
@@ -1031,7 +1096,11 @@ impl ConnectionIdentifiers {
 
         // The active connection ID limit applies per path.
         let dcid_limit = self.dcids.capacity;
-        let pool = self.mp_pools.entry(path_id).or_default();
+        self.mp_ensure_pool(path_id);
+        let pool = self
+            .mp_pools
+            .get_mut(&path_id)
+            .expect("pool exists after mp_ensure_pool");
         pool.dcids.resize(dcid_limit);
 
         // If an endpoint receives a PATH_NEW_CONNECTION_ID frame that
@@ -1076,6 +1145,8 @@ impl ConnectionIdentifiers {
             path_id: None,
         };
 
+        let mut retired_dcid_queue_err = None;
+
         // A receiver MUST ignore any Retire Prior To fields that do not
         // increase the largest received Retire Prior To value for that path.
         if retire_prior_to > pool.largest_peer_retire_prior_to {
@@ -1093,8 +1164,15 @@ impl ConnectionIdentifiers {
                 .partition_point(|e| e.seq < retire_prior_to);
 
             for e in pool.dcids.inner.drain(..index) {
-                retired.push((path_id, e.seq));
-                self.mp_retire_dcid_seqs.insert((path_id, e.seq))?;
+                retired.push((path_id, e.seq, e.path_id));
+
+                if let Err(e) = self.mp_retire_dcid_seqs.insert((path_id, e.seq))
+                {
+                    // Delay propagating the error as we need to try to
+                    // insert the new DCID first.
+                    retired_dcid_queue_err = Some(e);
+                    break;
+                }
             }
 
             pool.largest_peer_retire_prior_to = retire_prior_to;
@@ -1103,6 +1181,12 @@ impl ConnectionIdentifiers {
         // Note that if no element has been retired and the `VecDeque`
         // reaches its capacity limit, this will raise an `IdLimit`.
         pool.dcids.insert(new_entry)?;
+
+        // Propagate the error triggered when inserting a retired DCID seq to
+        // the queue.
+        if let Some(e) = retired_dcid_queue_err {
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -1197,10 +1281,22 @@ impl ConnectionIdentifiers {
     /// greater than any previously advertised sequence numbers on that path,
     /// it returns an [`InvalidState`].
     ///
-    /// Returns the retired Connection ID, if any. Path ID 0 delegates to
-    /// [`retire_scid()`].
+    /// Returns the retired Connection ID, if any, so that the caller can
+    /// tell whether an actual retirement happened (and of which CID). Note
+    /// that this differs from [`retire_scid()`], which returns the (4-tuple)
+    /// slab path that was using the CID: per-path SCID pools are not linked
+    /// to 4-tuple paths yet, so there is no slab path to unlink here. Once
+    /// path management links pools to paths (Task 2.x), this should be
+    /// aligned with [`retire_scid()`]'s return contract. The application is
+    /// notified of the retirement through the retired SCIDs queue (see
+    /// [`pop_retired_scid()`]) in all cases, and can check
+    /// [`mp_scids_left()`] to decide whether to supply a replacement.
+    ///
+    /// Path ID 0 delegates to [`retire_scid()`].
     ///
     /// [`retire_scid()`]: struct.ConnectionIdentifiers.html#method.retire_scid
+    /// [`pop_retired_scid()`]: struct.ConnectionIdentifiers.html#method.pop_retired_scid
+    /// [`mp_scids_left()`]: struct.ConnectionIdentifiers.html#method.mp_scids_left
     /// [`InvalidState`]: enum.Error.html#InvalidState
     pub fn mp_retire_scid(
         &mut self, path_id: u64, seq: u64, pkt_dcid: &ConnectionId,
@@ -1281,6 +1377,33 @@ impl ConnectionIdentifiers {
         self.mp_retire_dcid_seqs.insert((path_id, seq))?;
 
         Ok(e.path_id)
+    }
+
+    /// Returns the number of source Connection IDs that can still be issued
+    /// to the peer on the provided path ID without exceeding the per-path
+    /// active connection ID limit it advertised (the same limit
+    /// [`mp_new_scid()`] enforces).
+    ///
+    /// A non-zero value after a PATH_RETIRE_CONNECTION_ID means the
+    /// application should supply replacement Connection IDs for that path
+    /// (RFC 9000, Section 5.1.2, applied per path); the transport never
+    /// mints Connection IDs on its own, as the application must know every
+    /// source CID for packet routing.
+    ///
+    /// Path ID 0 reports the legacy space's accounting.
+    ///
+    /// [`mp_new_scid()`]: struct.ConnectionIdentifiers.html#method.mp_new_scid
+    pub fn mp_scids_left(&self, path_id: u64) -> usize {
+        let active = if path_id == 0 {
+            self.scids.len()
+        } else {
+            self.mp_pools
+                .get(&path_id)
+                .map(|p| p.scids.len())
+                .unwrap_or(0)
+        };
+
+        self.source_conn_id_limit.saturating_sub(active)
     }
 
     /// Returns the next source CID sequence number we would issue for the
@@ -1806,7 +1929,7 @@ mod tests {
         // Retire Prior To drains entries below it on that path only.
         let (d3, rt3) = create_cid_and_reset_token(16);
         assert_eq!(ids.mp_new_dcid(1, d3, 3, rt3, 1, &mut retired), Ok(()));
-        assert_eq!(retired, vec![(1, 0)]);
+        assert_eq!(retired, vec![(1, 0, None)]);
         assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
         assert!(ids.mp_has_retire_dcids());
         assert!(ids.mp_retire_dcid_seqs().contains(&(1, 0)));
@@ -1829,11 +1952,12 @@ mod tests {
         assert_eq!(ids.get_dcid(1).unwrap().cid, f1);
         assert_eq!(ids.dcids.len(), 2);
 
-        // Path 0 retirement is reported with path_id 0 and goes through the
-        // legacy retire queue.
+        // Path 0 retirement is reported with path_id 0, carrying the slab
+        // path link of the initial DCID, and goes through the legacy retire
+        // queue.
         let (f2, frt2) = create_cid_and_reset_token(16);
         assert_eq!(ids.mp_new_dcid(0, f2, 2, frt2, 1, &mut retired), Ok(()));
-        assert_eq!(retired, vec![(0, 0)]);
+        assert_eq!(retired, vec![(0, 0, Some(0))]);
         assert!(ids.has_retire_dcids());
         assert!(ids.retire_dcid_seqs().contains(&0));
     }
@@ -1958,7 +2082,7 @@ mod tests {
         let (d, rt) = create_cid_and_reset_token(16);
         assert!(ids.mp_new_dcid(1, d, 5, rt, 3, &mut retired).is_ok());
         assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
-        assert_eq!(retired, vec![(1, 0), (1, 1), (1, 2)]);
+        assert_eq!(retired, vec![(1, 0, None), (1, 1, None), (1, 2, None)]);
     }
 
     #[cfg(feature = "multipath")]
@@ -1989,11 +2113,15 @@ mod tests {
         assert_eq!(ids.mp_link_dcid_to_path_id(1, 1, 5), Ok(()));
         assert_eq!(ids.mp_lowest_available_dcid_seq(1), None);
 
-        // Path 0 delegates to the legacy accessor.
-        assert_eq!(
-            ids.mp_lowest_available_dcid_seq(0),
-            ids.lowest_available_dcid_seq()
-        );
+        // Path 0 delegates to the legacy accessor: the initial DCID (seq 0)
+        // is linked to the initial 4-tuple path, so nothing is available.
+        assert_eq!(ids.mp_lowest_available_dcid_seq(0), None);
+
+        // A fresh, unlinked legacy DCID becomes path 0's lowest available.
+        let mut retired_path_ids = SmallVec::new();
+        let (f1, frt1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.new_dcid(f1, 1, frt1, 0, &mut retired_path_ids), Ok(()));
+        assert_eq!(ids.mp_lowest_available_dcid_seq(0), Some(1));
     }
 
     #[cfg(feature = "multipath")]
@@ -2196,5 +2324,201 @@ mod tests {
             Err(Error::IdLimit),
             "insert past cap must return IdLimit",
         );
+
+        // Re-inserting an already-present element at capacity (e.g., upon
+        // frame retransmission) is not an error.
+        assert_eq!(
+            ids.mp_mark_retire_dcid(1, 0, true),
+            Ok(()),
+            "re-inserting a present element at cap must not error",
+        );
+    }
+
+    /// `BoundedSeqSet::insert` must report success for an already-present
+    /// element even when the set is at capacity, so that e.g. re-receiving
+    /// a frame retiring an already-queued sequence number does not close
+    /// the connection. This exercises the legacy (`u64`) alias.
+    #[test]
+    fn retire_dcid_seqs_reinsert_at_capacity() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        // destination_conn_id_limit = 2 → cap = 2 * 3 = 6.
+        let cap = 2 * RETIRED_CONN_ID_LIMIT_MULTIPLIER;
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        for seq in 0..cap {
+            assert_eq!(ids.mark_retire_dcid_seq(seq, true), Ok(()));
+        }
+
+        // A new element does not fit.
+        assert_eq!(ids.mark_retire_dcid_seq(cap, true), Err(Error::IdLimit));
+
+        // An already-present one is fine.
+        assert_eq!(ids.mark_retire_dcid_seq(0, true), Ok(()));
+        assert_eq!(ids.retire_dcid_seqs().len(), cap as usize);
+    }
+
+    /// Fix: the pending PATH_RETIRE_CONNECTION_ID set capacity must scale
+    /// with the number of per-path pools, so that a legitimate retirement
+    /// wave across several paths does not spuriously hit `IdLimit`.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_retire_dcid_seqs_capacity_scales_with_pools() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        // destination_conn_id_limit = 2 → single-path cap = 2 * 3 = 6.
+        let dcid_limit = 2usize;
+        let single_cap = dcid_limit * (RETIRED_CONN_ID_LIMIT_MULTIPLIER as usize);
+
+        let mut ids = ConnectionIdentifiers::new(dcid_limit, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Create 3 per-path pools.
+        let mut retired = Vec::new();
+        for path_id in 1..=3 {
+            let (d, rt) = create_cid_and_reset_token(16);
+            assert_eq!(
+                ids.mp_new_dcid(path_id, d, 0, rt, 0, &mut retired),
+                Ok(())
+            );
+        }
+
+        // With 3 pools the cap is (1 + 3) * 2 * 3 = 24.
+        let scaled_cap = (1 + 3) * single_cap;
+
+        // Drive retirements across all 3 paths, well beyond the single-path
+        // cap of 6 (the 7th insert would fail without capacity scaling):
+        // every insert up to the scaled cap must succeed.
+        let per_path = (scaled_cap / 3) as u64;
+        for seq in 0..per_path {
+            for path_id in 1..=3 {
+                assert_eq!(
+                    ids.mp_mark_retire_dcid(path_id, seq, true),
+                    Ok(()),
+                    "retire ({path_id}, {seq}) must fit in the scaled cap",
+                );
+            }
+        }
+
+        // The very next (new) insert exceeds the scaled cap.
+        assert_eq!(
+            ids.mp_mark_retire_dcid(1, per_path, true),
+            Err(Error::IdLimit),
+        );
+    }
+
+    /// `mp_new_dcid` must replicate `new_dcid`'s delayed-error handling:
+    /// when queueing a retired sequence number hits the set's capacity, the
+    /// drain still completes, the path's largest Retire Prior To advances
+    /// and the new DCID is inserted before the error is propagated.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_retire_queue_error_is_delayed() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Populate path 1 with seqs 0 and 1 (creating the pool grows the
+        // retire set capacity to (1 + 1) * 2 * 3 = 12).
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        let (d1, rt1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d0, 0, rt0, 0, &mut retired), Ok(()));
+        assert_eq!(ids.mp_new_dcid(1, d1, 1, rt1, 0, &mut retired), Ok(()));
+
+        // Fill the retire set to its capacity with unrelated entries.
+        for seq in 0..12 {
+            assert_eq!(ids.mp_mark_retire_dcid(9, seq, true), Ok(()));
+        }
+
+        // Seq 2 with Retire Prior To 2 drains seqs 0 and 1, but queueing
+        // them for PATH_RETIRE_CONNECTION_ID emission fails.
+        let (d2, rt2) = create_cid_and_reset_token(16);
+        retired.clear();
+        assert_eq!(
+            ids.mp_new_dcid(1, d2.clone(), 2, rt2, 2, &mut retired),
+            Err(Error::IdLimit)
+        );
+
+        // The drained entry that hit the error is still reported.
+        assert_eq!(retired, vec![(1, 0, None)]);
+
+        // Despite the error, the drain completed, the path's Retire Prior
+        // To advanced and the new DCID was inserted.
+        assert_eq!(ids.mp_pools[&1].largest_peer_retire_prior_to, 2);
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 1);
+        assert_eq!(ids.mp_get_dcid(1, 2).unwrap().cid, d2);
+    }
+
+    /// Retired entries reported by `mp_new_dcid` carry the (4-tuple) slab
+    /// path that was using them, if any, so that the caller can unlink and
+    /// re-fund the affected path.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_reports_slab_link_of_retired_entries() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        let (d1, rt1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d0, 0, rt0, 0, &mut retired), Ok(()));
+        assert_eq!(ids.mp_new_dcid(1, d1, 1, rt1, 0, &mut retired), Ok(()));
+
+        // Link seq 0 to slab path 4; seq 1 stays unlinked.
+        assert_eq!(ids.mp_link_dcid_to_path_id(1, 0, 4), Ok(()));
+
+        // Retire both: the slab link must be surfaced for seq 0.
+        let (d2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d2, 2, rt2, 2, &mut retired), Ok(()));
+        assert_eq!(retired, vec![(1, 0, Some(4)), (1, 1, None)]);
+    }
+
+    /// `mp_scids_left` mirrors the legacy accounting per path: it reports
+    /// how many SCIDs can still be issued on the path, and increases when
+    /// one is retired (signalling that the application should supply a
+    /// replacement).
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_scids_left_per_path() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Path 0 reports the legacy space: 1 active SCID out of 3.
+        assert_eq!(ids.mp_scids_left(0), 2);
+
+        // A path without a pool has the full budget available.
+        assert_eq!(ids.mp_scids_left(1), 3);
+
+        let (c0, rt0) = create_cid_and_reset_token(16);
+        let (c1, rt1) = create_cid_and_reset_token(16);
+        let (c2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, c0.clone(), rt0), Ok(0));
+        assert_eq!(ids.mp_new_scid(1, c1.clone(), rt1), Ok(1));
+        assert_eq!(ids.mp_new_scid(1, c2, rt2), Ok(2));
+        assert_eq!(ids.mp_scids_left(1), 0);
+
+        // Retiring one frees one slot: a replacement is needed.
+        assert_eq!(ids.mp_retire_scid(1, 1, &c0), Ok(Some(c1)));
+        assert_eq!(ids.mp_scids_left(1), 1);
+
+        // Other paths are not affected.
+        assert_eq!(ids.mp_scids_left(2), 3);
+        assert_eq!(ids.mp_scids_left(0), 2);
     }
 }

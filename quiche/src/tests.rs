@@ -13850,11 +13850,13 @@ fn multipath_path_new_cid_retire_prior_to_is_per_path() {
 }
 
 /// §4.5: a received PATH_RETIRE_CONNECTION_ID retires our per-path SCID,
-/// surfaces it to the application like the legacy frame does, and queues a
-/// replacement advertisement for that path (emission is Task 1.3).
+/// surfaces it to the application like the legacy frame does, and signals
+/// through `mp_scids_left()` that the application should supply a
+/// replacement for that path. The transport must not mint a replacement
+/// itself: the application has to know every source CID to route packets.
 #[cfg(feature = "multipath")]
 #[test]
-fn multipath_path_retire_cid_retires_scid_and_queues_replacement() {
+fn multipath_path_retire_cid_retires_scid_and_signals_replacement_needed() {
     let mut pipe = mp_cid_pipe(4);
 
     // Issue two SCIDs for path 1 and drain the advertise queue, as if they
@@ -13867,6 +13869,8 @@ fn multipath_path_retire_cid_retires_scid_and_queues_replacement() {
     pipe.server.ids.mp_mark_advertise_new_scid(1, 1, false);
     assert_eq!(pipe.server.ids.mp_next_advertise_new_scid(), None);
 
+    let scids_left_before = pipe.server.mp_scids_left(1);
+
     mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
         path_id: 1,
         seq_num: 0,
@@ -13877,10 +13881,13 @@ fn multipath_path_retire_cid_retires_scid_and_queues_replacement() {
     assert_eq!(pipe.server.retired_scid_next(), Some(cid0));
     assert_eq!(pipe.server.retired_scid_next(), None);
 
-    // A replacement SCID was issued for path 1 and queued for
-    // advertisement through a PATH_NEW_CONNECTION_ID frame.
-    assert_eq!(pipe.server.ids.mp_next_advertise_new_scid(), Some((1, 2)));
-    assert_eq!(pipe.server.ids.mp_next_scid_seq(1), 3);
+    // The retirement freed one per-path SCID slot: a replacement is NEEDED
+    // and the application is expected to supply it. No SCID was minted by
+    // the transport: nothing was queued for advertisement and the path's
+    // next sequence number is unchanged.
+    assert_eq!(pipe.server.mp_scids_left(1), scids_left_before + 1);
+    assert_eq!(pipe.server.ids.mp_next_advertise_new_scid(), None);
+    assert_eq!(pipe.server.ids.mp_next_scid_seq(1), 2);
     assert_eq!(pipe.server.local_error(), None);
 }
 

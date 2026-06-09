@@ -6256,6 +6256,30 @@ impl<F: BufFactory> Connection<F> {
         max_active_source_cids - self.active_scids()
     }
 
+    /// Returns the number of source Connection IDs that should be provided
+    /// to the peer for the provided multipath path ID without exceeding the
+    /// per-path active connection ID limit it advertised
+    /// (draft-ietf-quic-multipath-21, Section 3.2).
+    ///
+    /// When a PATH_RETIRE_CONNECTION_ID frame retires one of our source
+    /// Connection IDs, this value increases; the application should then
+    /// supply replacement Connection IDs for that path. The transport never
+    /// mints Connection IDs on its own, as the application must know every
+    /// source Connection ID to route incoming packets.
+    ///
+    /// Path ID 0 reports the same value as [`scids_left()`].
+    ///
+    /// [`scids_left()`]: struct.Connection.html#method.scids_left
+    #[cfg(feature = "multipath")]
+    #[inline]
+    pub fn mp_scids_left(&self, path_id: u64) -> usize {
+        if path_id == 0 {
+            return self.scids_left();
+        }
+
+        self.ids.mp_scids_left(path_id)
+    }
+
     /// Requests the retirement of the destination Connection ID used by the
     /// host to reach its peer.
     ///
@@ -7586,38 +7610,6 @@ impl<F: BufFactory> Connection<F> {
         new_dcid_res
     }
 
-    /// Issues a replacement source Connection ID for the provided multipath
-    /// path ID and queues it for advertisement to the peer through a
-    /// PATH_NEW_CONNECTION_ID frame.
-    ///
-    /// A randomly generated CID may collide with an existing one; such
-    /// collisions are retried a few times. On persistent failure no
-    /// replacement is issued, as supplying one is only a SHOULD
-    /// (RFC 9000 §5.1.2).
-    #[cfg(feature = "multipath")]
-    fn mp_replenish_scid(&mut self, path_id: u64, cid_len: usize) {
-        for _ in 0..3 {
-            let mut cid = vec![0u8; cid_len];
-            rand::rand_bytes(&mut cid);
-
-            let mut reset_token = [0u8; 16];
-            rand::rand_bytes(&mut reset_token);
-
-            match self.ids.mp_new_scid(
-                path_id,
-                ConnectionId::from(cid),
-                u128::from_be_bytes(reset_token),
-            ) {
-                // Random collision with a CID already in use; retry.
-                Err(Error::InvalidState) => continue,
-
-                // Issued (and queued for advertisement), or the pool
-                // cannot take a new CID right now.
-                _ => return,
-            }
-        }
-    }
-
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -8436,18 +8428,71 @@ impl<F: BufFactory> Connection<F> {
                     // Sequence numbers retired by the Retire Prior To field
                     // are queued for PATH_RETIRE_CONNECTION_ID emission by
                     // `mp_new_dcid()` itself (sending is Task 1.3).
-                    // Per-path pools are not linked to (4-tuple) paths yet
-                    // (`create_path()` still draws from the legacy pool),
-                    // so there is no in-use DCID to reassign here; Task 2.x
-                    // wires that together with path management.
-                    self.ids.mp_new_dcid(
+                    //
+                    // Unlink retired DCIDs from their (4-tuple) paths before
+                    // propagating the error code, to make sure retired
+                    // connection IDs are not in use anymore; this mirrors
+                    // `process_new_dcid_frame()`. Note that per-path pools
+                    // are not linked to (4-tuple) paths yet (`create_path()`
+                    // still draws from the legacy pool), so the slab link is
+                    // currently always `None`; Task 2.x wires path
+                    // management to these pools.
+                    let new_dcid_res = self.ids.mp_new_dcid(
                         path_id,
                         conn_id.into(),
                         seq_num,
                         reset_token,
                         retire_prior_to,
                         &mut retired_dcids,
-                    )?;
+                    );
+
+                    for (mp_path_id, dcid_seq, slab_pid) in retired_dcids {
+                        let pid = match slab_pid {
+                            Some(pid) => pid,
+                            None => continue,
+                        };
+
+                        let path = self.paths.get_mut(pid)?;
+
+                        // Maybe the path already switched to another DCID.
+                        if path.active_dcid_seq != Some(dcid_seq) {
+                            continue;
+                        }
+
+                        if let Some(new_dcid_seq) =
+                            self.ids.mp_lowest_available_dcid_seq(mp_path_id)
+                        {
+                            path.active_dcid_seq = Some(new_dcid_seq);
+
+                            self.ids.mp_link_dcid_to_path_id(
+                                mp_path_id,
+                                new_dcid_seq,
+                                pid,
+                            )?;
+
+                            trace!(
+                                "{} path ID {} changed DCID on mp path {}: old seq num {} new seq num {}",
+                                self.trace_id,
+                                pid,
+                                mp_path_id,
+                                dcid_seq,
+                                new_dcid_seq,
+                            );
+                        } else {
+                            // We cannot use this path anymore for now.
+                            path.active_dcid_seq = None;
+
+                            trace!(
+                                "{} path ID {} cannot be used; mp path {} DCID seq num {} has been retired",
+                                self.trace_id,
+                                pid,
+                                mp_path_id,
+                                dcid_seq,
+                            );
+                        }
+                    }
+
+                    new_dcid_res?;
                 }
             },
 
@@ -8488,15 +8533,17 @@ impl<F: BufFactory> Connection<F> {
                             path.active_scid_seq = None;
                         }
                     }
-                } else if let Some(retired_cid) =
-                    self.ids.mp_retire_scid(path_id, seq_num, &hdr.dcid)?
-                {
+                } else {
                     // An endpoint SHOULD supply a new connection ID for the
                     // path when the peer retires one (RFC 9000 §5.1.2,
-                    // applied per path). Issue a replacement SCID and queue
-                    // it for advertisement through a PATH_NEW_CONNECTION_ID
-                    // frame (sending is Task 1.3).
-                    self.mp_replenish_scid(path_id, retired_cid.len());
+                    // applied per path). Supplying it is the application's
+                    // job (via the per-path SCID issuance API, Task 1.3):
+                    // the transport must not mint CIDs itself, as the
+                    // application has to know every source CID to route
+                    // incoming packets. The need for a replacement is
+                    // surfaced through `mp_scids_left()`, and the retired
+                    // CID through `retired_scid_next()`.
+                    self.ids.mp_retire_scid(path_id, seq_num, &hdr.dcid)?;
                 }
             },
 
