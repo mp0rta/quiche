@@ -332,21 +332,11 @@ impl<F: BufFactory> Connection<F> {
         #[cfg(feature = "multipath")]
         if mp_paths_blocked_lost || mp_cids_blocked_lost {
             match self.mp_select_new_path_id() {
-                MpNewPathId::Exhausted
-                    if mp_paths_blocked_lost &&
-                        self.paths.peer_max_path_id <=
-                            self.paths.local_max_path_id =>
-                {
-                    self.mp_paths_blocked_pending =
-                        Some(self.paths.peer_max_path_id);
-                },
+                outcome @ MpNewPathId::Exhausted if mp_paths_blocked_lost =>
+                    self.mp_queue_blocked_signal(outcome),
 
-                MpNewPathId::NoCid { path_id } if mp_cids_blocked_lost => {
-                    self.mp_path_cids_blocked_pending = Some((
-                        path_id,
-                        self.ids.mp_next_expected_dcid_seq(path_id),
-                    ));
-                },
+                outcome @ MpNewPathId::NoCid { .. } if mp_cids_blocked_lost =>
+                    self.mp_queue_blocked_signal(outcome),
 
                 _ => (),
             }

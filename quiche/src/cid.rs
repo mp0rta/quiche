@@ -171,6 +171,11 @@ impl BoundedNonEmptyConnectionIdVecDeque {
         self.inner.len()
     }
 
+    /// Returns true when the `VecDeque` holds no element.
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     /// Inserts the provided entry in the `VecDeque`.
     ///
     /// This method ensures the unicity of the `seq` associated to an entry. If
@@ -1580,7 +1585,7 @@ impl ConnectionIdentifiers {
             None => 0,
 
             Some(p) =>
-                if p.dcids.len() == 0 &&
+                if p.dcids.is_empty() &&
                     p.largest_destination_seq == 0 &&
                     p.largest_peer_retire_prior_to == 0
                 {

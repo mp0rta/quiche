@@ -12212,14 +12212,20 @@ fn create_path_client_only() {
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     assert_eq!(pipe.handshake(), Ok(()));
 
-    // Exchange additional CIDs so that new paths can use fresh DCIDs.
+    // Fund the per-path CID pools so that a new path can be opened
+    // (draft-21 §3.1).
     let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset_token, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset_token, false)
+        .unwrap();
 
     let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset_token, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset_token, false)
+        .unwrap();
 
-    // Exchange NEW_CONNECTION_ID frames so each side knows the other's new CID.
+    // Exchange PATH_NEW_CONNECTION_ID frames so each side knows the
+    // other's new CID.
     assert_eq!(pipe.advance(), Ok(()));
 
     // Client can create paths
@@ -12389,11 +12395,15 @@ fn multipath_two_path_bulk_transfer() {
     assert!(pipe.client.is_multipath());
     assert!(pipe.server.is_multipath());
 
-    // Exchange additional CIDs for second path.
+    // Fund the per-path CID pools for the second path (draft-21 §3.1).
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     // Create second path on client.
@@ -12509,11 +12519,15 @@ fn multipath_server_to_client_bulk_transfer() {
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     pipe.handshake().unwrap();
 
-    // Exchange additional CIDs for second path.
+    // Fund the per-path CID pools for the second path (draft-21 §3.1).
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     // Create second path on client.
@@ -12630,9 +12644,13 @@ fn multipath_mid_transfer_path_creation() {
 
     // Exchange additional CIDs but do NOT create second path yet.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     // At this point: both sides have 1 path (path 0), multipath negotiated.
@@ -13047,9 +13065,13 @@ fn multipath_can_send_boundary_conditions() {
 
     // Exchange CIDs for second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     // Create second path — starts in Unknown state.
@@ -13120,9 +13142,13 @@ fn multipath_aggregate_cwnd_available() {
 
     // Add second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13162,9 +13188,13 @@ fn multipath_get_next_release_time_earliest() {
 
     // Add second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13191,9 +13221,13 @@ fn multipath_max_release_into_future_uses_min_srtt() {
 
     // Add second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13228,9 +13262,13 @@ fn multipath_send_quantum_aggregates() {
 
     // Add second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13258,9 +13296,13 @@ fn multipath_pmtu_on_path() {
 
     // Create second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13291,9 +13333,13 @@ fn multipath_send_on_path_uses_selected_path_mtu() {
 
     // Create second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13432,9 +13478,13 @@ mod scheduler_event_tests {
 
         // Create second path — should fire Activated.
         let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-        pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+        pipe.client
+            .new_scid_on_path(1, &c_cid, c_reset, false)
+            .unwrap();
         let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-        pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+        pipe.server
+            .new_scid_on_path(1, &s_cid, s_reset, false)
+            .unwrap();
         pipe.advance().unwrap();
 
         let local2: SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -13469,11 +13519,15 @@ fn multipath_reinjection_flag_lifecycle() {
     let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
     pipe.handshake().unwrap();
 
-    // Exchange CIDs and create second path.
+    // Fund the per-path CID pools and create the second path.
     let (c_cid, c_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.client.new_scid(&c_cid, c_reset, true).unwrap();
+    pipe.client
+        .new_scid_on_path(1, &c_cid, c_reset, false)
+        .unwrap();
     let (s_cid, s_reset) = test_utils::create_cid_and_reset_token(16);
-    pipe.server.new_scid(&s_cid, s_reset, true).unwrap();
+    pipe.server
+        .new_scid_on_path(1, &s_cid, s_reset, false)
+        .unwrap();
     pipe.advance().unwrap();
 
     let local2: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
@@ -14186,12 +14240,12 @@ fn multipath_new_scid_on_path_seq_increments_per_path() {
     assert_eq!(pipe.server.local_error(), None);
 }
 
-/// §4.4: we only issue CIDs for path IDs the peer may use, which is
-/// bounded by the limit WE advertised; beyond it nothing is queued and an
-/// InvalidState is raised.
+/// §3.2.1: we MUST NOT issue CIDs with path IDs greater than the Maximum
+/// Path Identifier the PEER advertised; beyond it nothing is queued and
+/// an InvalidState is raised.
 #[cfg(feature = "multipath")]
 #[test]
-fn multipath_new_scid_on_path_beyond_local_max_path_id_fails() {
+fn multipath_new_scid_on_path_beyond_peer_max_path_id_fails() {
     let mut pipe = mp_cid_pipe(2);
 
     let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
@@ -14204,6 +14258,44 @@ fn multipath_new_scid_on_path_beyond_local_max_path_id_fails() {
     // No frame goes out and the server never sees a path-3 CID.
     assert_eq!(pipe.advance(), Ok(()));
     assert!(pipe.server.ids.mp_get_dcid(3, 0).is_err());
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §3.2.1/§2.1: with asymmetric limits, the bound on issuance is the limit
+/// the PEER advertised, not our own. Client advertised 4, server
+/// advertised 2: the client must refuse to issue a CID for path ID 3 even
+/// though its own advertised limit would allow it (the server treats a
+/// path ID above its limit as a PROTOCOL_VIOLATION, §4.4), while path ID
+/// 2 is accepted by the server.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_scid_on_path_asymmetric_limits_bound_by_peer() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 2, &[]);
+
+    // Path ID 3 exceeds the server's advertised limit (2): refuse to
+    // issue, queue nothing, and keep the connection alive.
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(3, &cid, reset_token, false),
+        Err(Error::InvalidState)
+    );
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.server.ids.mp_get_dcid(3, 0).is_err());
+    assert_eq!(pipe.server.local_error(), None);
+    assert!(!pipe.client.is_closed());
+    assert!(!pipe.server.is_closed());
+
+    // Path ID 2 is exactly at the server's limit: issuing succeeds and
+    // the server accepts the PATH_NEW_CONNECTION_ID without error.
+    let (cid2, reset_token2) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(2, &cid2, reset_token2, false),
+        Ok(0)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.ids.mp_get_dcid(2, 0).unwrap().cid, cid2);
     assert_eq!(pipe.server.local_error(), None);
 }
 
@@ -14620,6 +14712,218 @@ fn multipath_probe_path_exhausted_sends_paths_blocked() {
     );
 }
 
+/// Under multipath, `create_path()` must not fall back to the legacy
+/// (path ID 0) CID pool when the per-path pools are unfunded: a compliant
+/// peer derives the path ID from the CID (§2.4), so such a path would be
+/// broken. It fails with OutOfIdentifiers and advertises
+/// PATH_CIDS_BLOCKED (§3.2.1), exactly like `probe_path()`.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_create_path_no_cid_sends_path_cids_blocked() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.create_path(client_addr_2, server_addr),
+        Err(Error::OutOfIdentifiers)
+    );
+
+    // No path was created.
+    assert_eq!(pipe.client.paths.len(), 1);
+
+    // The next client flight carries PATH_CIDS_BLOCKED(path ID 1, next
+    // sequence number 0: no CID was ever issued for that path ID).
+    let mut buf = [0; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathCidsBlocked {
+                path_id: 1,
+                seq_num: 0,
+            })),
+        "expected PATH_CIDS_BLOCKED in packet, got {frames:?}"
+    );
+}
+
+/// `create_path()` when every path ID allowed by the peer is consumed
+/// fails with PathLimitExceeded and advertises PATHS_BLOCKED (§3.2.1),
+/// exactly like `probe_path()`.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_create_path_exhausted_sends_paths_blocked() {
+    // The server only allows path ID 0: every usable path ID is consumed
+    // from the start.
+    let mut pipe = mp_pipe_with_per_path_cids(4, 0, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.create_path(client_addr_2, server_addr),
+        Err(Error::PathLimitExceeded)
+    );
+
+    // No path was created.
+    assert_eq!(pipe.client.paths.len(), 1);
+
+    let mut buf = [0; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathsBlocked { path_id: 0 })),
+        "expected PATHS_BLOCKED in packet, got {frames:?}"
+    );
+}
+
+/// A lost PATHS_BLOCKED / PATH_CIDS_BLOCKED frame is rebuilt and re-sent
+/// only while the blocking condition persists: once the per-path pool is
+/// funded, the loss of a previous instance must not re-arm the frame.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_cids_blocked_lost_rearmed_only_while_blocked() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.probe_path(client_addr_2, server_addr),
+        Err(Error::OutOfIdentifiers)
+    );
+
+    // The first flight carries PATH_CIDS_BLOCKED; it never reaches the
+    // server.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathCidsBlocked {
+                path_id: 1,
+                seq_num: 0,
+            })),
+        "expected PATH_CIDS_BLOCKED in packet, got {frames:?}"
+    );
+
+    // Declare it lost. The blocking condition still holds, so the frame
+    // is rebuilt and re-emitted.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    pipe.client.send_ack_eliciting().unwrap();
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathCidsBlocked {
+                path_id: 1,
+                seq_num: 0,
+            })),
+        "expected re-armed PATH_CIDS_BLOCKED in packet, got {frames:?}"
+    );
+
+    // The re-emitted instance is lost as well, but the pool gets funded
+    // before loss detection runs: the condition no longer holds, so the
+    // frame must NOT be re-armed again.
+    let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.server.new_scid_on_path(1, &s_cid, s_reset_token, false),
+        Ok(0)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    pipe.client.send_ack_eliciting().unwrap();
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathCidsBlocked { .. })),
+        "PATH_CIDS_BLOCKED must not be re-armed once the pool is funded, \
+         got {frames:?}"
+    );
+}
+
+/// A lost PATHS_BLOCKED frame is rebuilt and re-sent only while every
+/// path ID allowed by the peer remains consumed: once the peer raises its
+/// limit with MAX_PATH_ID, the loss must not re-arm the frame.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_lost_rearmed_only_while_blocked() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_pipe_with_per_path_cids(4, 0, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.probe_path(client_addr_2, server_addr),
+        Err(Error::PathLimitExceeded)
+    );
+
+    // The first flight carries PATHS_BLOCKED; it never reaches the
+    // server.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathsBlocked { path_id: 0 })),
+        "expected PATHS_BLOCKED in packet, got {frames:?}"
+    );
+
+    // Declare it lost. The blocking condition still holds, so the frame
+    // is rebuilt and re-emitted.
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    pipe.client.send_ack_eliciting().unwrap();
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathsBlocked { path_id: 0 })),
+        "expected re-armed PATHS_BLOCKED in packet, got {frames:?}"
+    );
+
+    // The re-emitted instance is lost as well, but the peer raises its
+    // limit before loss detection runs (as if a MAX_PATH_ID frame had
+    // been received): the condition no longer holds, so the frame must
+    // NOT be re-armed again.
+    pipe.client.paths.peer_max_path_id = 2;
+    assert_eq!(pipe.client.peer_max_path_id(), 2);
+
+    test_utils::trigger_ack_based_loss(&mut pipe.client, &mut pipe.server);
+
+    pipe.client.send_ack_eliciting().unwrap();
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathsBlocked { .. })),
+        "PATHS_BLOCKED must not be re-armed once the peer raised its \
+         limit, got {frames:?}"
+    );
+}
+
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_active_path_cid_on_new_tuple_is_migration() {
@@ -14684,6 +14988,119 @@ fn multipath_active_path_cid_on_new_tuple_is_migration() {
 
     // The new address is under (re)validation.
     assert!(pipe.server.paths.get(mpid).unwrap().probing_required());
+}
+
+/// RFC 9000 §9.4: when a migration (§3.1.2) changes the peer's address
+/// beyond just the port, the congestion controller and RTT estimator of
+/// the migrated path are reset to initial values.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_migration_to_new_ip_resets_congestion_state() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    // A different IP address: NOT a port-only change.
+    let client_addr_3 = "127.0.0.2:5678".parse().unwrap();
+
+    // Establish and validate path 1.
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+
+    // The validation exchange produced an RTT sample on path 1, so its
+    // estimator moved away from the initial value.
+    assert_ne!(
+        pipe.server.paths.get(spid).unwrap().recovery.rtt(),
+        DEFAULT_INITIAL_RTT
+    );
+
+    // Elicit a fresh packet on path 1, then deliver it from a different
+    // client IP address.
+    pipe.client.probe_path(client_addr_2, server_addr).unwrap();
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    for (mut pkt, si) in flight {
+        let info = RecvInfo {
+            to: si.to,
+            from: client_addr_3,
+        };
+        pipe.server.recv(&mut pkt, info).unwrap();
+    }
+
+    // Path 1 migrated, and its congestion state is back to initial
+    // values.
+    let migrated = pipe.server.paths.get(spid).unwrap();
+    assert_eq!(migrated.peer_addr(), client_addr_3);
+    assert_eq!(migrated.recovery.rtt(), DEFAULT_INITIAL_RTT);
+
+    let config = test_utils::Pipe::default_config("cubic").unwrap();
+    let initial_cwnd = recovery::Recovery::new(&config).cwnd();
+    assert_eq!(migrated.recovery.cwnd(), initial_cwnd);
+    assert_eq!(migrated.recovery.bytes_in_flight(), 0);
+
+    // The connection keeps working after the reset.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// RFC 9000 §9.4 allowance: when the only change in the peer's address is
+/// the port number, the congestion state of the migrated path is kept.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_migration_port_only_keeps_congestion_state() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    // Same IP address, different port: a port-only change.
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    // Establish and validate path 1.
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+
+    let rtt_before = pipe.server.paths.get(spid).unwrap().recovery.rtt();
+    assert_ne!(rtt_before, DEFAULT_INITIAL_RTT);
+
+    // Elicit a fresh packet on path 1, then deliver it from a different
+    // client port on the same IP.
+    pipe.client.probe_path(client_addr_2, server_addr).unwrap();
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    for (mut pkt, si) in flight {
+        let info = RecvInfo {
+            to: si.to,
+            from: client_addr_3,
+        };
+        pipe.server.recv(&mut pkt, info).unwrap();
+    }
+
+    // Path 1 migrated, keeping its RTT estimate.
+    let migrated = pipe.server.paths.get(spid).unwrap();
+    assert_eq!(migrated.peer_addr(), client_addr_3);
+    assert_eq!(migrated.recovery.rtt(), rtt_before);
 }
 
 #[cfg(feature = "multipath")]
