@@ -1252,7 +1252,10 @@ impl Config {
 #[cfg(feature = "multipath")]
 impl Config {
     /// Set the initial maximum path ID for multipath QUIC.
-    /// A non-zero value enables multipath negotiation.
+    ///
+    /// Advertising this transport parameter with any value (including 0)
+    /// enables multipath negotiation; the value bounds how many extra paths
+    /// the peer may open initially (draft-ietf-quic-multipath-21 §2.1).
     pub fn set_initial_max_path_id(&mut self, max_path_id: u32) {
         self.initial_max_path_id = Some(max_path_id);
     }
@@ -2451,11 +2454,22 @@ impl<F: BufFactory> Connection<F> {
         let raw_params_len = b.get_u64()? as usize;
         let raw_params_bytes = b.get_bytes(raw_params_len)?;
 
-        let peer_params = TransportParams::decode(
+        #[cfg_attr(not(feature = "multipath"), allow(unused_mut))]
+        let mut peer_params = TransportParams::decode(
             raw_params_bytes.as_ref(),
             self.is_server,
             self.peer_transport_params_track_unknown,
         )?;
+
+        // Per draft-ietf-quic-multipath §2.1: "The initial_max_path_id
+        // parameter MUST NOT be remembered for use in a subsequent connection."
+        // Clear it here so that session-restored TPs cannot latch multipath
+        // state. Multipath negotiation will happen (or not) based solely on
+        // the live handshake's transport parameters.
+        #[cfg(feature = "multipath")]
+        {
+            peer_params.initial_max_path_id = None;
+        }
 
         self.process_peer_transport_params(peer_params)?;
 
@@ -7190,26 +7204,31 @@ impl<F: BufFactory> Connection<F> {
 
         #[cfg(feature = "multipath")]
         {
+            // Per draft-ietf-quic-multipath §2.1: advertising
+            // initial_max_path_id with *any* value (including 0) enables the
+            // multipath extension. Value 0 means "multipath enabled but no
+            // extra paths allowed initially". The AEAD nonce construction
+            // switches to PPN (per-path packet number) once negotiated.
+            // The old guard `local_max > 0 && peer_max > 0` was wrong — it
+            // incorrectly required both sides to advertise > 0.
             if let (Some(local_max), Some(peer_max)) = (
                 self.local_transport_params.initial_max_path_id,
                 peer_params.initial_max_path_id,
             ) {
-                if local_max > 0 && peer_max > 0 {
-                    self.multipath_enabled = true;
-                    self.paths.peer_max_path_id = peer_max as u64;
-                    self.paths.local_max_path_id = local_max as u64;
-                    // Set initial path's path_id to 0
-                    let active_pid =
-                        self.paths.get_active_path_id().unwrap_or(0);
-                    if let Ok(path) = self.paths.get_mut(active_pid) {
-                        path.path_id = 0;
-                    }
-                    // Create default scheduler if none was configured
-                    if self.scheduler.is_none() {
-                        self.scheduler = Some(Box::new(
-                            multipath::schedulers::MinRttScheduler,
-                        ));
-                    }
+                self.multipath_enabled = true;
+                self.paths.peer_max_path_id = peer_max as u64;
+                self.paths.local_max_path_id = local_max as u64;
+                // Set initial path's path_id to 0
+                let active_pid =
+                    self.paths.get_active_path_id().unwrap_or(0);
+                if let Ok(path) = self.paths.get_mut(active_pid) {
+                    path.path_id = 0;
+                }
+                // Create default scheduler if none was configured
+                if self.scheduler.is_none() {
+                    self.scheduler = Some(Box::new(
+                        multipath::schedulers::MinRttScheduler,
+                    ));
                 }
             }
         }

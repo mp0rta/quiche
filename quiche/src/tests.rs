@@ -13496,3 +13496,192 @@ fn multipath_reinjection_flag_lifecycle() {
     // After send, flag should be consumed (None).
     assert!(pipe.client.pending_reinjection_path.is_none());
 }
+
+// ----- draft-ietf-quic-multipath-21 §2.1 negotiation correctness tests -----
+
+/// Test 1: Both sides advertise initial_max_path_id = 0.
+///
+/// Per §2.1, advertising the TP with value 0 still enables multipath
+/// ("the peer aims to enable the multipath extension without allowing extra
+/// paths immediately"). The AEAD nonce switches to PPN construction once
+/// negotiated. No extra paths are allowed initially; a MAX_PATH_ID frame
+/// can raise the limit later.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_negotiation_zero_max_path_id_enables_multipath() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    // Value 0: multipath enabled, but no additional paths allowed yet.
+    config.set_initial_max_path_id(0);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Both sides must report multipath enabled even though value is 0.
+    assert!(
+        pipe.client.is_multipath(),
+        "client: multipath must be enabled when both advertise \
+         initial_max_path_id=0"
+    );
+    assert!(
+        pipe.server.is_multipath(),
+        "server: multipath must be enabled when both advertise \
+         initial_max_path_id=0"
+    );
+
+    // Data must flow (PPN nonces are in use; AEAD decrypts correctly).
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    let mut buf = [0u8; 16];
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, false)));
+    assert_eq!(&buf[..5], b"hello");
+
+    // peer_max_path_id on both sides must be 0 (no extra paths yet).
+    assert_eq!(
+        pipe.client.paths.peer_max_path_id, 0,
+        "client peer_max_path_id should be 0"
+    );
+    assert_eq!(
+        pipe.server.paths.peer_max_path_id, 0,
+        "server peer_max_path_id should be 0"
+    );
+
+    // A MAX_PATH_ID frame with value 2 must raise the peer limit on the
+    // receiver. Inject the frame from client → server.
+    let max_path_id_frame = frame::Frame::MaxPathId { path_id: 2 };
+    let mut buf = [0u8; 65535];
+    let len = test_utils::encode_pkt(
+        &mut pipe.client,
+        packet::Type::Short,
+        &[max_path_id_frame],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.server_recv(&mut buf[..len]).unwrap();
+
+    assert_eq!(
+        pipe.server.paths.peer_max_path_id, 2,
+        "server peer_max_path_id must be raised to 2 after MAX_PATH_ID"
+    );
+}
+
+/// Test 2: Asymmetric advertisement — server=0, client=2.
+///
+/// Per §3.2.1 each side records the *peer's* advertised limit for the CIDs
+/// it issues. Both ends must have multipath_enabled = true, and each
+/// records the peer's limit in paths.peer_max_path_id.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_negotiation_asymmetric_zero_and_nonzero() {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(2); // client advertises 2
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.set_initial_max_path_id(0); // server advertises 0
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // Both sides must have multipath enabled.
+    assert!(
+        pipe.client.is_multipath(),
+        "client: multipath must be enabled in asymmetric negotiation"
+    );
+    assert!(
+        pipe.server.is_multipath(),
+        "server: multipath must be enabled in asymmetric negotiation"
+    );
+
+    // Client records what the server advertised (0); server records what
+    // the client advertised (2).
+    assert_eq!(
+        pipe.client.paths.peer_max_path_id, 0,
+        "client must record server's advertised limit (0)"
+    );
+    assert_eq!(
+        pipe.server.paths.peer_max_path_id, 2,
+        "server must record client's advertised limit (2)"
+    );
+}
+
+/// Test 3: Session resumption must NOT remember initial_max_path_id.
+///
+/// §2.1 MUST NOT: "The initial_max_path_id parameter MUST NOT be remembered
+/// for use in a subsequent connection." A session stored from a
+/// multipath-negotiated connection must not enable multipath on the resumed
+/// connection when the peer (server) no longer advertises
+/// initial_max_path_id, even if the client still does.
+///
+/// The key scenario: client has initial_max_path_id=2 configured AND a
+/// stored session from a prior multipath connection (peer params contain
+/// initial_max_path_id=2). When set_session is called, process_peer_transport_params
+/// runs with the remembered params — this must NOT latch multipath_enabled=true
+/// because the live handshake's server TP will have initial_max_path_id=None.
+#[cfg(feature = "multipath")]
+#[cfg(not(feature = "openssl"))] // session tickets not available with openssl/quictls
+#[test]
+fn multipath_session_resumption_does_not_remember_max_path_id() {
+    #[cfg(not(feature = "openssl"))]
+    const SESSION_TICKET_KEY: [u8; 48] = [0xab; 48];
+
+    // First connection: both sides enable multipath (initial_max_path_id=2).
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(2);
+    config.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    // Extract the session. The stored peer params contain initial_max_path_id=2.
+    let session = pipe.client.session().unwrap().to_vec();
+
+    // Second connection:
+    //   - Client still wants multipath (set_initial_max_path_id=2), AND
+    //     restores the session whose stored TPs have initial_max_path_id=2.
+    //   - Server does NOT advertise initial_max_path_id in the live handshake.
+    // Per §2.1 this must result in multipath NOT being enabled.
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    // NOTE: intentionally NOT calling set_initial_max_path_id on server.
+    server_config.set_ticket_key(&SESSION_TICKET_KEY).unwrap();
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(2); // client still wants multipath
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+
+    // Restore the previous session. The encoded peer TPs contain
+    // initial_max_path_id=2. set_session calls process_peer_transport_params
+    // with those remembered params — if unfixed, this would latch
+    // multipath_enabled=true even before the live handshake.
+    assert_eq!(pipe.client.set_session(&session), Ok(()));
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // After the live handshake the server sent no initial_max_path_id, so
+    // multipath must NOT be enabled on either side.
+    assert!(
+        !pipe.client.is_multipath(),
+        "client: multipath must NOT be enabled after session resumption \
+         when server no longer advertises initial_max_path_id (§2.1 MUST NOT)"
+    );
+    assert!(
+        !pipe.server.is_multipath(),
+        "server: multipath must NOT be enabled when it did not advertise \
+         initial_max_path_id in the live handshake"
+    );
+
+    // Data must still flow normally (non-PPN nonces).
+    assert_eq!(pipe.client.stream_send(0, b"world", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+    let mut buf = [0u8; 16];
+    assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, false)));
+    assert_eq!(&buf[..5], b"world");
+}
