@@ -2,7 +2,7 @@
 
 /// Compute the multipath AEAD nonce using PPN (Path and Packet Number).
 ///
-/// Implements draft-ietf-quic-multipath Section 5.1: the 96-bit PPN is:
+/// Implements draft-ietf-quic-multipath-21 §2.4: the 96-bit PPN is:
 ///   Bits 95-64: path_id (lower 32 bits, network byte order)
 ///   Bits 63-62: 00 (2 zero bits)
 ///   Bits 61-0:  packet_number (62 bits, network byte order)

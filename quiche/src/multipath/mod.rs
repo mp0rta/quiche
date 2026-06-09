@@ -1,4 +1,4 @@
-//! Multipath QUIC support (draft-ietf-quic-multipath-20).
+//! Multipath QUIC support (draft-ietf-quic-multipath-21).
 
 pub mod scheduler;
 pub mod schedulers;

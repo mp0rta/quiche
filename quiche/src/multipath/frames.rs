@@ -1,15 +1,15 @@
 //! Multipath-specific frame parsing and generation.
 //!
-//! Frame type codes per draft-ietf-quic-multipath-20:
-//!   PATH_ACK:                    0x3e / 0x3f (with ECN)
-//!   PATH_ABANDON:                0x3e75
-//!   PATH_STATUS_BACKUP:          0x3e76
-//!   PATH_STATUS_AVAILABLE:       0x3e77
-//!   PATH_NEW_CONNECTION_ID:      0x3e78
-//!   PATH_RETIRE_CONNECTION_ID:   0x3e79
-//!   MAX_PATH_ID:                 0x3e7a
-//!   PATHS_BLOCKED:               0x3e7b
-//!   PATH_CIDS_BLOCKED:           0x3e7c
+//! Frame type codes per draft-ietf-quic-multipath-21:
+//!   PATH_ACK:                    0x3e / 0x3f (with ECN)    §4.1
+//!   PATH_ABANDON:                0x3e75                    §4.2
+//!   PATH_STATUS_BACKUP:          0x3e76                    §4.3
+//!   PATH_STATUS_AVAILABLE:       0x3e77                    §4.3
+//!   PATH_NEW_CONNECTION_ID:      0x3e78                    §4.4
+//!   PATH_RETIRE_CONNECTION_ID:   0x3e79                    §4.5
+//!   MAX_PATH_ID:                 0x3e7a                    §4.6
+//!   PATHS_BLOCKED:               0x3e7b                    §4.7
+//!   PATH_CIDS_BLOCKED:           0x3e7c                    §4.7
 
 use crate::ranges::RangeSet;
 use crate::frame::EcnCounts;
