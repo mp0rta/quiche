@@ -32,6 +32,8 @@ use crate::frame;
 
 use crate::packet::ConnectionId;
 
+#[cfg(feature = "multipath")]
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -238,15 +240,58 @@ pub struct ConnectionIdentifiers {
     /// Does the host use zero-length destination Connection ID.
     zero_length_dcid: bool,
 
-    /// Per-path source CID sequences: maps path_id -> list of SCID seqs.
+    /// Per-Path ID connection ID pools for non-zero path identifiers
+    /// (draft-ietf-quic-multipath-21, Section 2.2). Path ID 0 uses the
+    /// legacy `scids`/`dcids` collections above.
     #[cfg(feature = "multipath")]
-    #[allow(dead_code)]
-    pub(crate) path_scid_map: std::collections::HashMap<u64, Vec<u64>>,
+    mp_pools: BTreeMap<u64, PathCidPool>,
 
-    /// Per-path destination CID sequences: maps path_id -> list of DCID seqs.
+    /// Per-path source CIDs that should be advertised to the peer through
+    /// PATH_NEW_CONNECTION_ID frames, as (path_id, seq) pairs.
     #[cfg(feature = "multipath")]
-    #[allow(dead_code)]
-    pub(crate) path_dcid_map: std::collections::HashMap<u64, Vec<u64>>,
+    mp_advertise_new_scid_seqs: VecDeque<(u64, u64)>,
+
+    /// Per-path retired destination CIDs that should be advertised to the
+    /// peer through PATH_RETIRE_CONNECTION_ID frames, as (path_id, seq)
+    /// pairs.
+    #[cfg(feature = "multipath")]
+    mp_retire_dcid_seqs: HashSet<(u64, u64)>,
+}
+
+/// Per-Path ID connection ID pool (draft-ietf-quic-multipath-21, Sections
+/// 2.2 and 3.2).
+///
+/// Every non-zero path identifier has its own connection ID sequence number
+/// spaces in both directions, each starting at 0, with the active connection
+/// ID limits applying per path. Path ID 0 reuses the legacy `scids`/`dcids`
+/// collections of `ConnectionIdentifiers`, so that legacy NEW_CONNECTION_ID
+/// and RETIRE_CONNECTION_ID frames and their PATH_* equivalents carrying
+/// Path ID 0 operate on the very same spaces.
+///
+/// The pools reuse `BoundedNonEmptyConnectionIdVecDeque` but start empty
+/// (via `Default`, with capacity adjusted on insertion); its `remove()`
+/// invariant then enforces that a path keeps at least one active CID once
+/// populated, mirroring the legacy behavior.
+#[cfg(feature = "multipath")]
+#[derive(Default)]
+struct PathCidPool {
+    /// Source CIDs we issued to the peer for this path.
+    scids: BoundedNonEmptyConnectionIdVecDeque,
+
+    /// Destination CIDs the peer issued to us for this path.
+    dcids: BoundedNonEmptyConnectionIdVecDeque,
+
+    /// Next source CID sequence number to issue on this path.
+    next_scid_seq: u64,
+
+    /// "Retire Prior To" value to advertise to the peer for this path.
+    retire_prior_to: u64,
+
+    /// Largest "Retire Prior To" received from the peer on this path.
+    largest_peer_retire_prior_to: u64,
+
+    /// Largest DCID sequence number received from the peer on this path.
+    largest_destination_seq: u64,
 }
 
 impl ConnectionIdentifiers {
@@ -835,6 +880,486 @@ impl ConnectionIdentifiers {
     }
 }
 
+/// Per-Path ID connection ID pool management
+/// (draft-ietf-quic-multipath-21, Sections 2.2 and 3.2).
+///
+/// All methods taking a `path_id` treat Path ID 0 as the initial path and
+/// delegate to the legacy single-space methods, so that legacy
+/// NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames and PATH_* frames carrying
+/// Path ID 0 are equivalent.
+// TODO(multipath): drop the `allow(dead_code)` once the PATH_NEW_CONNECTION_ID
+// and PATH_RETIRE_CONNECTION_ID frame handlers and the send-side wiring use
+// these methods.
+#[cfg(feature = "multipath")]
+#[allow(dead_code)]
+impl ConnectionIdentifiers {
+    /// Returns whether the provided CID bytes are already used by any
+    /// connection ID known to this connection, on any path and on either the
+    /// source or destination side.
+    ///
+    /// Connection ID values must be unique across the whole connection,
+    /// whatever the path ID (draft-ietf-quic-multipath-21, Section 3.2.1).
+    fn mp_cid_in_use(&self, cid: &ConnectionId) -> bool {
+        self.scids.iter().any(|e| e.cid == *cid) ||
+            self.dcids.iter().any(|e| e.cid == *cid) ||
+            self.mp_pools.values().any(|p| {
+                p.scids.iter().any(|e| e.cid == *cid) ||
+                    p.dcids.iter().any(|e| e.cid == *cid)
+            })
+    }
+
+    /// Adds a new source identifier for the provided path ID and queues its
+    /// advertisement through a PATH_NEW_CONNECTION_ID frame.
+    ///
+    /// The sequence number spaces are per path and start at 0. The number of
+    /// active source CIDs is limited per path by the maximum number of
+    /// source Connection IDs our peer allows us; exceeding it raises an
+    /// [`IdLimit`].
+    ///
+    /// Providing a CID whose bytes are already used anywhere on the
+    /// connection raises an [`InvalidState`].
+    ///
+    /// For path ID 0, this delegates to [`new_scid()`], operating on the
+    /// very same sequence number space as legacy NEW_CONNECTION_ID frames.
+    ///
+    /// Returns the sequence number associated to that new source identifier
+    /// in the path's sequence number space.
+    ///
+    /// [`new_scid()`]: struct.ConnectionIdentifiers.html#method.new_scid
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    /// [`IdLimit`]: enum.Error.html#IdLimit
+    pub fn mp_new_scid(
+        &mut self, path_id: u64, cid: ConnectionId<'static>, reset_token: u128,
+    ) -> Result<u64> {
+        if path_id == 0 {
+            return self.new_scid(cid, Some(reset_token), true, None, false);
+        }
+
+        if self.zero_length_scid {
+            return Err(Error::InvalidState);
+        }
+
+        // CID bytes must be unique across all paths and both directions.
+        if self.mp_cid_in_use(&cid) {
+            return Err(Error::InvalidState);
+        }
+
+        let limit = self.source_conn_id_limit;
+        let pool = self.mp_pools.entry(path_id).or_default();
+
+        // The active connection ID limit applies per path.
+        if pool.scids.len() >= limit {
+            return Err(Error::IdLimit);
+        }
+        pool.scids.resize(limit);
+
+        let seq = pool.next_scid_seq;
+        pool.scids.insert(ConnectionIdEntry {
+            cid,
+            seq,
+            reset_token: Some(reset_token),
+            path_id: None,
+        })?;
+        pool.next_scid_seq += 1;
+
+        self.mp_advertise_new_scid_seqs.push_back((path_id, seq));
+
+        Ok(seq)
+    }
+
+    /// Adds a new Destination Connection ID for the provided path ID
+    /// (originating from a PATH_NEW_CONNECTION_ID frame) and processes all
+    /// its related metadata, with RFC 9000 Section 19.15 semantics applied
+    /// per path.
+    ///
+    /// Returns an error if the provided Connection ID or its metadata are
+    /// invalid.
+    ///
+    /// Sequence numbers of retired DCIDs are appended to `retired` as
+    /// (path ID, sequence number) pairs, and queued for later
+    /// PATH_RETIRE_CONNECTION_ID emission.
+    ///
+    /// For path ID 0, this delegates to [`new_dcid()`], operating on the
+    /// very same sequence number space as legacy NEW_CONNECTION_ID frames.
+    ///
+    /// [`new_dcid()`]: struct.ConnectionIdentifiers.html#method.new_dcid
+    pub fn mp_new_dcid(
+        &mut self, path_id: u64, cid: ConnectionId<'static>, seq: u64,
+        reset_token: u128, retire_prior_to: u64, retired: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        if path_id == 0 {
+            let mut retired_path_ids = SmallVec::new();
+            let res = self.new_dcid(
+                cid,
+                seq,
+                reset_token,
+                retire_prior_to,
+                &mut retired_path_ids,
+            );
+            // The legacy call may have retired entries even on error.
+            retired.extend(retired_path_ids.iter().map(|(seq, _)| (0, *seq)));
+            return res;
+        }
+
+        if self.zero_length_dcid {
+            return Err(Error::InvalidState);
+        }
+
+        // The active connection ID limit applies per path.
+        let dcid_limit = self.dcids.capacity;
+        let pool = self.mp_pools.entry(path_id).or_default();
+        pool.dcids.resize(dcid_limit);
+
+        // If an endpoint receives a PATH_NEW_CONNECTION_ID frame that
+        // repeats a previously issued connection ID for the same path with a
+        // different Stateless Reset Token field value or a different
+        // Sequence Number field value, or if a sequence number is used for
+        // different connection IDs on the same path, the endpoint MAY treat
+        // that receipt as a connection error of type PROTOCOL_VIOLATION.
+        if let Some(e) = pool.dcids.iter().find(|e| e.cid == cid || e.seq == seq)
+        {
+            if e.cid != cid || e.seq != seq || e.reset_token != Some(reset_token)
+            {
+                return Err(Error::InvalidFrame);
+            }
+            // The identifier is already there, nothing to do.
+            return Ok(());
+        }
+
+        // The value in the Retire Prior To field MUST be less than or equal
+        // to the value in the Sequence Number field.
+        if retire_prior_to > seq {
+            return Err(Error::InvalidFrame);
+        }
+
+        // An endpoint that receives a sequence number smaller than the
+        // Retire Prior To field of a previously received frame for the same
+        // path MUST send a corresponding PATH_RETIRE_CONNECTION_ID frame,
+        // unless it has already done so for that sequence number.
+        if seq < pool.largest_peer_retire_prior_to {
+            self.mp_retire_dcid_seqs.insert((path_id, seq));
+            return Ok(());
+        }
+
+        if seq > pool.largest_destination_seq {
+            pool.largest_destination_seq = seq;
+        }
+
+        let new_entry = ConnectionIdEntry {
+            cid,
+            seq,
+            reset_token: Some(reset_token),
+            path_id: None,
+        };
+
+        // A receiver MUST ignore any Retire Prior To fields that do not
+        // increase the largest received Retire Prior To value for that path.
+        if retire_prior_to > pool.largest_peer_retire_prior_to {
+            // The inserted entry MUST have a sequence higher or equal to the
+            // ones being retired.
+            if new_entry.seq < retire_prior_to {
+                return Err(Error::OutOfIdentifiers);
+            }
+
+            // To avoid exceeding the capacity of the inner `VecDeque`, we
+            // first remove the elements and then insert the new one.
+            let index = pool
+                .dcids
+                .inner
+                .partition_point(|e| e.seq < retire_prior_to);
+
+            for e in pool.dcids.inner.drain(..index) {
+                retired.push((path_id, e.seq));
+                self.mp_retire_dcid_seqs.insert((path_id, e.seq));
+            }
+
+            pool.largest_peer_retire_prior_to = retire_prior_to;
+        }
+
+        // Note that if no element has been retired and the `VecDeque`
+        // reaches its capacity limit, this will raise an `IdLimit`.
+        pool.dcids.insert(new_entry)?;
+
+        Ok(())
+    }
+
+    /// Gets the lowest Destination Connection ID sequence number of the
+    /// provided path ID that is not associated to a (4-tuple) path, if any.
+    ///
+    /// Path ID 0 delegates to [`lowest_available_dcid_seq()`].
+    ///
+    /// [`lowest_available_dcid_seq()`]: struct.ConnectionIdentifiers.html#method.lowest_available_dcid_seq
+    pub fn mp_lowest_available_dcid_seq(&self, path_id: u64) -> Option<u64> {
+        if path_id == 0 {
+            return self.lowest_available_dcid_seq();
+        }
+
+        self.mp_pools
+            .get(&path_id)?
+            .dcids
+            .iter()
+            .filter_map(|e| {
+                if e.path_id.is_none() {
+                    Some(e.seq)
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
+    /// Gets the destination Connection ID of the provided path ID associated
+    /// with the provided sequence number. Path ID 0 delegates to
+    /// [`get_dcid()`].
+    ///
+    /// [`get_dcid()`]: struct.ConnectionIdentifiers.html#method.get_dcid
+    pub fn mp_get_dcid(
+        &self, path_id: u64, seq_num: u64,
+    ) -> Result<&ConnectionIdEntry> {
+        if path_id == 0 {
+            return self.get_dcid(seq_num);
+        }
+
+        self.mp_pools
+            .get(&path_id)
+            .and_then(|p| p.dcids.get(seq_num))
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Gets the source Connection ID of the provided path ID associated with
+    /// the provided sequence number. Path ID 0 delegates to [`get_scid()`].
+    ///
+    /// [`get_scid()`]: struct.ConnectionIdentifiers.html#method.get_scid
+    pub fn mp_get_scid(
+        &self, path_id: u64, seq_num: u64,
+    ) -> Result<&ConnectionIdEntry> {
+        if path_id == 0 {
+            return self.get_scid(seq_num);
+        }
+
+        self.mp_pools
+            .get(&path_id)
+            .and_then(|p| p.scids.get(seq_num))
+            .ok_or(Error::InvalidState)
+    }
+
+    /// Updates the Destination Connection ID entry of the provided path ID
+    /// with the provided sequence number to indicate that it is now linked
+    /// to the provided (4-tuple) path ID. Path ID 0 delegates to
+    /// [`link_dcid_to_path_id()`].
+    ///
+    /// [`link_dcid_to_path_id()`]: struct.ConnectionIdentifiers.html#method.link_dcid_to_path_id
+    pub fn mp_link_dcid_to_path_id(
+        &mut self, path_id: u64, dcid_seq: u64, four_tuple_path_id: usize,
+    ) -> Result<()> {
+        if path_id == 0 {
+            return self.link_dcid_to_path_id(dcid_seq, four_tuple_path_id);
+        }
+
+        let e = self
+            .mp_pools
+            .get_mut(&path_id)
+            .and_then(|p| p.dcids.get_mut(dcid_seq))
+            .ok_or(Error::InvalidState)?;
+        e.path_id = Some(four_tuple_path_id);
+        Ok(())
+    }
+
+    /// Retires the Source Connection ID of the provided path ID having the
+    /// provided sequence number, mirroring [`retire_scid()`] per path.
+    ///
+    /// In case the retired Connection ID is the same as the one used by the
+    /// packet requesting the retiring, or if the retired sequence number is
+    /// greater than any previously advertised sequence numbers on that path,
+    /// it returns an [`InvalidState`].
+    ///
+    /// Returns the retired Connection ID, if any. Path ID 0 delegates to
+    /// [`retire_scid()`].
+    ///
+    /// [`retire_scid()`]: struct.ConnectionIdentifiers.html#method.retire_scid
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    pub fn mp_retire_scid(
+        &mut self, path_id: u64, seq: u64, pkt_dcid: &ConnectionId,
+    ) -> Result<Option<ConnectionId<'static>>> {
+        if path_id == 0 {
+            let cid = self.scids.get(seq).map(|e| e.cid.clone());
+            self.retire_scid(seq, pkt_dcid)?;
+            return Ok(cid);
+        }
+
+        let pool = self.mp_pools.get_mut(&path_id).ok_or(Error::InvalidState)?;
+
+        if seq >= pool.next_scid_seq {
+            return Err(Error::InvalidState);
+        }
+
+        let cid = if let Some(e) = pool.scids.remove(seq)? {
+            if e.cid == *pkt_dcid {
+                return Err(Error::InvalidState);
+            }
+
+            // Notifies the application.
+            self.retired_scids.push_back(e.cid.clone());
+
+            // Retiring this SCID may increase the path's retire prior to.
+            let lowest_scid_seq = pool
+                .scids
+                .iter()
+                .filter_map(|e| {
+                    if e.seq >= pool.retire_prior_to {
+                        Some(e.seq)
+                    } else {
+                        None
+                    }
+                })
+                .min()
+                .ok_or(Error::InvalidState)?;
+            pool.retire_prior_to = lowest_scid_seq;
+
+            Some(e.cid)
+        } else {
+            None
+        };
+
+        Ok(cid)
+    }
+
+    /// Retires the Destination Connection ID of the provided path ID having
+    /// the provided sequence number, mirroring [`retire_dcid()`] per path.
+    ///
+    /// If the caller tries to retire the last destination Connection ID of
+    /// the path, this method triggers an [`OutOfIdentifiers`].
+    ///
+    /// If the caller tries to retire a non-existing Destination Connection
+    /// ID sequence number, this method returns an [`InvalidState`].
+    ///
+    /// Returns the (4-tuple) path ID that was associated to the retired CID,
+    /// if any. Path ID 0 delegates to [`retire_dcid()`].
+    ///
+    /// [`retire_dcid()`]: struct.ConnectionIdentifiers.html#method.retire_dcid
+    /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
+    /// [`InvalidState`]: enum.Error.html#InvalidState
+    pub fn mp_retire_dcid(
+        &mut self, path_id: u64, seq: u64,
+    ) -> Result<Option<usize>> {
+        if path_id == 0 {
+            return self.retire_dcid(seq);
+        }
+
+        if self.zero_length_dcid {
+            return Err(Error::InvalidState);
+        }
+
+        let pool = self.mp_pools.get_mut(&path_id).ok_or(Error::InvalidState)?;
+
+        let e = pool.dcids.remove(seq)?.ok_or(Error::InvalidState)?;
+
+        self.mp_retire_dcid_seqs.insert((path_id, seq));
+
+        Ok(e.path_id)
+    }
+
+    /// Returns the next source CID sequence number we would issue for the
+    /// provided path ID. Path ID 0 reports the legacy space's next sequence
+    /// number.
+    pub fn mp_next_scid_seq(&self, path_id: u64) -> u64 {
+        if path_id == 0 {
+            return self.next_scid_seq;
+        }
+
+        self.mp_pools
+            .get(&path_id)
+            .map(|p| p.next_scid_seq)
+            .unwrap_or(0)
+    }
+
+    /// Finds the multipath path ID owning one of our source Connection IDs
+    /// having the provided value, if any. SCIDs from the legacy pool belong
+    /// to path ID 0.
+    pub fn mp_find_scid_path_id(&self, cid: &ConnectionId) -> Option<u64> {
+        if self.scids.iter().any(|e| e.cid == *cid) {
+            return Some(0);
+        }
+
+        self.mp_pools.iter().find_map(|(path_id, p)| {
+            if p.scids.iter().any(|e| e.cid == *cid) {
+                Some(*path_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Returns an iterator over the non-zero path IDs that have a
+    /// connection ID pool.
+    pub fn mp_pools_path_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.mp_pools.keys().copied()
+    }
+
+    /// Adds or removes the (path ID, sequence number) pair from the set of
+    /// source Connection IDs that need to be advertised to the peer through
+    /// PATH_NEW_CONNECTION_ID frames.
+    pub fn mp_mark_advertise_new_scid(
+        &mut self, path_id: u64, seq: u64, advertise: bool,
+    ) {
+        if advertise {
+            self.mp_advertise_new_scid_seqs.push_back((path_id, seq));
+        } else if let Some(index) = self
+            .mp_advertise_new_scid_seqs
+            .iter()
+            .position(|e| *e == (path_id, seq))
+        {
+            self.mp_advertise_new_scid_seqs.remove(index);
+        }
+    }
+
+    /// Gets a (path ID, sequence number) pair requiring advertising it to
+    /// the peer through a PATH_NEW_CONNECTION_ID frame, if any.
+    ///
+    /// If `Some`, it always returns the same value until it has been removed
+    /// using `mp_mark_advertise_new_scid`.
+    pub fn mp_next_advertise_new_scid(&self) -> Option<(u64, u64)> {
+        self.mp_advertise_new_scid_seqs.front().copied()
+    }
+
+    /// Returns true if there are per-path source Connection IDs to
+    /// advertise.
+    pub fn mp_has_new_scids(&self) -> bool {
+        !self.mp_advertise_new_scid_seqs.is_empty()
+    }
+
+    /// Adds or removes the (path ID, sequence number) pair from the set of
+    /// retired destination Connection IDs that need to be advertised to the
+    /// peer through PATH_RETIRE_CONNECTION_ID frames.
+    pub fn mp_mark_retire_dcid(
+        &mut self, path_id: u64, seq: u64, retire: bool,
+    ) -> Result<()> {
+        if retire {
+            self.mp_retire_dcid_seqs.insert((path_id, seq));
+        } else {
+            self.mp_retire_dcid_seqs.remove(&(path_id, seq));
+        }
+
+        Ok(())
+    }
+
+    /// Returns a copy of the set of (path ID, sequence number) pairs to send
+    /// PATH_RETIRE_CONNECTION_ID frames for.
+    ///
+    /// Note that the set includes pairs at the time the copy was created. To
+    /// account for newly inserted or removed pairs, a new copy needs to be
+    /// created.
+    pub fn mp_retire_dcid_seqs(&self) -> HashSet<(u64, u64)> {
+        self.mp_retire_dcid_seqs.clone()
+    }
+
+    /// Returns true if there are retired per-path destination Connection IDs
+    /// to advertise.
+    pub fn mp_has_retire_dcids(&self) -> bool {
+        !self.mp_retire_dcid_seqs.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1085,5 +1610,502 @@ mod tests {
 
         assert_eq!(ids.pop_retired_scid(), Some(scid2));
         assert_eq!(ids.pop_retired_scid(), None);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_scid_per_path_seq_spaces() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Path 1 and path 2 have independent, 0-based sequence spaces.
+        let (c10, rt10) = create_cid_and_reset_token(16);
+        let (c11, rt11) = create_cid_and_reset_token(16);
+        let (c20, rt20) = create_cid_and_reset_token(16);
+
+        assert_eq!(ids.mp_new_scid(1, c10.clone(), rt10), Ok(0));
+        assert_eq!(ids.mp_new_scid(1, c11.clone(), rt11), Ok(1));
+        assert_eq!(ids.mp_new_scid(2, c20.clone(), rt20), Ok(0));
+
+        assert_eq!(ids.mp_next_scid_seq(1), 2);
+        assert_eq!(ids.mp_next_scid_seq(2), 1);
+        assert_eq!(ids.mp_next_scid_seq(0), 1);
+
+        assert_eq!(ids.mp_get_scid(1, 0).unwrap().cid, c10);
+        assert_eq!(ids.mp_get_scid(1, 1).unwrap().cid, c11);
+        assert_eq!(ids.mp_get_scid(2, 0).unwrap().cid, c20);
+        assert_eq!(ids.mp_get_scid(2, 1).err(), Some(Error::InvalidState));
+
+        // Pools exist for paths 1 and 2 only; path 0 uses the legacy space.
+        let pids: Vec<u64> = ids.mp_pools_path_ids().collect();
+        assert_eq!(pids, vec![1, 2]);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_scid_path_zero_delegation() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Issue via the legacy API, observe through the multipath one.
+        let (scid2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.new_scid(scid2.clone(), Some(rt2), true, None, false),
+            Ok(1)
+        );
+        assert_eq!(ids.mp_get_scid(0, 1).unwrap().cid, scid2);
+
+        // Issue via the multipath API for path 0, observe through legacy.
+        let (scid3, rt3) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(0, scid3.clone(), rt3), Ok(2));
+        assert_eq!(ids.get_scid(2).unwrap().cid, scid3);
+        assert_eq!(ids.mp_next_scid_seq(0), 3);
+        assert_eq!(ids.next_scid_seq, 3);
+
+        // Path-0 issuance goes through the legacy advertise queue, not the
+        // multipath one.
+        assert_eq!(ids.next_advertise_new_scid_seq(), Some(1));
+        assert_eq!(ids.mp_next_advertise_new_scid(), None);
+
+        // Path 0 never creates a pool.
+        assert_eq!(ids.mp_pools_path_ids().count(), 0);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_scid_global_duplicate_rejected() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid.clone(), None, Some(0));
+
+        // Reusing the initial (path 0) SCID bytes on another path is invalid.
+        assert_eq!(
+            ids.mp_new_scid(1, scid.clone(), 42),
+            Err(Error::InvalidState)
+        );
+
+        // Reusing the initial DCID bytes is also invalid.
+        assert_eq!(
+            ids.mp_new_scid(1, dcid.clone(), 43),
+            Err(Error::InvalidState)
+        );
+
+        // Same bytes on path 1 then path 2.
+        let (ca, rta) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, ca.clone(), rta), Ok(0));
+        assert_eq!(
+            ids.mp_new_scid(2, ca.clone(), rta),
+            Err(Error::InvalidState)
+        );
+        // Even on the same path.
+        assert_eq!(
+            ids.mp_new_scid(1, ca.clone(), rta),
+            Err(Error::InvalidState)
+        );
+
+        // Bytes already used by a per-path DCID are rejected too.
+        let (dx, rtx) = create_cid_and_reset_token(16);
+        let mut retired = Vec::new();
+        assert_eq!(
+            ids.mp_new_dcid(1, dx.clone(), 0, rtx, 0, &mut retired),
+            Ok(())
+        );
+        assert_eq!(ids.mp_new_scid(2, dx, 44), Err(Error::InvalidState));
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_scid_per_path_limit() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // The active CID limit applies per path, not summed across paths.
+        for path_id in 1..=2 {
+            for seq in 0..3 {
+                let (c, rt) = create_cid_and_reset_token(16);
+                assert_eq!(ids.mp_new_scid(path_id, c, rt), Ok(seq));
+            }
+            let (c, rt) = create_cid_and_reset_token(16);
+            assert_eq!(ids.mp_new_scid(path_id, c, rt), Err(Error::IdLimit));
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_per_path() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        let (d1, rt1) = create_cid_and_reset_token(16);
+
+        assert_eq!(
+            ids.mp_new_dcid(1, d0.clone(), 0, rt0, 0, &mut retired),
+            Ok(())
+        );
+        assert!(retired.is_empty());
+        assert_eq!(ids.mp_get_dcid(1, 0).unwrap().cid, d0);
+
+        assert_eq!(
+            ids.mp_new_dcid(1, d1.clone(), 1, rt1, 0, &mut retired),
+            Ok(())
+        );
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+
+        // Exceeding the per-path destination CID limit (2) errors.
+        let (d2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_dcid(1, d2, 2, rt2, 0, &mut retired),
+            Err(Error::IdLimit)
+        );
+
+        // Retire Prior To drains entries below it on that path only.
+        let (d3, rt3) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d3, 3, rt3, 1, &mut retired), Ok(()));
+        assert_eq!(retired, vec![(1, 0)]);
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+        assert!(ids.mp_has_retire_dcids());
+        assert!(ids.mp_retire_dcid_seqs().contains(&(1, 0)));
+
+        // Path 2 has its own independent space and limit.
+        retired.clear();
+        let (e0, ert0) = create_cid_and_reset_token(16);
+        let (e1, ert1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(2, e0, 0, ert0, 0, &mut retired), Ok(()));
+        assert_eq!(ids.mp_new_dcid(2, e1, 1, ert1, 0, &mut retired), Ok(()));
+        assert!(retired.is_empty());
+        assert_eq!(ids.mp_pools[&2].dcids.len(), 2);
+
+        // Path 0 delegates to the legacy pool.
+        let (f1, frt1) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_dcid(0, f1.clone(), 1, frt1, 0, &mut retired),
+            Ok(())
+        );
+        assert_eq!(ids.get_dcid(1).unwrap().cid, f1);
+        assert_eq!(ids.dcids.len(), 2);
+
+        // Path 0 retirement is reported with path_id 0 and goes through the
+        // legacy retire queue.
+        let (f2, frt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(0, f2, 2, frt2, 1, &mut retired), Ok(()));
+        assert_eq!(retired, vec![(0, 0)]);
+        assert!(ids.has_retire_dcids());
+        assert!(ids.retire_dcid_seqs().contains(&0));
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_mismatch_and_invalid_rpt() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_dcid(1, d0.clone(), 0, rt0, 0, &mut retired),
+            Ok(())
+        );
+
+        // Exact duplicate is tolerated.
+        assert_eq!(
+            ids.mp_new_dcid(1, d0.clone(), 0, rt0, 0, &mut retired),
+            Ok(())
+        );
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 1);
+
+        // Same CID with a different sequence number.
+        assert_eq!(
+            ids.mp_new_dcid(1, d0.clone(), 1, rt0, 0, &mut retired),
+            Err(Error::InvalidFrame)
+        );
+
+        // Same sequence number with a different CID.
+        let (dx, rtx) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_dcid(1, dx.clone(), 0, rtx, 0, &mut retired),
+            Err(Error::InvalidFrame)
+        );
+
+        // Same CID and seq with a different reset token.
+        assert_eq!(
+            ids.mp_new_dcid(
+                1,
+                d0.clone(),
+                0,
+                rt0.wrapping_add(1),
+                0,
+                &mut retired
+            ),
+            Err(Error::InvalidFrame)
+        );
+
+        // Retire Prior To greater than the sequence number.
+        let (dy, rty) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.mp_new_dcid(1, dy, 9, rty, 10, &mut retired),
+            Err(Error::InvalidFrame)
+        );
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_reordered_per_path() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Skip DCID #1 (e.g due to packet loss) and insert DCID #2.
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 2, rt, 1, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 1);
+
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 3, rt, 2, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 4, rt, 3, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+
+        // Insert DCID #1 (e.g due to packet reordering): it is below the
+        // path's Retire Prior To, so it is immediately queued for retirement.
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 1, rt, 0, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+        assert!(ids.mp_retire_dcid_seqs().contains(&(1, 1)));
+
+        // Try inserting DCID #1 again (e.g. due to retransmission).
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 1, rt, 0, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_new_dcid_partial_retire_prior_to_per_path() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        for seq in 0..5 {
+            let (d, rt) = create_cid_and_reset_token(16);
+            assert!(ids.mp_new_dcid(1, d, seq, rt, 0, &mut retired).is_ok());
+        }
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 5);
+
+        // Retire a DCID from the middle of the list.
+        assert!(ids.mp_retire_dcid(1, 3).is_ok());
+
+        // Retire prior to the DCID that was just retired; the drain point
+        // must be meaningful even if the sequence is absent from the list.
+        let (d, rt) = create_cid_and_reset_token(16);
+        assert!(ids.mp_new_dcid(1, d, 5, rt, 3, &mut retired).is_ok());
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 2);
+        assert_eq!(retired, vec![(1, 0), (1, 1), (1, 2)]);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_lowest_available_dcid_seq_per_path() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // No pool yet.
+        assert_eq!(ids.mp_lowest_available_dcid_seq(1), None);
+
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        let (d1, rt1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d0, 0, rt0, 0, &mut retired), Ok(()));
+        assert_eq!(ids.mp_new_dcid(1, d1, 1, rt1, 0, &mut retired), Ok(()));
+
+        assert_eq!(ids.mp_lowest_available_dcid_seq(1), Some(0));
+
+        // Linking a DCID to a live 4-tuple (slab path) makes it unavailable.
+        assert_eq!(ids.mp_link_dcid_to_path_id(1, 0, 4), Ok(()));
+        assert_eq!(ids.mp_lowest_available_dcid_seq(1), Some(1));
+
+        assert_eq!(ids.mp_link_dcid_to_path_id(1, 1, 5), Ok(()));
+        assert_eq!(ids.mp_lowest_available_dcid_seq(1), None);
+
+        // Path 0 delegates to the legacy accessor.
+        assert_eq!(
+            ids.mp_lowest_available_dcid_seq(0),
+            ids.lowest_available_dcid_seq()
+        );
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_retire_dcid_round_trip() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired = Vec::new();
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        let (d0, rt0) = create_cid_and_reset_token(16);
+        let (d1, rt1) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_dcid(1, d0, 0, rt0, 0, &mut retired), Ok(()));
+        assert_eq!(ids.mp_new_dcid(1, d1, 1, rt1, 0, &mut retired), Ok(()));
+
+        // Retiring a non-existing sequence number fails.
+        assert_eq!(ids.mp_retire_dcid(1, 7), Err(Error::InvalidState));
+
+        // Retiring an existing one removes it and queues the retirement.
+        assert_eq!(ids.mp_retire_dcid(1, 0), Ok(None));
+        assert_eq!(ids.mp_pools[&1].dcids.len(), 1);
+        assert!(ids.mp_has_retire_dcids());
+        assert!(ids.mp_retire_dcid_seqs().contains(&(1, 0)));
+
+        // Fake RETIRE frame emission.
+        assert_eq!(ids.mp_mark_retire_dcid(1, 0, false), Ok(()));
+        assert!(!ids.mp_has_retire_dcids());
+
+        // Retiring the last DCID of the path fails.
+        assert_eq!(ids.mp_retire_dcid(1, 1), Err(Error::OutOfIdentifiers));
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_retire_scid_round_trip() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        let (c0, rt0) = create_cid_and_reset_token(16);
+        let (c1, rt1) = create_cid_and_reset_token(16);
+        let (c2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, c0.clone(), rt0), Ok(0));
+        assert_eq!(ids.mp_new_scid(1, c1.clone(), rt1), Ok(1));
+        assert_eq!(ids.mp_new_scid(1, c2.clone(), rt2), Ok(2));
+
+        // Sequence numbers we never issued on that path are invalid.
+        assert_eq!(ids.mp_retire_scid(1, 5, &c1), Err(Error::InvalidState));
+        // Path 1 issued seq 0..2, but path 2 issued nothing.
+        assert_eq!(ids.mp_retire_scid(2, 0, &c1), Err(Error::InvalidState));
+
+        // A packet cannot retire the CID it arrived on.
+        assert_eq!(ids.mp_retire_scid(1, 0, &c0), Err(Error::InvalidState));
+
+        // Valid retirement returns the retired CID and notifies the app.
+        assert_eq!(ids.mp_retire_scid(1, 1, &c2), Ok(Some(c1.clone())));
+        assert_eq!(ids.pop_retired_scid(), Some(c1));
+        assert_eq!(ids.pop_retired_scid(), None);
+
+        // Path 0 delegates to the legacy logic.
+        let (s2, srt2) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.new_scid(s2.clone(), Some(srt2), true, None, false),
+            Ok(1)
+        );
+        assert_eq!(ids.mp_retire_scid(0, 0, &s2), Ok(Some(scid.clone())));
+        assert_eq!(ids.pop_retired_scid(), Some(scid));
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_find_scid_path_id_resolves_pools() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        // Legacy-pool SCIDs belong to path 0.
+        assert_eq!(ids.mp_find_scid_path_id(&scid), Some(0));
+
+        let (s2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(
+            ids.new_scid(s2.clone(), Some(rt2), true, None, false),
+            Ok(1)
+        );
+        assert_eq!(ids.mp_find_scid_path_id(&s2), Some(0));
+
+        let (c1, rt1) = create_cid_and_reset_token(16);
+        let (c2, crt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, c1.clone(), rt1), Ok(0));
+        assert_eq!(ids.mp_new_scid(2, c2.clone(), crt2), Ok(0));
+        assert_eq!(ids.mp_find_scid_path_id(&c1), Some(1));
+        assert_eq!(ids.mp_find_scid_path_id(&c2), Some(2));
+
+        let (unknown, _) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_find_scid_path_id(&unknown), None);
+    }
+
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn mp_advertise_queue_drain() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut ids = ConnectionIdentifiers::new(2, &scid, 0, None);
+        ids.set_source_conn_id_limit(3);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        assert_eq!(ids.mp_next_advertise_new_scid(), None);
+
+        let (c1, rt1) = create_cid_and_reset_token(16);
+        let (c2, rt2) = create_cid_and_reset_token(16);
+        assert_eq!(ids.mp_new_scid(1, c1, rt1), Ok(0));
+        assert_eq!(ids.mp_new_scid(2, c2, rt2), Ok(0));
+
+        // Issued SCIDs are queued for PATH_NEW_CONNECTION_ID advertisement.
+        assert_eq!(ids.mp_next_advertise_new_scid(), Some((1, 0)));
+
+        // Fake the frame being sent.
+        ids.mp_mark_advertise_new_scid(1, 0, false);
+        assert_eq!(ids.mp_next_advertise_new_scid(), Some((2, 0)));
+
+        // A lost frame can be re-queued.
+        ids.mp_mark_advertise_new_scid(1, 0, true);
+        ids.mp_mark_advertise_new_scid(2, 0, false);
+        assert_eq!(ids.mp_next_advertise_new_scid(), Some((1, 0)));
+
+        ids.mp_mark_advertise_new_scid(1, 0, false);
+        assert_eq!(ids.mp_next_advertise_new_scid(), None);
     }
 }
