@@ -7209,8 +7209,6 @@ impl<F: BufFactory> Connection<F> {
             // multipath extension. Value 0 means "multipath enabled but no
             // extra paths allowed initially". The AEAD nonce construction
             // switches to PPN (per-path packet number) once negotiated.
-            // The old guard `local_max > 0 && peer_max > 0` was wrong — it
-            // incorrectly required both sides to advertise > 0.
             if let (Some(local_max), Some(peer_max)) = (
                 self.local_transport_params.initial_max_path_id,
                 peer_params.initial_max_path_id,

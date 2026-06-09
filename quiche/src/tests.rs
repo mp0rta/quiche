@@ -13621,11 +13621,14 @@ fn multipath_negotiation_asymmetric_zero_and_nonzero() {
 /// runs with the remembered params — this must NOT latch multipath_enabled=true
 /// because the live handshake's server TP will have initial_max_path_id=None.
 #[cfg(feature = "multipath")]
-#[cfg(not(feature = "openssl"))] // session tickets not available with openssl/quictls
 #[test]
 fn multipath_session_resumption_does_not_remember_max_path_id() {
     #[cfg(not(feature = "openssl"))]
     const SESSION_TICKET_KEY: [u8; 48] = [0xab; 48];
+
+    // 80-byte key (AES 256), as in `handshake_resumption`.
+    #[cfg(feature = "openssl")]
+    const SESSION_TICKET_KEY: [u8; 80] = [0xab; 80];
 
     // First connection: both sides enable multipath (initial_max_path_id=2).
     let mut config = test_utils::Pipe::default_config("cubic").unwrap();
