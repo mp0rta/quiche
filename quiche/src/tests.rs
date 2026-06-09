@@ -13688,3 +13688,344 @@ fn multipath_session_resumption_does_not_remember_max_path_id() {
     assert_eq!(pipe.server.stream_recv(0, &mut buf), Ok((5, false)));
     assert_eq!(&buf[..5], b"world");
 }
+
+// ----- draft-ietf-quic-multipath-21 §4.4/§4.5 receive handler tests -----
+
+/// Builds a multipath-negotiated pipe where both sides advertise the
+/// provided initial_max_path_id and a comfortable connection ID limit.
+#[cfg(feature = "multipath")]
+fn mp_cid_pipe(initial_max_path_id: u32) -> test_utils::Pipe {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(initial_max_path_id);
+    config.set_active_connection_id_limit(5);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    pipe.handshake().unwrap();
+    pipe
+}
+
+/// Injects the provided frames from the client to the server over path 0.
+#[cfg(feature = "multipath")]
+fn mp_inject_to_server(
+    pipe: &mut test_utils::Pipe, frames: &[frame::Frame],
+) -> Result<usize> {
+    let mut buf = [0u8; 65535];
+    let len =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, frames, &mut buf)
+            .unwrap();
+    pipe.server_recv(&mut buf[..len])
+}
+
+/// §4.4: a received PATH_NEW_CONNECTION_ID stores the CID in the per-path
+/// DCID pool. The path itself does not need to exist yet: receiving CIDs
+/// for a within-limit path ID ahead of path creation is normal (§3.1).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_new_cid_lands_in_path_pool() {
+    let mut pipe = mp_cid_pipe(4);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathNewConnectionId {
+        path_id: 1,
+        seq_num: 0,
+        retire_prior_to: 0,
+        conn_id: cid.to_vec(),
+        reset_token,
+    }])
+    .unwrap();
+
+    let e = pipe.server.ids.mp_get_dcid(1, 0).unwrap();
+    assert_eq!(e.cid, cid);
+    assert_eq!(e.reset_token, Some(reset_token));
+    assert_eq!(pipe.server.ids.mp_lowest_available_dcid_seq(1), Some(0));
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §4.4: receiving a PATH_NEW_CONNECTION_ID with a path ID greater than
+/// the limit the receiver advertised is a connection error of type
+/// PROTOCOL_VIOLATION (0xa).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_new_cid_beyond_local_max_path_id_is_protocol_violation() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathNewConnectionId {
+            path_id: 3, // greater than the server's advertised limit (2).
+            seq_num: 0,
+            retire_prior_to: 0,
+            conn_id: cid.to_vec(),
+            reset_token,
+        }]);
+    assert!(res.is_err());
+
+    // The CID must not have been stored.
+    assert!(pipe.server.ids.mp_get_dcid(3, 0).is_err());
+
+    // The server closes with PROTOCOL_VIOLATION and the client sees it.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+    assert_eq!(
+        pipe.client.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.4: Retire Prior To only affects the path the frame refers to; other
+/// paths' pools must be left untouched.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_new_cid_retire_prior_to_is_per_path() {
+    let mut pipe = mp_cid_pipe(4);
+
+    let (cid_a, tok_a) = test_utils::create_cid_and_reset_token(16);
+    let (cid_b, tok_b) = test_utils::create_cid_and_reset_token(16);
+    let (cid_c, tok_c) = test_utils::create_cid_and_reset_token(16);
+
+    mp_inject_to_server(&mut pipe, &[
+        frame::Frame::PathNewConnectionId {
+            path_id: 1,
+            seq_num: 0,
+            retire_prior_to: 0,
+            conn_id: cid_a.to_vec(),
+            reset_token: tok_a,
+        },
+        frame::Frame::PathNewConnectionId {
+            path_id: 1,
+            seq_num: 1,
+            retire_prior_to: 0,
+            conn_id: cid_b.to_vec(),
+            reset_token: tok_b,
+        },
+        frame::Frame::PathNewConnectionId {
+            path_id: 2,
+            seq_num: 0,
+            retire_prior_to: 0,
+            conn_id: cid_c.to_vec(),
+            reset_token: tok_c,
+        },
+    ])
+    .unwrap();
+
+    // Path 1 seq 2 with Retire Prior To 2 retires path 1's seqs 0 and 1.
+    let (cid_d, tok_d) = test_utils::create_cid_and_reset_token(16);
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathNewConnectionId {
+        path_id: 1,
+        seq_num: 2,
+        retire_prior_to: 2,
+        conn_id: cid_d.to_vec(),
+        reset_token: tok_d,
+    }])
+    .unwrap();
+
+    assert!(pipe.server.ids.mp_get_dcid(1, 0).is_err());
+    assert!(pipe.server.ids.mp_get_dcid(1, 1).is_err());
+    assert_eq!(pipe.server.ids.mp_get_dcid(1, 2).unwrap().cid, cid_d);
+    assert_eq!(pipe.server.ids.mp_lowest_available_dcid_seq(1), Some(2));
+
+    // The retired sequence numbers are queued for later
+    // PATH_RETIRE_CONNECTION_ID emission (sending is Task 1.3).
+    let retire = pipe.server.ids.mp_retire_dcid_seqs();
+    assert!(retire.contains(&(1, 0)));
+    assert!(retire.contains(&(1, 1)));
+
+    // Path 2's pool is untouched.
+    assert_eq!(pipe.server.ids.mp_get_dcid(2, 0).unwrap().cid, cid_c);
+    assert_eq!(pipe.server.ids.mp_lowest_available_dcid_seq(2), Some(0));
+    assert!(!retire.contains(&(2, 0)));
+
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §4.5: a received PATH_RETIRE_CONNECTION_ID retires our per-path SCID,
+/// surfaces it to the application like the legacy frame does, and queues a
+/// replacement advertisement for that path (emission is Task 1.3).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_retires_scid_and_queues_replacement() {
+    let mut pipe = mp_cid_pipe(4);
+
+    // Issue two SCIDs for path 1 and drain the advertise queue, as if they
+    // had already been sent to the peer.
+    let (cid0, tok0) = test_utils::create_cid_and_reset_token(16);
+    let (cid1, tok1) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.ids.mp_new_scid(1, cid0.clone(), tok0), Ok(0));
+    assert_eq!(pipe.server.ids.mp_new_scid(1, cid1.clone(), tok1), Ok(1));
+    pipe.server.ids.mp_mark_advertise_new_scid(1, 0, false);
+    pipe.server.ids.mp_mark_advertise_new_scid(1, 1, false);
+    assert_eq!(pipe.server.ids.mp_next_advertise_new_scid(), None);
+
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+        path_id: 1,
+        seq_num: 0,
+    }])
+    .unwrap();
+
+    // The retired SCID is surfaced to the application like legacy.
+    assert_eq!(pipe.server.retired_scid_next(), Some(cid0));
+    assert_eq!(pipe.server.retired_scid_next(), None);
+
+    // A replacement SCID was issued for path 1 and queued for
+    // advertisement through a PATH_NEW_CONNECTION_ID frame.
+    assert_eq!(pipe.server.ids.mp_next_advertise_new_scid(), Some((1, 2)));
+    assert_eq!(pipe.server.ids.mp_next_scid_seq(1), 3);
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// §4.5 (RFC 9000 §19.16 applied per path): a PATH_RETIRE_CONNECTION_ID
+/// with a sequence number we never issued on that path is a connection
+/// error of type PROTOCOL_VIOLATION (0xa).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_unissued_seq_is_protocol_violation() {
+    let mut pipe = mp_cid_pipe(4);
+
+    let (cid0, tok0) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.ids.mp_new_scid(1, cid0, tok0), Ok(0));
+
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+            path_id: 1,
+            seq_num: 3, // we only issued seq 0 on path 1.
+        }]);
+    assert!(res.is_err());
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.5 (RFC 9000 §19.16 applied per path): a PATH_RETIRE_CONNECTION_ID
+/// naming the CID used as DCID by the carrying packet is a connection
+/// error of type PROTOCOL_VIOLATION (0xa).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_retire_cid_of_carrying_packet_is_protocol_violation() {
+    let mut pipe = mp_cid_pipe(4);
+
+    // The client's packets to the server carry the server's SCID seq 0 as
+    // DCID. Asking the server to retire it from within such a packet must
+    // be rejected.
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+            path_id: 0,
+            seq_num: 0,
+        }]);
+    assert!(res.is_err());
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.4/§4.5: path ID 0 frames operate on the very same sequence number
+/// space as the legacy NEW_CONNECTION_ID / RETIRE_CONNECTION_ID frames.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path0_frames_share_legacy_cid_space() {
+    let mut pipe = mp_cid_pipe(4);
+
+    // Mix one legacy NEW_CONNECTION_ID and one path-0
+    // PATH_NEW_CONNECTION_ID: both must land in the single legacy DCID
+    // space, with coherent sequence numbers.
+    let (cid1, tok1) = test_utils::create_cid_and_reset_token(16);
+    let (cid2, tok2) = test_utils::create_cid_and_reset_token(16);
+    mp_inject_to_server(&mut pipe, &[
+        frame::Frame::NewConnectionId {
+            seq_num: 1,
+            retire_prior_to: 0,
+            conn_id: cid1.to_vec(),
+            reset_token: tok1.to_be_bytes(),
+        },
+        frame::Frame::PathNewConnectionId {
+            path_id: 0,
+            seq_num: 2,
+            retire_prior_to: 0,
+            conn_id: cid2.to_vec(),
+            reset_token: tok2,
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(pipe.server.ids.get_dcid(1).unwrap().cid, cid1);
+    assert_eq!(pipe.server.ids.get_dcid(2).unwrap().cid, cid2);
+
+    // The path-0 view is the legacy view.
+    assert_eq!(pipe.server.ids.mp_get_dcid(0, 1).unwrap().cid, cid1);
+    assert_eq!(pipe.server.ids.mp_get_dcid(0, 2).unwrap().cid, cid2);
+    assert_eq!(
+        pipe.server.ids.mp_lowest_available_dcid_seq(0),
+        pipe.server.ids.lowest_available_dcid_seq()
+    );
+
+    // PATH_RETIRE_CONNECTION_ID(0, seq) retires an SCID issued through the
+    // legacy API.
+    let (scid, stok) = test_utils::create_cid_and_reset_token(16);
+    let seq = pipe.server.new_scid(&scid, stok, false).unwrap();
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathRetireConnectionId {
+        path_id: 0,
+        seq_num: seq,
+    }])
+    .unwrap();
+
+    assert_eq!(pipe.server.retired_scid_next(), Some(scid));
+    assert_eq!(pipe.server.local_error(), None);
+}
+
+/// Until Task 2.2 lands real abandoned-path tracking, no path ID is
+/// considered abandoned and CID frames for within-limit path IDs are
+/// processed normally.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_no_path_id_is_abandoned_yet() {
+    let pipe = mp_cid_pipe(4);
+
+    assert!(!pipe.server.paths.is_abandoned_path_id(0));
+    assert!(!pipe.server.paths.is_abandoned_path_id(1));
+    assert!(!pipe.server.paths.is_abandoned_path_id(4));
+}
+
+/// PATH_NEW_CONNECTION_ID / PATH_RETIRE_CONNECTION_ID received on a
+/// connection where multipath was not negotiated are invalid.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_cid_frames_without_negotiation_are_invalid() {
+    // No initial_max_path_id advertised: multipath is not negotiated.
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathNewConnectionId {
+            path_id: 0,
+            seq_num: 1,
+            retire_prior_to: 0,
+            conn_id: cid.to_vec(),
+            reset_token,
+        }]);
+    assert_eq!(res, Err(Error::InvalidFrame));
+}

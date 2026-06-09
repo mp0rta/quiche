@@ -815,6 +815,16 @@ impl PathMap {
         self.paths.get(path_id).ok_or(Error::InvalidState)
     }
 
+    /// Returns true if the provided multipath path ID refers to an
+    /// abandoned path. Frames referring to abandoned path IDs are silently
+    /// ignored (draft-ietf-quic-multipath-21 §4.4/§4.5).
+    #[cfg(feature = "multipath")]
+    pub fn is_abandoned_path_id(&self, _path_id: u64) -> bool {
+        // Task 2.2 populates this with real abandoned-path tracking; until
+        // then, no path ID is ever considered abandoned.
+        false
+    }
+
     /// Gets a mutable reference to the path identified by `path_id`. If the
     /// provided `path_id` does not identify any current `Path`, returns an
     /// [`InvalidState`].

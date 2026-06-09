@@ -7531,6 +7531,93 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    /// Processes a new destination Connection ID for the legacy (path ID 0)
+    /// sequence number space, as received in a NEW_CONNECTION_ID or path-0
+    /// PATH_NEW_CONNECTION_ID frame, reassigning the DCID of any (4-tuple)
+    /// path that was using a sequence number retired by the Retire Prior To
+    /// field.
+    fn process_new_dcid_frame(
+        &mut self, conn_id: ConnectionId<'static>, seq_num: u64,
+        reset_token: u128, retire_prior_to: u64,
+    ) -> Result<()> {
+        let mut retired_path_ids = SmallVec::new();
+
+        // Retire pending path IDs before propagating the error code to
+        // make sure retired connection IDs are not in use anymore.
+        let new_dcid_res = self.ids.new_dcid(
+            conn_id,
+            seq_num,
+            reset_token,
+            retire_prior_to,
+            &mut retired_path_ids,
+        );
+
+        for (dcid_seq, pid) in retired_path_ids {
+            let path = self.paths.get_mut(pid)?;
+
+            // Maybe the path already switched to another DCID.
+            if path.active_dcid_seq != Some(dcid_seq) {
+                continue;
+            }
+
+            if let Some(new_dcid_seq) = self.ids.lowest_available_dcid_seq() {
+                path.active_dcid_seq = Some(new_dcid_seq);
+
+                self.ids.link_dcid_to_path_id(new_dcid_seq, pid)?;
+
+                trace!(
+                    "{} path ID {} changed DCID: old seq num {} new seq num {}",
+                    self.trace_id,
+                    pid,
+                    dcid_seq,
+                    new_dcid_seq,
+                );
+            } else {
+                // We cannot use this path anymore for now.
+                path.active_dcid_seq = None;
+
+                trace!(
+                    "{} path ID {} cannot be used; DCID seq num {} has been retired",
+                    self.trace_id, pid, dcid_seq,
+                );
+            }
+        }
+
+        new_dcid_res
+    }
+
+    /// Issues a replacement source Connection ID for the provided multipath
+    /// path ID and queues it for advertisement to the peer through a
+    /// PATH_NEW_CONNECTION_ID frame.
+    ///
+    /// A randomly generated CID may collide with an existing one; such
+    /// collisions are retried a few times. On persistent failure no
+    /// replacement is issued, as supplying one is only a SHOULD
+    /// (RFC 9000 §5.1.2).
+    #[cfg(feature = "multipath")]
+    fn mp_replenish_scid(&mut self, path_id: u64, cid_len: usize) {
+        for _ in 0..3 {
+            let mut cid = vec![0u8; cid_len];
+            rand::rand_bytes(&mut cid);
+
+            let mut reset_token = [0u8; 16];
+            rand::rand_bytes(&mut reset_token);
+
+            match self.ids.mp_new_scid(
+                path_id,
+                ConnectionId::from(cid),
+                u128::from_be_bytes(reset_token),
+            ) {
+                // Random collision with a CID already in use; retry.
+                Err(Error::InvalidState) => continue,
+
+                // Issued (and queued for advertisement), or the pool
+                // cannot take a new CID right now.
+                _ => return,
+            }
+        }
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -7974,50 +8061,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                let mut retired_path_ids = SmallVec::new();
-
-                // Retire pending path IDs before propagating the error code to
-                // make sure retired connection IDs are not in use anymore.
-                let new_dcid_res = self.ids.new_dcid(
+                self.process_new_dcid_frame(
                     conn_id.into(),
                     seq_num,
                     u128::from_be_bytes(reset_token),
                     retire_prior_to,
-                    &mut retired_path_ids,
-                );
-
-                for (dcid_seq, pid) in retired_path_ids {
-                    let path = self.paths.get_mut(pid)?;
-
-                    // Maybe the path already switched to another DCID.
-                    if path.active_dcid_seq != Some(dcid_seq) {
-                        continue;
-                    }
-
-                    if let Some(new_dcid_seq) =
-                        self.ids.lowest_available_dcid_seq()
-                    {
-                        path.active_dcid_seq = Some(new_dcid_seq);
-
-                        self.ids.link_dcid_to_path_id(new_dcid_seq, pid)?;
-
-                        trace!(
-                            "{} path ID {} changed DCID: old seq num {} new seq num {}",
-                            self.trace_id, pid, dcid_seq, new_dcid_seq,
-                        );
-                    } else {
-                        // We cannot use this path anymore for now.
-                        path.active_dcid_seq = None;
-
-                        trace!(
-                            "{} path ID {} cannot be used; DCID seq num {} has been retired",
-                            self.trace_id, pid, dcid_seq,
-                        );
-                    }
-                }
-
-                // Propagate error (if any) now...
-                new_dcid_res?;
+                )?;
             },
 
             frame::Frame::RetireConnectionId { seq_num } => {
@@ -8342,16 +8391,64 @@ impl<F: BufFactory> Connection<F> {
             },
 
             #[cfg(feature = "multipath")]
-            frame::Frame::PathNewConnectionId { path_id, .. } => {
+            frame::Frame::PathNewConnectionId {
+                path_id,
+                seq_num,
+                retire_prior_to,
+                conn_id,
+                reset_token,
+            } => {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
-                // TODO: Handle path-specific connection ID management.
-                trace!(
-                    "{} PATH_NEW_CONNECTION_ID path_id={}",
-                    self.trace_id,
-                    path_id,
-                );
+
+                if self.ids.zero_length_dcid() {
+                    return Err(Error::InvalidState);
+                }
+
+                // §4.4: receiving a path ID greater than the limit we
+                // advertised is a connection error of type
+                // PROTOCOL_VIOLATION.
+                if path_id > self.paths.local_max_path_id {
+                    return Err(Error::InvalidState);
+                }
+
+                // Frames referring to an abandoned path ID are silently
+                // ignored. Task 2.2 populates the abandoned-path tracking.
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
+                if path_id == 0 {
+                    // Path ID 0 operates on the very same sequence number
+                    // space as legacy NEW_CONNECTION_ID frames (§4.4).
+                    self.process_new_dcid_frame(
+                        conn_id.into(),
+                        seq_num,
+                        reset_token,
+                        retire_prior_to,
+                    )?;
+                } else {
+                    // The CID may refer to a path that does not exist yet;
+                    // the per-path pool is created on demand (§3.1).
+                    let mut retired_dcids = Vec::new();
+
+                    // Sequence numbers retired by the Retire Prior To field
+                    // are queued for PATH_RETIRE_CONNECTION_ID emission by
+                    // `mp_new_dcid()` itself (sending is Task 1.3).
+                    // Per-path pools are not linked to (4-tuple) paths yet
+                    // (`create_path()` still draws from the legacy pool),
+                    // so there is no in-use DCID to reassign here; Task 2.x
+                    // wires that together with path management.
+                    self.ids.mp_new_dcid(
+                        path_id,
+                        conn_id.into(),
+                        seq_num,
+                        reset_token,
+                        retire_prior_to,
+                        &mut retired_dcids,
+                    )?;
+                }
             },
 
             #[cfg(feature = "multipath")]
@@ -8359,13 +8456,48 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
-                // TODO: Handle path-specific connection ID retirement.
-                trace!(
-                    "{} PATH_RETIRE_CONNECTION_ID path_id={} seq={}",
-                    self.trace_id,
-                    path_id,
-                    seq_num,
-                );
+
+                if self.ids.zero_length_scid() {
+                    return Err(Error::InvalidState);
+                }
+
+                // §4.5: receiving a path ID greater than the limit we
+                // advertised is a connection error of type
+                // PROTOCOL_VIOLATION.
+                if path_id > self.paths.local_max_path_id {
+                    return Err(Error::InvalidState);
+                }
+
+                // Frames referring to an abandoned path ID are silently
+                // ignored. Task 2.2 populates the abandoned-path tracking.
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
+                if path_id == 0 {
+                    // Path ID 0 operates on the very same sequence number
+                    // space as legacy RETIRE_CONNECTION_ID frames (§4.5).
+                    if let Some(pid) = self.ids.retire_scid(seq_num, &hdr.dcid)? {
+                        let path = self.paths.get_mut(pid)?;
+
+                        // Maybe we already linked a new SCID to that path.
+                        if path.active_scid_seq == Some(seq_num) {
+                            // XXX: We do not remove unused paths now, we
+                            // instead wait until we need to maintain more
+                            // paths than the host is willing to.
+                            path.active_scid_seq = None;
+                        }
+                    }
+                } else if let Some(retired_cid) =
+                    self.ids.mp_retire_scid(path_id, seq_num, &hdr.dcid)?
+                {
+                    // An endpoint SHOULD supply a new connection ID for the
+                    // path when the peer retires one (RFC 9000 §5.1.2,
+                    // applied per path). Issue a replacement SCID and queue
+                    // it for advertisement through a PATH_NEW_CONNECTION_ID
+                    // frame (sending is Task 1.3).
+                    self.mp_replenish_scid(path_id, retired_cid.len());
+                }
             },
 
             #[cfg(feature = "multipath")]
