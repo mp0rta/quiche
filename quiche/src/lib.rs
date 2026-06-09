@@ -7378,7 +7378,7 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// Marks the path for closing (mp_closing = true). At least one active
     /// path must remain; if this is the only active path, returns
-    /// [`Error::InvalidState`].
+    /// [`Error::LastActivePath`].
     ///
     /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
     /// negotiated, or [`Error::PathNotFound`] if no path with the given ID
@@ -8244,6 +8244,26 @@ impl<F: BufFactory> Connection<F> {
         new_dcid_res
     }
 
+    /// Returns true if multipath path 0 — the owner of the legacy
+    /// connection ID space (NEW_CONNECTION_ID / RETIRE_CONNECTION_ID
+    /// frames) — has been abandoned: either still in its post-abandon
+    /// retention window (mp_closing) or already torn down.
+    ///
+    /// Connection IDs of an abandoned path are implicitly retired and no
+    /// retirement frames are exchanged for them anymore
+    /// (draft-ietf-quic-multipath-21 §3.4).
+    #[cfg(feature = "multipath")]
+    pub(crate) fn mp_path_zero_abandoned(&self) -> bool {
+        if !self.multipath_enabled {
+            return false;
+        }
+
+        self.paths.is_abandoned_path_id(0) ||
+            self.paths
+                .iter()
+                .any(|(_, p)| p.path_id == 0 && (p.mp_closing || p.mp_closed))
+    }
+
     /// Applies the draft-ietf-quic-multipath-21 §4 generic rules to a
     /// received multipath frame that references `path_id`.
     ///
@@ -8711,6 +8731,20 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
+                // When multipath is negotiated, the legacy connection ID
+                // space belongs to path 0. Once path 0 is abandoned its
+                // connection IDs are implicitly retired
+                // (draft-ietf-quic-multipath-21 §3.4): a late legacy
+                // NEW_CONNECTION_ID is silently ignored here — the single
+                // suppression point — so that neither the CID (unusable:
+                // the path is gone) is stored nor fresh legacy
+                // RETIRE_CONNECTION_ID emissions are queued through its
+                // Retire Prior To field.
+                #[cfg(feature = "multipath")]
+                if self.mp_path_zero_abandoned() {
+                    return Ok(());
+                }
+
                 self.process_new_dcid_frame(
                     conn_id.into(),
                     seq_num,
@@ -8985,6 +9019,13 @@ impl<F: BufFactory> Connection<F> {
                         // its DCID pool, consume the path ID and echo a
                         // PATH_ABANDON.
                         self.ids.mp_retire_dcid_pool(path_id);
+
+                        // No path state exists, so no retention-window
+                        // finalization will ever run for this path ID:
+                        // free both halves of its connection ID pool
+                        // right away (the SCID half would otherwise leak).
+                        self.ids.mp_remove_path_pools(path_id);
+
                         self.paths.mark_abandoned_id(path_id);
 
                         if !self
@@ -9127,8 +9168,18 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
-                // Peer cannot open more paths beyond path_id. No local action
-                // required; just acknowledge receipt.
+
+                // §4.7: a Maximum Path Identifier higher than the local
+                // maximum value is a connection error of type
+                // PROTOCOL_VIOLATION (`Error::InvalidState` reaches the
+                // wire as 0xa).
+                if path_id > self.paths.local_max_path_id {
+                    return Err(Error::InvalidState);
+                }
+
+                // Peer cannot open more paths beyond path_id. The frame
+                // is informational (§4.7): no local action required; just
+                // acknowledge receipt.
                 trace!(
                     "{} PATHS_BLOCKED path_id={}",
                     self.trace_id,
@@ -9309,7 +9360,16 @@ impl<F: BufFactory> Connection<F> {
                     return Ok(());
                 }
 
-                // Peer cannot provide more path CIDs. Just acknowledge.
+                // §4.7: a Next Sequence Number higher than the sequence
+                // number of the connection ID we would issue next for
+                // this path is a connection error of type
+                // PROTOCOL_VIOLATION.
+                if seq_num > self.ids.mp_next_scid_seq(path_id) {
+                    return Err(Error::InvalidState);
+                }
+
+                // Peer cannot provide more path CIDs. The frame is
+                // informational (§4.7): just acknowledge.
                 trace!(
                     "{} PATH_CIDS_BLOCKED path_id={} seq={}",
                     self.trace_id,

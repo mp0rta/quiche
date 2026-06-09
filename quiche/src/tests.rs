@@ -16365,3 +16365,290 @@ fn multipath_create_path_self_limited_is_invalid_state() {
 
     assert_eq!(pipe.client.create_path(client_addr_3, server_addr), Ok(2));
 }
+
+// ----- draft-ietf-quic-multipath-21 §4.7 PATHS_BLOCKED / PATH_CIDS_BLOCKED
+// validation tests -----
+
+/// §4.7: a PATHS_BLOCKED Maximum Path Identifier higher than the local
+/// maximum value MUST be treated as a connection error of type
+/// PROTOCOL_VIOLATION.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_beyond_local_max_is_protocol_violation() {
+    let mut pipe = mp_cid_pipe(2);
+
+    let res = mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 3,
+    }]);
+    assert!(
+        res.is_err(),
+        "PATHS_BLOCKED above the local maximum path ID must be a \
+         connection error, got {res:?}"
+    );
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+    assert_eq!(
+        pipe.client.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4.7: a PATH_CIDS_BLOCKED Next Sequence Number higher than the
+/// sequence number of the next connection ID expected to be issued for
+/// the path MUST be treated as a connection error of type
+/// PROTOCOL_VIOLATION.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_cids_blocked_seq_beyond_next_issued_is_protocol_violation() {
+    // Nothing was issued for path ID 1 yet: the next sequence number to
+    // be issued is 0, so any higher value is invalid.
+    let mut pipe = mp_cid_pipe(2);
+
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathCidsBlocked {
+            path_id: 1,
+            seq_num: 1,
+        }]);
+    assert!(
+        res.is_err(),
+        "PATH_CIDS_BLOCKED with a Next Sequence Number beyond the next \
+         issued CID must be a connection error, got {res:?}"
+    );
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+    assert_eq!(
+        pipe.client.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+
+    // After one CID was issued for path ID 1, the next sequence number
+    // is 1: that value is valid, 2 is not.
+    let mut pipe = mp_pipe_with_per_path_cids(2, 2, &[1]);
+    assert_eq!(pipe.server.ids.mp_next_scid_seq(1), 1);
+
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathCidsBlocked {
+        path_id: 1,
+        seq_num: 1,
+    }])
+    .unwrap();
+    assert_eq!(pipe.server.local_error(), None);
+
+    let res =
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathCidsBlocked {
+            path_id: 1,
+            seq_num: 2,
+        }]);
+    assert!(res.is_err());
+}
+
+/// §4.7: PATHS_BLOCKED and PATH_CIDS_BLOCKED frames carrying valid
+/// values are informational: no error and no state change.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_blocked_frames_valid_values_are_informational() {
+    let mut pipe = mp_cid_pipe(2);
+
+    mp_inject_to_server(&mut pipe, &[
+        frame::Frame::PathsBlocked { path_id: 0 },
+        frame::Frame::PathsBlocked { path_id: 2 },
+        frame::Frame::PathCidsBlocked {
+            path_id: 1,
+            seq_num: 0,
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(pipe.server.local_error(), None);
+    assert_eq!(pipe.server.paths.local_max_path_id, 2);
+    assert_eq!(pipe.server.paths.peer_max_path_id, 2);
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(!pipe.server.is_closed());
+}
+
+/// §3.4: a legacy NEW_CONNECTION_ID frame arriving after path 0 was
+/// abandoned must be silently ignored: the legacy CID space belongs to
+/// path 0, whose connection IDs are implicitly retired, so no legacy
+/// RETIRE_CONNECTION_ID may be queued through its Retire Prior To field.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_legacy_new_cid_after_path_zero_abandon_is_ignored() {
+    let mut buf = [0; 65535];
+    let (mut pipe, _pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    // Abandon path 0 locally (path 1 remains active).
+    assert_eq!(pipe.client.close_path(0, 0), Ok(()));
+
+    // The server sends a legacy NEW_CONNECTION_ID with a rising Retire
+    // Prior To, which would normally queue legacy retirements.
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::NewConnectionId {
+            seq_num: 2,
+            retire_prior_to: 2,
+            conn_id: cid.to_vec(),
+            reset_token: reset_token.to_be_bytes(),
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    assert!(
+        !pipe.client.ids.has_retire_dcids(),
+        "no legacy RETIRE_CONNECTION_ID may be queued after path 0 was \
+         abandoned"
+    );
+    assert_eq!(pipe.client.local_error(), None);
+}
+
+/// §3.4: a lost legacy RETIRE_CONNECTION_ID frame is not re-queued once
+/// path 0 was abandoned, mirroring the PATH_RETIRE_CONNECTION_ID gate:
+/// connection IDs of an abandoned path are implicitly retired and no
+/// retirement frames are emitted for them.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_legacy_retire_cid_lost_not_requeued_after_path_zero_abandon() {
+    let mut buf = [0; 65535];
+    let (mut pipe, _pid, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // The server's legacy NEW_CONNECTION_ID with Retire Prior To 1 makes
+    // the client queue a legacy RETIRE_CONNECTION_ID for seq 0.
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::NewConnectionId {
+            seq_num: 1,
+            retire_prior_to: 1,
+            conn_id: cid.to_vec(),
+            reset_token: reset_token.to_be_bytes(),
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    // The client emits RETIRE_CONNECTION_ID on path 0; the flight is
+    // lost.
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr),
+        Some(server_addr),
+    )
+    .unwrap();
+    let mut found = false;
+    for (pkt, _) in &flight {
+        let mut inspect = pkt.clone();
+        if let Ok(frames) =
+            test_utils::decode_pkt(&mut pipe.server, &mut inspect)
+        {
+            found |= frames.iter().any(|f| {
+                matches!(f, frame::Frame::RetireConnectionId { seq_num: 0 })
+            });
+        }
+    }
+    assert!(found, "expected RETIRE_CONNECTION_ID in the lost flight");
+    drop(flight);
+    assert!(!pipe.client.ids.has_retire_dcids());
+
+    // Abandoning path 0 marks its unacked frames as lost, including the
+    // RETIRE_CONNECTION_ID. The lost-frame processing must NOT re-queue
+    // it (and so the next flights must not carry it): path 0's
+    // connection IDs are implicitly retired.
+    assert_eq!(pipe.client.close_path(0, 0), Ok(()));
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    for (pkt, _) in &flight {
+        let mut inspect = pkt.clone();
+        if let Ok(frames) =
+            test_utils::decode_pkt(&mut pipe.server, &mut inspect)
+        {
+            assert!(
+                !frames.iter().any(|f| matches!(
+                    f,
+                    frame::Frame::RetireConnectionId { .. }
+                )),
+                "a lost legacy RETIRE_CONNECTION_ID must not be re-queued \
+                 after path 0 was abandoned, got {frames:?}"
+            );
+        }
+    }
+    assert!(!pipe.client.ids.has_retire_dcids());
+}
+
+/// §3.4: abandoning a never-used path ID must free both halves of its
+/// connection ID pool (the DCIDs *and* the SCIDs), not just the DCIDs:
+/// no path state will ever go through the retention-window finalization
+/// that removes the pools of live paths.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_never_used_path_id_frees_both_cid_pools() {
+    let mut buf = [0; 65535];
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    // The client funded path ID 1 in both directions.
+    assert!(pipe.client.ids.mp_pools_path_ids().any(|id| id == 1));
+
+    // The server abandons path ID 1 before it ever carried traffic.
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        Type::Short,
+        &[frame::Frame::PathAbandon {
+            path_id: 1,
+            error_code: 0,
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    pipe.client_recv(&mut buf[..len]).unwrap();
+
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+    assert!(
+        !pipe.client.ids.mp_pools_path_ids().any(|id| id == 1),
+        "both CID pool halves of a never-used abandoned path ID must be \
+         freed"
+    );
+
+    // The PATH_ABANDON echo is still emitted (drop it: the injected
+    // packet is unknown to the server's recovery, so its ACK cannot be
+    // delivered), and the connection is unaffected.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(frames.iter().any(|f| matches!(
+        f,
+        frame::Frame::PathAbandon {
+            path_id: 1,
+            error_code: multipath::frames::PATH_ABANDON_NO_ERROR,
+        }
+    )));
+    assert_eq!(pipe.client.local_error(), None);
+    assert!(!pipe.client.is_closed());
+}

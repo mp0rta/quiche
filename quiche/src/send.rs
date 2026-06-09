@@ -48,6 +48,8 @@ impl<F: BufFactory> Connection<F> {
         let mut mp_retire_dcid_lost: SmallVec<[(u64, u64); 2]> =
             SmallVec::new();
         #[cfg(feature = "multipath")]
+        let mut legacy_retire_dcid_lost: SmallVec<[u64; 2]> = SmallVec::new();
+        #[cfg(feature = "multipath")]
         let mut mp_paths_blocked_lost = false;
         #[cfg(feature = "multipath")]
         let mut mp_cids_blocked_lost = false;
@@ -226,6 +228,16 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     frame::Frame::RetireConnectionId { seq_num } => {
+                        // Deferred below when multipath is enabled: the
+                        // legacy CID space belongs to path 0, which may
+                        // have been abandoned in the meantime, but
+                        // `self.paths` cannot be queried from inside this
+                        // loop. Mirrors the PATH_RETIRE_CONNECTION_ID
+                        // handling.
+                        #[cfg(feature = "multipath")]
+                        legacy_retire_dcid_lost.push(seq_num);
+
+                        #[cfg(not(feature = "multipath"))]
                         self.ids.mark_retire_dcid_seq(seq_num, true)?;
                     },
 
@@ -336,6 +348,19 @@ impl<F: BufFactory> Connection<F> {
             }
 
             self.ids.mp_mark_retire_dcid(mp_path_id, seq_num, true)?;
+        }
+        #[cfg(feature = "multipath")]
+        for seq_num in legacy_retire_dcid_lost {
+            // The legacy CID space belongs to path 0: once it is
+            // abandoned (or in its retention window) its connection IDs
+            // are implicitly retired and no legacy RETIRE_CONNECTION_ID
+            // is re-queued for them (draft-21 §3.4), mirroring the
+            // PATH_RETIRE_CONNECTION_ID gate above.
+            if self.mp_path_zero_abandoned() {
+                continue;
+            }
+
+            self.ids.mark_retire_dcid_seq(seq_num, true)?;
         }
 
         // Re-arm lost PATHS_BLOCKED / PATH_CIDS_BLOCKED frames only if the
