@@ -41,12 +41,39 @@
 //! ```
 //!
 //! where `(i)` denotes a variable-length integer.
+//!
+//! The capsule protocol operates at the HTTP semantic layer, above the
+//! HTTP/3 framing state machine in [`quiche::h3`]: capsules are opaque
+//! information carried in the payload of DATA frames. This module
+//! therefore lives in tokio-quiche rather than in the low-level `h3`
+//! module, and operates on plain byte slices so it can be used with any
+//! API that exposes the stream body bytes.
 
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 
-use super::Result;
+/// Errors raised when encoding or decoding capsules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CapsuleError {
+    /// The provided buffer is too short.
+    #[error("provided buffer is too short")]
+    BufferTooShort,
+
+    /// The capsule (or its CONNECT-IP payload) is malformed.
+    #[error("invalid capsule")]
+    InvalidCapsule,
+}
+
+impl From<octets::BufferTooShortError> for CapsuleError {
+    fn from(_: octets::BufferTooShortError) -> Self {
+        CapsuleError::BufferTooShort
+    }
+}
+
+/// A specialized [`Result`](std::result::Result) type for capsule
+/// operations.
+pub type Result<T> = std::result::Result<T, CapsuleError>;
 
 /// RFC 9297 Section 3.2: DATAGRAM capsule type.
 pub const DATAGRAM_CAPSULE: u64 = 0x00;
@@ -278,7 +305,7 @@ impl CapsuleParser {
                     // Check if the buffer is unreasonably large (a varint
                     // is at most 8 bytes).
                     if self.hdr_buf.len() > 8 {
-                        return Err(crate::h3::Error::FrameError);
+                        return Err(CapsuleError::InvalidCapsule);
                     }
                     continue;
                 },
@@ -512,13 +539,13 @@ pub fn decode_address_request(data: &[u8]) -> Result<Vec<AddressEntry>> {
 
     // RFC 9484 §4.7.2: zero Requested Addresses MUST abort stream.
     if entries.is_empty() {
-        return Err(crate::h3::Error::FrameError);
+        return Err(CapsuleError::InvalidCapsule);
     }
 
     // RFC 9484 §4.7.2: Request IDs MUST NOT be zero.
     for entry in &entries {
         if entry.request_id == 0 {
-            return Err(crate::h3::Error::FrameError);
+            return Err(CapsuleError::InvalidCapsule);
         }
     }
 
@@ -572,7 +599,7 @@ fn decode_address_entries(data: &[u8]) -> Result<Vec<AddressEntry>> {
                 IpAddr::V6(Ipv6Addr::from(octets))
             },
 
-            _ => return Err(crate::h3::Error::FrameError),
+            _ => return Err(CapsuleError::InvalidCapsule),
         };
 
         let prefix_length = b.get_u8()?;
@@ -583,12 +610,12 @@ fn decode_address_entries(data: &[u8]) -> Result<Vec<AddressEntry>> {
             IpAddr::V6(_) => 128,
         };
         if prefix_length > max_prefix {
-            return Err(crate::h3::Error::FrameError);
+            return Err(CapsuleError::InvalidCapsule);
         }
 
         // RFC 9484 §4.7.1: lower bits not covered by prefix MUST be zero.
         if !validate_prefix_lower_bits(&ip_prefix, prefix_length) {
-            return Err(crate::h3::Error::FrameError);
+            return Err(CapsuleError::InvalidCapsule);
         }
 
         entries.push(AddressEntry {
@@ -614,7 +641,7 @@ pub fn encode_route_advertisement(
         match (&entry.start_ip, &entry.end_ip) {
             (IpAddr::V4(_), IpAddr::V4(_)) => {},
             (IpAddr::V6(_), IpAddr::V6(_)) => {},
-            _ => return Err(crate::h3::Error::FrameError),
+            _ => return Err(CapsuleError::InvalidCapsule),
         }
     }
 
@@ -649,7 +676,7 @@ fn encode_route_entry(
         },
 
         // Mismatched IP versions are caught in encode_route_advertisement.
-        _ => return Err(crate::h3::Error::FrameError),
+        _ => return Err(CapsuleError::InvalidCapsule),
     }
 
     b.put_u8(entry.ip_protocol)?;
@@ -736,14 +763,14 @@ pub fn decode_route_advertisement(data: &[u8]) -> Result<Vec<RouteEntry>> {
                 )
             },
 
-            _ => return Err(crate::h3::Error::FrameError),
+            _ => return Err(CapsuleError::InvalidCapsule),
         };
 
         let ip_protocol = b.get_u8()?;
 
         // RFC 9484 §4.7.3: Start IP Address MUST be <= End IP Address.
         if !ip_addr_le(&start_ip, &end_ip) {
-            return Err(crate::h3::Error::FrameError);
+            return Err(CapsuleError::InvalidCapsule);
         }
 
         entries.push(RouteEntry {
@@ -761,18 +788,18 @@ pub fn decode_route_advertisement(data: &[u8]) -> Result<Vec<RouteEntry>> {
         let b_ver = ip_version(&b.start_ip);
 
         if a_ver > b_ver {
-            return Err(crate::h3::Error::FrameError);
+            return Err(CapsuleError::InvalidCapsule);
         }
 
         if a_ver == b_ver {
             if a.ip_protocol > b.ip_protocol {
-                return Err(crate::h3::Error::FrameError);
+                return Err(CapsuleError::InvalidCapsule);
             }
 
             if a.ip_protocol == b.ip_protocol &&
                 !ip_addr_lt(&a.end_ip, &b.start_ip)
             {
-                return Err(crate::h3::Error::FrameError);
+                return Err(CapsuleError::InvalidCapsule);
             }
         }
     }
@@ -1453,7 +1480,7 @@ mod tests {
         let value_start = r.off();
         assert_eq!(
             decode_address_assign(&buf[value_start..value_start + vlen]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1500,7 +1527,7 @@ mod tests {
         let value_start = r.off();
         assert_eq!(
             decode_address_assign(&buf[value_start..value_start + vlen]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1541,7 +1568,7 @@ mod tests {
 
         assert_eq!(
             decode_address_request(&raw),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1550,7 +1577,7 @@ mod tests {
         // Empty ADDRESS_REQUEST (zero entries)
         assert_eq!(
             decode_address_request(&[]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1581,7 +1608,7 @@ mod tests {
         let off = b.off();
         assert_eq!(
             decode_route_advertisement(&buf[..off]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1632,7 +1659,7 @@ mod tests {
         let off = b.off();
         assert_eq!(
             decode_route_advertisement(&buf[..off]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1654,7 +1681,7 @@ mod tests {
         let off = b.off();
         assert_eq!(
             decode_route_advertisement(&buf[..off]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1676,7 +1703,7 @@ mod tests {
         let off = b.off();
         assert_eq!(
             decode_route_advertisement(&buf[..off]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 
@@ -1737,7 +1764,7 @@ mod tests {
         let off = b.off();
         assert_eq!(
             decode_route_advertisement(&buf[..off]),
-            Err(crate::h3::Error::FrameError)
+            Err(CapsuleError::InvalidCapsule)
         );
     }
 

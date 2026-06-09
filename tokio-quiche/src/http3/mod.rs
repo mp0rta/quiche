@@ -26,6 +26,10 @@
 
 //! HTTP/3 integrations for tokio-quiche.
 
+/// HTTP Capsule Protocol (RFC 9297) and CONNECT-IP capsule types (RFC
+/// 9484). Capsules are HTTP-semantic-level payloads carried opaquely in
+/// DATA frames, so they are handled here rather than in `quiche::h3`.
+pub mod capsule;
 /// An [`ApplicationOverQuic`](crate::ApplicationOverQuic) to build clients
 /// and servers on top of.
 pub mod driver;
