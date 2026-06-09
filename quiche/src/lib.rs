@@ -1310,6 +1310,20 @@ pub enum TxBufferTrackingState {
     Inconsistent,
 }
 
+/// Disposition of a received multipath frame that references a path ID,
+/// per the draft-ietf-quic-multipath-21 §4 generic frame rules.
+#[cfg(feature = "multipath")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MpFrameDisposition {
+    /// The path ID is within the announced limit and still active:
+    /// process the frame.
+    Process,
+
+    /// The path ID cannot be processed anymore (e.g. the path has been
+    /// abandoned): the frame must be silently ignored.
+    SilentlyIgnore,
+}
+
 /// A QUIC connection.
 pub struct Connection<F = DefaultBufFactory>
 where
@@ -8114,6 +8128,30 @@ impl<F: BufFactory> Connection<F> {
         new_dcid_res
     }
 
+    /// Applies the draft-ietf-quic-multipath-21 §4 generic rules to a
+    /// received multipath frame that references `path_id`.
+    ///
+    /// A path ID greater than the limit we advertised (through the
+    /// `initial_max_path_id` transport parameter, or a later MAX_PATH_ID
+    /// frame) is a connection error of type PROTOCOL_VIOLATION
+    /// (`Error::InvalidState` reaches the wire as 0xa). A path ID that
+    /// cannot be processed anymore (e.g. because the path has been
+    /// abandoned) means the frame must be silently ignored.
+    #[cfg(feature = "multipath")]
+    fn mp_frame_path_id_disposition(
+        &self, path_id: u64,
+    ) -> Result<MpFrameDisposition> {
+        if path_id > self.paths.local_max_path_id {
+            return Err(Error::InvalidState);
+        }
+
+        if self.paths.is_abandoned_path_id(path_id) {
+            return Ok(MpFrameDisposition::SilentlyIgnore);
+        }
+
+        Ok(MpFrameDisposition::Process)
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -8668,9 +8706,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
-                // §3.4.3/§4: PATH_ACK frames received with an abandoned
-                // path ID are silently ignored.
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §3.4.3/§4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; PATH_ACK frames received with an
+                // abandoned path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -8770,17 +8811,14 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
-                // §4: receiving a path ID greater than the limit we
-                // advertised is a connection error of type
-                // PROTOCOL_VIOLATION.
-                if path_id > self.paths.local_max_path_id {
-                    return Err(Error::InvalidState);
-                }
-
-                // §4: frames referring to an already-consumed path ID are
-                // silently ignored (e.g. a duplicate PATH_ABANDON received
-                // after the path state was deleted).
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an
+                // already-consumed path ID are silently ignored (e.g. a
+                // duplicate PATH_ABANDON received after the path state
+                // was deleted).
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -8853,9 +8891,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
-                // §4: frames referring to an abandoned path ID are
-                // silently ignored.
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an abandoned
+                // path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -8893,9 +8934,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidFrame);
                 }
 
-                // §4: frames referring to an abandoned path ID are
-                // silently ignored.
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an abandoned
+                // path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -8972,16 +9016,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // §4.4: receiving a path ID greater than the limit we
-                // advertised is a connection error of type
-                // PROTOCOL_VIOLATION.
-                if path_id > self.paths.local_max_path_id {
-                    return Err(Error::InvalidState);
-                }
-
-                // §4: frames referring to an abandoned path ID are silently
-                // ignored.
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §4/§4.4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an abandoned
+                // path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -9081,16 +9121,12 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // §4.5: receiving a path ID greater than the limit we
-                // advertised is a connection error of type
-                // PROTOCOL_VIOLATION.
-                if path_id > self.paths.local_max_path_id {
-                    return Err(Error::InvalidState);
-                }
-
-                // §4: frames referring to an abandoned path ID are silently
-                // ignored.
-                if self.paths.is_abandoned_path_id(path_id) {
+                // §4/§4.5: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an abandoned
+                // path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
                     return Ok(());
                 }
 
@@ -9127,6 +9163,16 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
+
+                // §4: a path ID beyond the announced limit is a
+                // PROTOCOL_VIOLATION; frames referring to an abandoned
+                // path ID are silently ignored.
+                if self.mp_frame_path_id_disposition(path_id)? ==
+                    MpFrameDisposition::SilentlyIgnore
+                {
+                    return Ok(());
+                }
+
                 // Peer cannot provide more path CIDs. Just acknowledge.
                 trace!(
                     "{} PATH_CIDS_BLOCKED path_id={} seq={}",

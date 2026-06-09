@@ -466,6 +466,25 @@ impl Frame {
 
             // All frames are allowed on 0-RTT and 1-RTT packets.
             (packet::Type::Short, _) => true,
+
+            // Multipath frames MUST only be sent in 1-RTT packets
+            // (draft-ietf-quic-multipath-21 §4). The resulting
+            // `Error::InvalidPacket` reaches the wire as
+            // PROTOCOL_VIOLATION (0xa), as required.
+            #[cfg(feature = "multipath")]
+            (
+                packet::Type::ZeroRTT,
+                Frame::PathAck { .. } |
+                Frame::PathAbandon { .. } |
+                Frame::PathStatusAvailable { .. } |
+                Frame::PathStatusBackup { .. } |
+                Frame::MaxPathId { .. } |
+                Frame::PathsBlocked { .. } |
+                Frame::PathNewConnectionId { .. } |
+                Frame::PathRetireConnectionId { .. } |
+                Frame::PathCidsBlocked { .. },
+            ) => false,
+
             (packet::Type::ZeroRTT, _) => true,
 
             // All other cases are forbidden.
@@ -2568,5 +2587,81 @@ mod tests {
         };
 
         assert_eq!(frame_data, data);
+    }
+
+    /// draft-ietf-quic-multipath-21 §4: "All frames defined in this
+    /// document MUST only be sent in 1-RTT packets." Every multipath
+    /// frame must be admitted in Short packets only, and rejected in
+    /// Initial, Handshake and 0-RTT packets.
+    #[cfg(feature = "multipath")]
+    #[test]
+    fn multipath_frames_1rtt_only() {
+        let mut ranges = ranges::RangeSet::default();
+        ranges.insert(4..7);
+
+        let frames = [
+            Frame::PathAck {
+                path_id: 1,
+                ack_delay: 0,
+                ranges,
+                ecn_counts: None,
+            },
+            Frame::PathAbandon {
+                path_id: 1,
+                error_code: 0,
+            },
+            Frame::PathStatusAvailable {
+                path_id: 1,
+                seq_num: 0,
+            },
+            Frame::PathStatusBackup {
+                path_id: 1,
+                seq_num: 0,
+            },
+            Frame::PathNewConnectionId {
+                path_id: 1,
+                seq_num: 0,
+                retire_prior_to: 0,
+                conn_id: vec![0xba; 8],
+                reset_token: 0xb0b0,
+            },
+            Frame::PathRetireConnectionId {
+                path_id: 1,
+                seq_num: 0,
+            },
+            Frame::MaxPathId { path_id: 3 },
+            Frame::PathsBlocked { path_id: 3 },
+            Frame::PathCidsBlocked {
+                path_id: 1,
+                seq_num: 0,
+            },
+        ];
+
+        for frame in frames {
+            let mut d = [42; 128];
+
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap();
+
+            let mut b = octets::Octets::with_slice(&d);
+            assert_eq!(
+                Frame::from_bytes(&mut b, packet::Type::Short),
+                Ok(frame.clone()),
+                "{frame:?} must be admitted in 1-RTT packets"
+            );
+
+            for pkt_type in [
+                packet::Type::Initial,
+                packet::Type::Handshake,
+                packet::Type::ZeroRTT,
+            ] {
+                let mut b = octets::Octets::with_slice(&d);
+                assert_eq!(
+                    Frame::from_bytes(&mut b, pkt_type),
+                    Err(Error::InvalidPacket),
+                    "{frame:?} must be rejected in {pkt_type:?} packets"
+                );
+            }
+        }
     }
 }

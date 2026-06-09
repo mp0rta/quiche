@@ -15571,6 +15571,189 @@ fn multipath_abandon_silent_ignore_frames_for_abandoned_path_id() {
     assert!(!pipe.client.is_closed());
 }
 
+// ----- draft-ietf-quic-multipath-21 §4 generic frame rules -----
+
+/// §4: multipath frames MUST only be sent in 1-RTT packets. A multipath
+/// frame received in a Handshake packet closes the connection with
+/// PROTOCOL_VIOLATION (0xa) on the wire.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_frame_in_handshake_packet_is_protocol_violation() {
+    let mut buf = [0; 65535];
+
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(2);
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+
+    // Client sends its Initial flight; the server replies with its
+    // Initial + Handshake flight, after which both sides hold Handshake
+    // keys but the handshake is not complete.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    // Forge a Handshake packet carrying a multipath frame.
+    let frames = [frame::Frame::PathStatusAvailable {
+        path_id: 0,
+        seq_num: 1,
+    }];
+
+    let len = test_utils::encode_pkt(
+        &mut pipe.client,
+        Type::Handshake,
+        &frames,
+        &mut buf,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Err(Error::InvalidPacket));
+
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4: multipath frames MUST only be sent in 1-RTT packets; 0-RTT
+/// packets are explicitly not 1-RTT packets. A multipath frame received
+/// in a 0-RTT packet closes the connection with PROTOCOL_VIOLATION
+/// (0xa) on the wire.
+#[cfg(all(feature = "multipath", not(feature = "openssl")))] // 0-RTT not supported when using openssl/quictls
+#[test]
+fn multipath_frame_in_0rtt_packet_is_protocol_violation() {
+    let mut buf = [0; 65535];
+
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config
+        .set_application_protos(&[b"proto1", b"proto2"])
+        .unwrap();
+    config.set_initial_max_data(30);
+    config.set_initial_max_stream_data_bidi_local(15);
+    config.set_initial_max_stream_data_bidi_remote(15);
+    config.set_initial_max_streams_bidi(3);
+    config.set_initial_max_path_id(2);
+    config.enable_early_data();
+    config.verify_peer(false);
+
+    // Perform initial handshake to obtain a resumable session.
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let session = pipe.client.session().unwrap();
+
+    // Start a resumed connection and send the client Initial flight.
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.client.set_session(session), Ok(()));
+
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Ok(len));
+
+    // Forge a 0-RTT packet carrying a multipath frame.
+    let frames = [frame::Frame::PathStatusAvailable {
+        path_id: 0,
+        seq_num: 1,
+    }];
+
+    let len = test_utils::encode_pkt(
+        &mut pipe.client,
+        Type::ZeroRTT,
+        &frames,
+        &mut buf,
+    )
+    .unwrap();
+
+    assert_eq!(pipe.server_recv(&mut buf[..len]), Err(Error::InvalidPacket));
+
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// §4: receipt of a multipath frame with a path ID greater than the
+/// announced Maximum Paths value is a connection error of type
+/// PROTOCOL_VIOLATION, uniformly across every path-ID-bearing frame.
+/// (PATH_ABANDON, PATH_NEW_CONNECTION_ID and PATH_RETIRE_CONNECTION_ID
+/// are pinned by their own tests above.)
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_id_frames_beyond_local_max_are_protocol_violation() {
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(0..1);
+
+    let frames = [
+        frame::Frame::PathAck {
+            path_id: 3, // greater than the server's advertised limit (2).
+            ack_delay: 0,
+            ranges,
+            ecn_counts: None,
+        },
+        frame::Frame::PathStatusAvailable {
+            path_id: 3,
+            seq_num: 1,
+        },
+        frame::Frame::PathStatusBackup {
+            path_id: 3,
+            seq_num: 1,
+        },
+        frame::Frame::PathCidsBlocked {
+            path_id: 3,
+            seq_num: 0,
+        },
+    ];
+
+    for frame in frames {
+        let dbg = format!("{frame:?}");
+        let mut pipe = mp_cid_pipe(2);
+
+        let res = mp_inject_to_server(&mut pipe, &[frame]);
+        assert!(
+            res.is_err(),
+            "{dbg} beyond the local max path ID must be a connection \
+             error, got {res:?}"
+        );
+
+        // The server closes with PROTOCOL_VIOLATION and the client sees
+        // it.
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(
+            pipe.server.local_error(),
+            Some(&ConnectionError {
+                is_app: false,
+                error_code: WireErrorCode::ProtocolViolation as u64,
+                reason: vec![],
+            }),
+            "{dbg}"
+        );
+        assert_eq!(
+            pipe.client.peer_error(),
+            Some(&ConnectionError {
+                is_app: false,
+                error_code: WireErrorCode::ProtocolViolation as u64,
+                reason: vec![],
+            }),
+            "{dbg}"
+        );
+    }
+}
+
 /// Behavior 6 (§3.4): in-flight data on the abandoned path is evacuated
 /// at abandon time: unacked frames are rescheduled and retransmitted on
 /// the remaining paths.
