@@ -6,6 +6,11 @@ pub mod reinjection;
 pub(crate) mod frames;
 pub(crate) mod pktns;
 
+pub use frames::{
+    APPLICATION_ABANDON_PATH, NO_CID_AVAILABLE_FOR_PATH,
+    PATH_ABANDON_NO_ERROR, PATH_RESOURCE_LIMIT_REACHED, PATH_UNSTABLE_OR_POOR,
+};
+
 use std::time::Instant;
 
 use crate::path::PathMap;

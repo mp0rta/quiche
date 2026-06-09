@@ -26,6 +26,34 @@ pub const MAX_PATH_ID_TYPE: u64 = 0x3e7a;
 pub const PATHS_BLOCKED_TYPE: u64 = 0x3e7b;
 pub const PATH_CIDS_BLOCKED_TYPE: u64 = 0x3e7c;
 
+// PATH_ABANDON error code constants (draft-ietf-quic-multipath-21 §4.2.1)
+
+/// PATH_ABANDON error code: the path is abandoned without error.
+///
+/// Defined in draft-ietf-quic-multipath-21 §4.2.1.
+pub const PATH_ABANDON_NO_ERROR: u64 = 0x0;
+
+/// PATH_ABANDON error code: the path is abandoned at the application's request.
+///
+/// Defined in draft-ietf-quic-multipath-21 §4.2.1.
+pub const APPLICATION_ABANDON_PATH: u64 = 0x3e;
+
+/// PATH_ABANDON error code: cannot allocate sufficient resources to use the path.
+///
+/// Defined in draft-ietf-quic-multipath-21 §4.2.1.
+pub const PATH_RESOURCE_LIMIT_REACHED: u64 = 0x3e75;
+
+/// PATH_ABANDON error code: the path is abandoned due to an unstable interface
+/// or poor performance.
+///
+/// Defined in draft-ietf-quic-multipath-21 §4.2.1.
+pub const PATH_UNSTABLE_OR_POOR: u64 = 0x3e76;
+
+/// PATH_ABANDON error code: no connection ID is available for the path.
+///
+/// Defined in draft-ietf-quic-multipath-21 §4.2.1.
+pub const NO_CID_AVAILABLE_FOR_PATH: u64 = 0x3e77;
+
 /// Returns true if the given frame type is a multipath frame.
 pub fn is_multipath_frame_type(ty: u64) -> bool {
     matches!(
@@ -496,5 +524,83 @@ mod tests {
         let (path_id, seq_num) = parse_path_cids_blocked(&mut b).unwrap();
         assert_eq!(path_id, 4);
         assert_eq!(seq_num, 2);
+    }
+
+    // PATH_ABANDON error code round-trip tests (draft-ietf-quic-multipath-21 §4.2.1)
+
+    #[test]
+    fn path_abandon_no_error_roundtrip() {
+        let mut buf = [0u8; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut buf);
+        let len =
+            encode_path_abandon(&mut b, 0, PATH_ABANDON_NO_ERROR).unwrap();
+
+        let mut b = octets::Octets::with_slice(&buf[..len]);
+        let ty = b.get_varint().unwrap();
+        assert_eq!(ty, PATH_ABANDON_TYPE);
+        let (path_id, error_code) = parse_path_abandon(&mut b).unwrap();
+        assert_eq!(path_id, 0);
+        assert_eq!(error_code, PATH_ABANDON_NO_ERROR);
+    }
+
+    #[test]
+    fn path_abandon_application_abandon_roundtrip() {
+        let mut buf = [0u8; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut buf);
+        let len =
+            encode_path_abandon(&mut b, 1, APPLICATION_ABANDON_PATH).unwrap();
+
+        let mut b = octets::Octets::with_slice(&buf[..len]);
+        let ty = b.get_varint().unwrap();
+        assert_eq!(ty, PATH_ABANDON_TYPE);
+        let (path_id, error_code) = parse_path_abandon(&mut b).unwrap();
+        assert_eq!(path_id, 1);
+        assert_eq!(error_code, APPLICATION_ABANDON_PATH);
+    }
+
+    #[test]
+    fn path_abandon_resource_limit_roundtrip() {
+        let mut buf = [0u8; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut buf);
+        let len =
+            encode_path_abandon(&mut b, 2, PATH_RESOURCE_LIMIT_REACHED)
+                .unwrap();
+
+        let mut b = octets::Octets::with_slice(&buf[..len]);
+        let ty = b.get_varint().unwrap();
+        assert_eq!(ty, PATH_ABANDON_TYPE);
+        let (path_id, error_code) = parse_path_abandon(&mut b).unwrap();
+        assert_eq!(path_id, 2);
+        assert_eq!(error_code, PATH_RESOURCE_LIMIT_REACHED);
+    }
+
+    #[test]
+    fn path_abandon_unstable_or_poor_roundtrip() {
+        let mut buf = [0u8; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut buf);
+        let len =
+            encode_path_abandon(&mut b, 3, PATH_UNSTABLE_OR_POOR).unwrap();
+
+        let mut b = octets::Octets::with_slice(&buf[..len]);
+        let ty = b.get_varint().unwrap();
+        assert_eq!(ty, PATH_ABANDON_TYPE);
+        let (path_id, error_code) = parse_path_abandon(&mut b).unwrap();
+        assert_eq!(path_id, 3);
+        assert_eq!(error_code, PATH_UNSTABLE_OR_POOR);
+    }
+
+    #[test]
+    fn path_abandon_no_cid_available_roundtrip() {
+        let mut buf = [0u8; 64];
+        let mut b = octets::OctetsMut::with_slice(&mut buf);
+        let len =
+            encode_path_abandon(&mut b, 4, NO_CID_AVAILABLE_FOR_PATH).unwrap();
+
+        let mut b = octets::Octets::with_slice(&buf[..len]);
+        let ty = b.get_varint().unwrap();
+        assert_eq!(ty, PATH_ABANDON_TYPE);
+        let (path_id, error_code) = parse_path_abandon(&mut b).unwrap();
+        assert_eq!(path_id, 4);
+        assert_eq!(error_code, NO_CID_AVAILABLE_FOR_PATH);
     }
 }
