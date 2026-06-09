@@ -14417,3 +14417,310 @@ fn multipath_path_retire_cid_retransmit_on_loss() {
         "PATH_RETIRE_CONNECTION_ID should be retransmitted"
     );
 }
+
+// ----- draft-ietf-quic-multipath-21 §3.1/§3.1.2/§3.2.1 path opening tests
+// -----
+
+/// Builds a multipath-negotiated pipe and funds the per-path CID pools of
+/// the provided path IDs on BOTH endpoints (one CID each way per path ID),
+/// pumping the pipe so the PATH_NEW_CONNECTION_ID frames are processed.
+#[cfg(feature = "multipath")]
+fn mp_pipe_with_per_path_cids(
+    client_max_path_id: u32, server_max_path_id: u32, fund_path_ids: &[u64],
+) -> test_utils::Pipe {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(client_max_path_id);
+    client_config.set_active_connection_id_limit(4);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.set_initial_max_path_id(server_max_path_id);
+    server_config.set_active_connection_id_limit(4);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    for &path_id in fund_path_ids {
+        let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
+        assert_eq!(
+            pipe.client
+                .new_scid_on_path(path_id, &c_cid, c_reset_token, false),
+            Ok(0)
+        );
+
+        let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+        assert_eq!(
+            pipe.server
+                .new_scid_on_path(path_id, &s_cid, s_reset_token, false),
+            Ok(0)
+        );
+    }
+
+    // Exchange the PATH_NEW_CONNECTION_ID frames.
+    assert_eq!(pipe.advance(), Ok(()));
+
+    pipe
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_probe_path_consumes_per_path_cid() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // The per-path DCID pool of path ID 1 holds one CID with sequence 0.
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+
+    // The new client path consumed multipath path ID 1.
+    let pid = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_2, server_addr))
+        .unwrap();
+    let path = pipe.client.paths.get(pid).unwrap();
+    assert_eq!(path.path_id, 1);
+    assert_eq!(path.active_dcid_seq, Some(0));
+
+    // The wire packets for path 1 use the path-1 DCID, i.e. the SCID the
+    // server issued through PATH_NEW_CONNECTION_ID for path ID 1.
+    let expected_dcid = pipe.client.ids.mp_get_dcid(1, 0).unwrap().cid.clone();
+
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    for (pkt, si) in &flight {
+        assert_eq!(si.from, client_addr_2);
+
+        let mut pkt = pkt.clone();
+        let mut b = octets::OctetsMut::with_slice(&mut pkt);
+        let hdr = Header::from_bytes(&mut b, 16).unwrap();
+        assert_eq!(hdr.ty, packet::Type::Short);
+        assert_eq!(hdr.dcid, expected_dcid);
+    }
+
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // The server attributed the new 4-tuple to path ID 1 based on the CID.
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+    assert_eq!(pipe.server.paths.get(spid).unwrap().path_id, 1);
+
+    // Complete the PATH_CHALLENGE/PATH_RESPONSE exchange.
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.client.paths.get(pid).map(|p| p.validated()), Ok(true));
+    assert_eq!(pipe.server.paths.get(spid).map(|p| p.validated()), Ok(true));
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_probe_path_consumes_path_ids_lowest_first() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1, 2]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+    assert_eq!(pipe.client.probe_path(client_addr_3, server_addr), Ok(0));
+
+    let pid_a = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_2, server_addr))
+        .unwrap();
+    let pid_b = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_3, server_addr))
+        .unwrap();
+
+    // Lowest-first, no holes: path IDs 1 then 2.
+    assert_eq!(pipe.client.paths.get(pid_a).unwrap().path_id, 1);
+    assert_eq!(pipe.client.paths.get(pid_b).unwrap().path_id, 2);
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_probe_path_no_cid_sends_path_cids_blocked() {
+    // Path IDs are available (limit is 4) but no per-path CID pool was
+    // funded: opening a path must fail and advertise PATH_CIDS_BLOCKED.
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.probe_path(client_addr_2, server_addr),
+        Err(Error::OutOfIdentifiers)
+    );
+
+    // No path was created.
+    assert_eq!(pipe.client.paths.len(), 1);
+
+    // The next client flight carries PATH_CIDS_BLOCKED(path ID 1, next
+    // sequence number 0: no CID was ever issued for that path ID).
+    let mut buf = [0; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathCidsBlocked {
+                path_id: 1,
+                seq_num: 0,
+            })),
+        "expected PATH_CIDS_BLOCKED in packet, got {frames:?}"
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_probe_path_exhausted_sends_paths_blocked() {
+    // The server only allows path ID 0: every usable path ID is consumed
+    // from the start, so probing must fail and advertise PATHS_BLOCKED
+    // with our current view of the peer's Maximum Path Identifier.
+    let mut pipe = mp_pipe_with_per_path_cids(4, 0, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.probe_path(client_addr_2, server_addr),
+        Err(Error::PathLimitExceeded)
+    );
+
+    // No path was created.
+    assert_eq!(pipe.client.paths.len(), 1);
+
+    let mut buf = [0; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathsBlocked { path_id: 0 })),
+        "expected PATHS_BLOCKED in packet, got {frames:?}"
+    );
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_active_path_cid_on_new_tuple_is_migration() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    // Establish and validate path 1.
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+    assert_eq!(pipe.server.paths.get(spid).unwrap().path_id, 1);
+    assert_eq!(pipe.server.paths.get(spid).unwrap().validated(), true);
+
+    let n_paths_before = pipe.server.paths.len();
+
+    // Elicit a fresh packet on path 1 (re-probe the existing path), then
+    // deliver it from a DIFFERENT client 4-tuple.
+    pipe.client.probe_path(client_addr_2, server_addr).unwrap();
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    for (mut pkt, si) in flight {
+        let info = RecvInfo {
+            to: si.to,
+            from: client_addr_3,
+        };
+        pipe.server.recv(&mut pkt, info).unwrap();
+    }
+
+    // No new path was created: path 1 migrated to the new 4-tuple.
+    assert_eq!(pipe.server.paths.len(), n_paths_before);
+
+    let mpid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_3))
+        .unwrap();
+    assert_eq!(mpid, spid);
+
+    let migrated = pipe.server.paths.get(mpid).unwrap();
+    assert_eq!(migrated.path_id, 1);
+    assert_eq!(migrated.peer_addr(), client_addr_3);
+
+    // The old 4-tuple is no longer attributed to any path.
+    assert!(pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .is_none());
+
+    // The new address is under (re)validation.
+    assert!(pipe.server.paths.get(mpid).unwrap().probing_required());
+}
+
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_unused_path_id_cid_on_new_tuple_opens_path() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr = test_utils::Pipe::client_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // Probing-only packet (PATH_CHALLENGE) on a new 4-tuple with a CID of
+    // the unused path ID 1.
+    assert_eq!(pipe.client.probe_path(client_addr_2, server_addr), Ok(0));
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // The path ID 1 is now open on the server.
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+    assert_eq!(pipe.server.paths.get(spid).unwrap().path_id, 1);
+
+    // Other paths are unaffected: path 0 remains the active path on its
+    // original 4-tuple.
+    let (active_pid, active) = pipe.server.paths.get_active_with_pid().unwrap();
+    assert_ne!(active_pid, spid);
+    assert_eq!(active.path_id, 0);
+    assert_eq!(active.local_addr(), server_addr);
+    assert_eq!(active.peer_addr(), client_addr);
+    assert!(active.active());
+}

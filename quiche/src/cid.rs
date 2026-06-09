@@ -1459,17 +1459,49 @@ impl ConnectionIdentifiers {
     /// having the provided value, if any. SCIDs from the legacy pool belong
     /// to path ID 0.
     pub fn mp_find_scid_path_id(&self, cid: &ConnectionId) -> Option<u64> {
-        if self.scids.iter().any(|e| e.cid == *cid) {
-            return Some(0);
+        self.mp_find_scid(cid).map(|(path_id, _)| path_id)
+    }
+
+    /// Finds one of our source Connection IDs having the provided value and
+    /// returns the multipath path ID owning it along with its sequence
+    /// number in that path's sequence number space, if any. SCIDs from the
+    /// legacy pool belong to path ID 0 (with their legacy sequence number).
+    pub fn mp_find_scid(&self, cid: &ConnectionId) -> Option<(u64, u64)> {
+        if let Some(e) = self.scids.iter().find(|e| e.cid == *cid) {
+            return Some((0, e.seq));
         }
 
         self.mp_pools.iter().find_map(|(path_id, p)| {
-            if p.scids.iter().any(|e| e.cid == *cid) {
-                Some(*path_id)
-            } else {
-                None
-            }
+            p.scids
+                .iter()
+                .find(|e| e.cid == *cid)
+                .map(|e| (*path_id, e.seq))
         })
+    }
+
+    /// Returns the sequence number of the next destination Connection ID we
+    /// expect the peer to issue for the provided non-zero path ID (the
+    /// "Next Sequence Number" of a PATH_CIDS_BLOCKED frame, §3.2.1).
+    ///
+    /// This is derived from the largest DCID sequence number seen on the
+    /// path's pool: 0 when no DCID was ever received for that path ID,
+    /// largest + 1 otherwise. One approximation: if the only DCID ever
+    /// received had sequence number 0 and was since retired, this reports 0
+    /// instead of 1; the value is informational, so this is harmless.
+    pub fn mp_next_expected_dcid_seq(&self, path_id: u64) -> u64 {
+        match self.mp_pools.get(&path_id) {
+            None => 0,
+
+            Some(p) =>
+                if p.dcids.len() == 0 &&
+                    p.largest_destination_seq == 0 &&
+                    p.largest_peer_retire_prior_to == 0
+                {
+                    0
+                } else {
+                    p.largest_destination_seq + 1
+                },
+        }
     }
 
     /// Returns an iterator over the non-zero path IDs that have a

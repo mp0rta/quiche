@@ -236,6 +236,14 @@ pub struct Path {
     #[cfg(feature = "multipath")]
     pub(crate) path_id: u64,
 
+    /// Whether this path's Connection IDs resolve from the per-path CID
+    /// pools of `path_id` (draft-ietf-quic-multipath-21 §3.1) rather than
+    /// from the legacy pools. Set for paths opened by consuming a per-path
+    /// CID; the initial path (path ID 0) and legacy flows keep using the
+    /// legacy pools.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_per_path_cids: bool,
+
     /// Application-level path status.
     #[cfg(feature = "multipath")]
     pub(crate) app_status: PathAppStatus,
@@ -361,6 +369,8 @@ impl Path {
             needs_ack_eliciting: false,
             #[cfg(feature = "multipath")]
             path_id: 0,
+            #[cfg(feature = "multipath")]
+            mp_per_path_cids: false,
             #[cfg(feature = "multipath")]
             app_status: PathAppStatus::Available,
             #[cfg(feature = "multipath")]
@@ -833,6 +843,27 @@ impl PathMap {
     #[inline]
     pub fn get_mut(&mut self, path_id: usize) -> Result<&mut Path> {
         self.paths.get_mut(path_id).ok_or(Error::InvalidState)
+    }
+
+    /// Moves the path identified by `pid` to the provided 4-tuple, keeping
+    /// the `Path` structure (and thus its packet number space) intact, and
+    /// notifies the application (draft-ietf-quic-multipath-21 §3.1.2).
+    #[cfg(feature = "multipath")]
+    pub(crate) fn on_mp_path_migrated(
+        &mut self, pid: usize, local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> Result<()> {
+        let path = self.paths.get_mut(pid).ok_or(Error::InvalidState)?;
+
+        let old_addrs = (path.local_addr, path.peer_addr);
+        path.local_addr = local_addr;
+        path.peer_addr = peer_addr;
+
+        self.addrs_to_paths.remove(&old_addrs);
+        self.addrs_to_paths.insert((local_addr, peer_addr), pid);
+
+        self.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
+
+        Ok(())
     }
 
     #[inline]

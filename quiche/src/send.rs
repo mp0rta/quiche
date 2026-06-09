@@ -44,6 +44,10 @@ impl<F: BufFactory> Connection<F> {
         let mut mp_abandon_lost: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
         let mut mp_status_lost: SmallVec<[u64; 2]> = SmallVec::new();
+        #[cfg(feature = "multipath")]
+        let mut mp_paths_blocked_lost = false;
+        #[cfg(feature = "multipath")]
+        let mut mp_cids_blocked_lost = false;
 
         for (_, p) in self.paths.iter_mut() {
             while let Some(lost) = p.recovery.next_lost_frame(epoch) {
@@ -173,6 +177,16 @@ impl<F: BufFactory> Connection<F> {
                         mp_status_lost.push(path_id);
                     },
 
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathsBlocked { .. } => {
+                        mp_paths_blocked_lost = true;
+                    },
+
+                    #[cfg(feature = "multipath")]
+                    frame::Frame::PathCidsBlocked { .. } => {
+                        mp_cids_blocked_lost = true;
+                    },
+
                     frame::Frame::MaxStreamData { stream_id, .. } => {
                         if self.streams.get(stream_id).is_some() {
                             self.streams.insert_almost_full(stream_id);
@@ -255,6 +269,33 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Re-arm lost PATHS_BLOCKED / PATH_CIDS_BLOCKED frames only if the
+        // blocking condition still holds (the frames are one-shot and carry
+        // a point-in-time value, so they are rebuilt from current state
+        // rather than retransmitted verbatim).
+        #[cfg(feature = "multipath")]
+        if mp_paths_blocked_lost || mp_cids_blocked_lost {
+            match self.mp_select_new_path_id() {
+                MpNewPathId::Exhausted
+                    if mp_paths_blocked_lost &&
+                        self.paths.peer_max_path_id <=
+                            self.paths.local_max_path_id =>
+                {
+                    self.mp_paths_blocked_pending =
+                        Some(self.paths.peer_max_path_id);
+                },
+
+                MpNewPathId::NoCid { path_id } if mp_cids_blocked_lost => {
+                    self.mp_path_cids_blocked_pending = Some((
+                        path_id,
+                        self.ids.mp_next_expected_dcid_seq(path_id),
+                    ));
+                },
+
+                _ => (),
+            }
+        }
+
         self.check_tx_buffered_invariant();
 
         let is_app_limited = self.delivery_rate_check_if_app_limited();
@@ -321,11 +362,34 @@ impl<F: BufFactory> Connection<F> {
 
         let dcid_seq = path.active_dcid_seq.ok_or(Error::OutOfIdentifiers)?;
 
+        // Paths opened by consuming a per-path CID (draft-21 §3.1) resolve
+        // their Connection IDs from their path ID's own pools; other paths
+        // keep resolving from the legacy pools.
+        #[cfg(feature = "multipath")]
+        let dcid = if path.mp_per_path_cids {
+            ConnectionId::from_ref(
+                self.ids.mp_get_dcid(path.path_id, dcid_seq)?.cid.as_ref(),
+            )
+        } else {
+            ConnectionId::from_ref(self.ids.get_dcid(dcid_seq)?.cid.as_ref())
+        };
+
+        #[cfg(not(feature = "multipath"))]
         let dcid =
             ConnectionId::from_ref(self.ids.get_dcid(dcid_seq)?.cid.as_ref());
 
         let scid = if let Some(scid_seq) = path.active_scid_seq {
-            ConnectionId::from_ref(self.ids.get_scid(scid_seq)?.cid.as_ref())
+            #[cfg(feature = "multipath")]
+            let scid_entry = if path.mp_per_path_cids {
+                self.ids.mp_get_scid(path.path_id, scid_seq)?
+            } else {
+                self.ids.get_scid(scid_seq)?
+            };
+
+            #[cfg(not(feature = "multipath"))]
+            let scid_entry = self.ids.get_scid(scid_seq)?;
+
+            ConnectionId::from_ref(scid_entry.cid.as_ref())
         } else if pkt_type == Type::Short {
             ConnectionId::default()
         } else {
@@ -595,6 +659,37 @@ impl<F: BufFactory> Connection<F> {
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.paths.get_mut(pid).unwrap().mp_path_status_pending =
                         false;
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Generate PATHS_BLOCKED / PATH_CIDS_BLOCKED frames if a path
+            // opening attempt was blocked (draft-ietf-quic-multipath-21,
+            // Section 3.2.1). One-shot: the pending flag is cleared once
+            // the frame is built, and re-armed on loss only if the
+            // blocking condition still holds.
+            if let Some(max_path_id) = self.mp_paths_blocked_pending {
+                let frame = frame::Frame::PathsBlocked {
+                    path_id: max_path_id,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.mp_paths_blocked_pending = None;
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            if let Some((mp_path_id, seq_num)) = self.mp_path_cids_blocked_pending
+            {
+                let frame = frame::Frame::PathCidsBlocked {
+                    path_id: mp_path_id,
+                    seq_num,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.mp_path_cids_blocked_pending = None;
                     ack_eliciting = true;
                     in_flight = true;
                 }
@@ -969,11 +1064,22 @@ impl<F: BufFactory> Connection<F> {
             for seq_num in retire_dcid_seqs {
                 // The sequence number specified in a RETIRE_CONNECTION_ID frame
                 // MUST NOT refer to the Destination Connection ID field of the
-                // packet in which the frame is contained.
-                let dcid_seq = path.active_dcid_seq.ok_or(Error::InvalidState)?;
+                // packet in which the frame is contained. Paths that consumed
+                // a per-path CID (draft-21 §3.1) carry a DCID from their path
+                // ID's own pool, which can never collide with a legacy
+                // sequence number.
+                #[cfg(feature = "multipath")]
+                let check_collision = !path.mp_per_path_cids;
+                #[cfg(not(feature = "multipath"))]
+                let check_collision = true;
 
-                if seq_num == dcid_seq {
-                    continue;
+                if check_collision {
+                    let dcid_seq =
+                        path.active_dcid_seq.ok_or(Error::InvalidState)?;
+
+                    if seq_num == dcid_seq {
+                        continue;
+                    }
                 }
 
                 let frame = frame::Frame::RetireConnectionId { seq_num };
@@ -997,12 +1103,17 @@ impl<F: BufFactory> Connection<F> {
                 for (mp_path_id, seq_num) in mp_retire_dcid_seqs {
                     // Like RETIRE_CONNECTION_ID, the sequence number MUST
                     // NOT refer to the Destination Connection ID of the
-                    // packet in which the frame is contained. Per-path
-                    // (non-zero) pools are not linked to (4-tuple) sending
-                    // paths yet (Task 2.x): packets are always sent with
-                    // path-0 DCIDs, so only path-0 pairs can collide with
-                    // the carrying packet's DCID.
-                    if mp_path_id == 0 {
+                    // packet in which the frame is contained. The carrying
+                    // packet's DCID comes from the sending path's pool: the
+                    // legacy pool (path ID 0), unless the path consumed a
+                    // per-path CID (draft-21 §3.1).
+                    let carrying_path_id = if path.mp_per_path_cids {
+                        path.path_id
+                    } else {
+                        0
+                    };
+
+                    if mp_path_id == carrying_path_id {
                         let dcid_seq =
                             path.active_dcid_seq.ok_or(Error::InvalidState)?;
 

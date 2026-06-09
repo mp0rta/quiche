@@ -1620,6 +1620,34 @@ where
     /// Consumed by send_on_path() when constructing PacketMeta.
     #[cfg(feature = "multipath")]
     pending_reinjection_path: Option<u64>,
+
+    /// Pending PATHS_BLOCKED frame carrying the peer's Maximum Path
+    /// Identifier we are blocked on (draft-ietf-quic-multipath-21 §3.2.1).
+    /// One-shot: cleared once the frame is built, re-armed on loss only if
+    /// the blocking condition still holds.
+    #[cfg(feature = "multipath")]
+    mp_paths_blocked_pending: Option<u64>,
+
+    /// Pending PATH_CIDS_BLOCKED frame as a (path ID, next expected DCID
+    /// sequence number) pair (draft-ietf-quic-multipath-21 §3.2.1). Same
+    /// one-shot semantics as `mp_paths_blocked_pending`.
+    #[cfg(feature = "multipath")]
+    mp_path_cids_blocked_pending: Option<(u64, u64)>,
+}
+
+/// Outcome of selecting the next multipath path ID to consume when opening
+/// a new path (draft-ietf-quic-multipath-21 §3.1/§3.2.1).
+#[cfg(feature = "multipath")]
+pub(crate) enum MpNewPathId {
+    /// An unused path ID with an unused Connection ID available in its
+    /// per-path DCID pool (carrying that CID's sequence number).
+    Usable { path_id: u64, dcid_seq: u64 },
+
+    /// The lowest unused path ID has no Connection ID available.
+    NoCid { path_id: u64 },
+
+    /// Every path ID up to the negotiated limit is in use or abandoned.
+    Exhausted,
 }
 
 /// Creates a new server-side connection.
@@ -2263,6 +2291,10 @@ impl<F: BufFactory> Connection<F> {
             stream_qos_hints: std::collections::HashMap::new(),
             #[cfg(feature = "multipath")]
             pending_reinjection_path: None,
+            #[cfg(feature = "multipath")]
+            mp_paths_blocked_pending: None,
+            #[cfg(feature = "multipath")]
+            mp_path_cids_blocked_pending: None,
         };
 
         if let Some(retry_cids) = retry_cids {
@@ -3474,15 +3506,36 @@ impl<F: BufFactory> Connection<F> {
                             .copy_from_slice(&snapshot);
                     }
 
-                    // Try candidate path_ids. The peer assigns them
-                    // sequentially, so try next_path_id first (the most
-                    // likely candidate for a new path).
-                    let candidate_pid = self.paths.next_path_id as u32;
+                    // Resolve the candidate path ID from the packet's DCID:
+                    // path attribution is CID-based (draft-21 §3.1.2). When
+                    // a live path already uses that path ID (migration),
+                    // decode the pn against that path's largest received
+                    // pn; for a new path the per-path pn starts at 0. CIDs
+                    // from the legacy (path-0) pool keep the next_path_id
+                    // heuristic for paths opened by the legacy
+                    // `create_path()` flow.
+                    let (candidate_pid, mp_largest_rx) =
+                        match self.ids.mp_find_scid_path_id(&hdr.dcid) {
+                            Some(mp_path_id) if mp_path_id > 0 => {
+                                let largest_rx = self
+                                    .paths
+                                    .iter()
+                                    .find(|(_, p)| p.path_id == mp_path_id)
+                                    .map(|(_, p)| {
+                                        p.app_pkt_num_space.largest_rx_pkt_num
+                                    })
+                                    .unwrap_or(0);
 
-                    // For a new path, the per-path pn starts at 0, so
-                    // decode with largest_rx = 0.
+                                (mp_path_id as u32, largest_rx)
+                            },
+
+                            _ => (self.paths.next_path_id as u32, 0),
+                        };
+
                     let mp_pn = packet::decode_pkt_num(
-                        0, hdr.pkt_num, hdr.pkt_num_len,
+                        mp_largest_rx,
+                        hdr.pkt_num,
+                        hdr.pkt_num_len,
                     );
 
                     match packet::decrypt_pkt_mp(
@@ -3531,6 +3584,18 @@ impl<F: BufFactory> Connection<F> {
                 } else {
                     self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn)
                 }
+            } else if let Some((_, owner_path)) = self
+                .ids
+                .mp_find_scid_path_id(&hdr.dcid)
+                .filter(|mp_path_id| *mp_path_id > 0)
+                .and_then(|mp_path_id| {
+                    self.paths.iter_mut().find(|(_, p)| p.path_id == mp_path_id)
+                })
+            {
+                // New 4-tuple, but the DCID belongs to a live multipath
+                // path (migration, §3.1.2): the per-path packet number
+                // space of that path is authoritative.
+                owner_path.app_pkt_num_space.recv_pkt_num.contains(pn)
             } else {
                 self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn)
             }
@@ -3555,7 +3620,9 @@ impl<F: BufFactory> Connection<F> {
         // existing path.
         let recv_pid = if hdr.ty == Type::Short && self.got_peer_conn_id {
             let pkt_dcid = ConnectionId::from_ref(&hdr.dcid);
-            self.get_or_create_recv_path_id(recv_pid, &pkt_dcid, buf_len, info)?
+            self.get_or_create_recv_path_id(
+                recv_pid, &pkt_dcid, buf_len, info, now,
+            )?
         } else {
             // During handshake, we are on the initial path.
             self.paths.get_active_path_id()?
@@ -4017,6 +4084,20 @@ impl<F: BufFactory> Connection<F> {
         for (pid, p) in no_dcid {
             if self.ids.zero_length_dcid() {
                 p.active_dcid_seq = Some(0);
+                continue;
+            }
+
+            // Paths opened by consuming a per-path CID draw replacements
+            // from their own path ID's pool (draft-21 §3.1).
+            #[cfg(feature = "multipath")]
+            if p.mp_per_path_cids {
+                if let Some(dcid_seq) =
+                    self.ids.mp_lowest_available_dcid_seq(p.path_id)
+                {
+                    self.ids.mp_link_dcid_to_path_id(p.path_id, dcid_seq, pid)?;
+
+                    p.active_dcid_seq = Some(dcid_seq);
+                }
                 continue;
             }
 
@@ -6076,8 +6157,19 @@ impl<F: BufFactory> Connection<F> {
     /// Returns the Destination Connection ID sequence number associated to that
     /// path.
     ///
+    /// When multipath is negotiated, opening a new path instead consumes the
+    /// lowest unused multipath path ID and a Connection ID from that path
+    /// ID's own pool (draft-ietf-quic-multipath-21, Section 3.1); the
+    /// returned sequence number then belongs to that path ID's sequence
+    /// number space. If every path ID allowed by the peer is consumed, this
+    /// raises a [`PathLimitExceeded`] and queues a PATHS_BLOCKED frame; if
+    /// no Connection ID is available for the next unused path ID, this
+    /// raises an [`OutOfIdentifiers`] and queues a PATH_CIDS_BLOCKED frame
+    /// (Section 3.2.1).
+    ///
     /// [`PathEvent::New`]: enum.PathEvent.html#variant.New
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
+    /// [`PathLimitExceeded`]: enum.Error.html#PathLimitExceeded
     /// [`InvalidState`]: enum.Error.html#InvalidState
     /// [`send()`]: struct.Connection.html#method.send
     /// [`send_on_path()`]: struct.Connection.html#method.send_on_path
@@ -7566,10 +7658,13 @@ impl<F: BufFactory> Connection<F> {
         let send_path = self.paths.get(send_pid)?;
 
         // Pending per-path PATH_NEW_CONNECTION_ID /
-        // PATH_RETIRE_CONNECTION_ID advertisements also trigger sending.
+        // PATH_RETIRE_CONNECTION_ID advertisements also trigger sending, as
+        // do pending PATHS_BLOCKED / PATH_CIDS_BLOCKED frames (§3.2.1).
         #[cfg(feature = "multipath")]
-        let mp_has_cid_frames =
-            self.ids.mp_has_new_scids() || self.ids.mp_has_retire_dcids();
+        let mp_has_cid_frames = self.ids.mp_has_new_scids() ||
+            self.ids.mp_has_retire_dcids() ||
+            self.mp_paths_blocked_pending.is_some() ||
+            self.mp_path_cids_blocked_pending.is_some();
         #[cfg(not(feature = "multipath"))]
         let mp_has_cid_frames = false;
 
@@ -8803,12 +8898,166 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Attributes an incoming packet whose Destination Connection ID
+    /// belongs to the per-path CID pool of the non-zero multipath path ID
+    /// `mp_path_id` (draft-21 §3.1.2).
+    ///
+    /// - On the 4-tuple of an existing path: that path receives the packet.
+    /// - On a new 4-tuple while a live path uses `mp_path_id`: migration of
+    ///   that path (same `Path` and packet number space, updated addresses).
+    /// - On a new 4-tuple while `mp_path_id` is unused: opens that path ID.
+    #[cfg(feature = "multipath")]
+    fn mp_get_or_create_recv_path_id(
+        &mut self, recv_pid: Option<usize>, mp_path_id: u64, in_scid_seq: u64,
+        buf_len: usize, info: &RecvInfo, now: Instant,
+    ) -> Result<usize> {
+        // The 4-tuple matches an existing path.
+        if let Some(recv_pid) = recv_pid {
+            let recv_path = self.paths.get_mut(recv_pid)?;
+
+            if recv_path.path_id == mp_path_id {
+                // Record the SCID currently used by the peer on that path.
+                if recv_path.active_scid_seq != Some(in_scid_seq) {
+                    trace!(
+                        "{} mp path ID {} now sees SCID with seq num {}",
+                        self.trace_id,
+                        mp_path_id,
+                        in_scid_seq
+                    );
+
+                    recv_path.active_scid_seq = Some(in_scid_seq);
+                }
+            } else {
+                // The peer used a CID associated with `mp_path_id` on the
+                // 4-tuple of another path. §3.1.2 requires CIDs to be
+                // associated with the current path ID; be conservative and
+                // keep the packet attributed to the 4-tuple's path.
+                trace!(
+                    "{} peer used CID of mp path ID {} on mp path ID {}",
+                    self.trace_id,
+                    mp_path_id,
+                    recv_path.path_id,
+                );
+            }
+
+            return Ok(recv_pid);
+        }
+
+        // This is a new 4-tuple. If the path ID is in active use, this is a
+        // migration of that path (§3.1.2): keep the `Path` structure (and
+        // thus its packet number space), update its addresses, and validate
+        // the new address.
+        let migrating_pid = self
+            .paths
+            .iter()
+            .find(|(_, p)| p.path_id == mp_path_id)
+            .map(|(pid, _)| pid);
+
+        if let Some(pid) = migrating_pid {
+            trace!(
+                "{} mp path ID {} migrated to ({},{})",
+                self.trace_id,
+                mp_path_id,
+                info.to,
+                info.from
+            );
+
+            self.paths.on_mp_path_migrated(pid, info.to, info.from)?;
+
+            let path = self.paths.get_mut(pid)?;
+            path.active_scid_seq = Some(in_scid_seq);
+
+            // Reset congestion state for the new 4-tuple: declare the
+            // packets in flight on the previous 4-tuple lost so their
+            // frames are retransmitted, mirroring `set_active_path()`'s
+            // handling of connection migration. Note that a full
+            // congestion/RTT reset to initial values (RFC 9000 §9.4) is
+            // not performed yet.
+            for &e in packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            ) {
+                let (lost_packets, lost_bytes) =
+                    path.recovery.on_path_change(e, now, &self.trace_id);
+
+                self.lost_count += lost_packets;
+                self.lost_bytes += lost_bytes as u64;
+            }
+
+            // The peer's new address must be validated (RFC 9000 §9.3):
+            // restart the anti-amplification budget and probe the new
+            // 4-tuple.
+            path.verified_peer_address = false;
+            path.max_send_bytes = buf_len * self.max_amplification_factor;
+            path.request_validation();
+
+            return Ok(pid);
+        }
+
+        // The path ID is unused: any packet (probing or not) arriving on a
+        // new 4-tuple with a CID of an unused path ID opens that path ID,
+        // without affecting other paths (§3.1.2).
+        let mut path = path::Path::new(
+            info.to,
+            info.from,
+            &self.recovery_config,
+            self.path_challenge_recv_max_queue_len,
+            false,
+            None,
+        );
+
+        path.max_send_bytes = buf_len * self.max_amplification_factor;
+        path.active_scid_seq = Some(in_scid_seq);
+        path.path_id = mp_path_id;
+        path.mp_per_path_cids = true;
+
+        // Automatically probes the new path.
+        path.request_validation();
+
+        let pid = self.paths.insert_path(path, self.is_server)?;
+
+        // Keep the legacy counter monotonic for non-CID-based fallbacks.
+        if self.paths.next_path_id <= mp_path_id {
+            self.paths.next_path_id = mp_path_id + 1;
+        }
+
+        // When the first additional path is created, sync path 0's
+        // per-path send counter from the shared counter.
+        if self.paths.len() == 2 {
+            if let Ok(path0) = self.paths.get_mut(0) {
+                path0.mp_next_pkt_num = self.next_pkt_num;
+            }
+        }
+
+        Ok(pid)
+    }
+
     /// Selects the path that the incoming packet belongs to, or creates a new
     /// one if no existing path matches.
+    #[cfg_attr(not(feature = "multipath"), allow(unused_variables))]
     fn get_or_create_recv_path_id(
         &mut self, recv_pid: Option<usize>, dcid: &ConnectionId, buf_len: usize,
-        info: &RecvInfo,
+        info: &RecvInfo, now: Instant,
     ) -> Result<usize> {
+        // With multipath, path attribution is CID-based (draft-21 §3.1.2):
+        // CIDs from a non-zero path ID's pool attribute the packet to that
+        // path ID. CIDs from the legacy pool belong to path ID 0 and follow
+        // the pre-multipath flow below.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && !self.ids.zero_length_scid() {
+            if let Some((mp_path_id, in_scid_seq)) = self.ids.mp_find_scid(dcid) {
+                if mp_path_id > 0 {
+                    return self.mp_get_or_create_recv_path_id(
+                        recv_pid,
+                        mp_path_id,
+                        in_scid_seq,
+                        buf_len,
+                        info,
+                        now,
+                    );
+                }
+            }
+        }
+
         let ids = &mut self.ids;
 
         let (in_scid_seq, mut in_scid_pid) =
@@ -9009,12 +9258,123 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
+    /// Selects the next multipath path ID to consume for a new path.
+    ///
+    /// Path IDs are consumed lowest-first without holes (draft-21 §3.2.1):
+    /// the lowest path ID within the negotiated limit that is neither in
+    /// use by a live path nor abandoned is the only candidate; whether it
+    /// is usable depends on an unused Connection ID being available in its
+    /// per-path DCID pool (§3.1).
+    #[cfg(feature = "multipath")]
+    fn mp_select_new_path_id(&self) -> MpNewPathId {
+        let limit =
+            cmp::min(self.paths.local_max_path_id, self.paths.peer_max_path_id);
+
+        for path_id in 1..=limit {
+            if self.paths.iter().any(|(_, p)| p.path_id == path_id) ||
+                self.paths.is_abandoned_path_id(path_id)
+            {
+                continue;
+            }
+
+            return match self.ids.mp_lowest_available_dcid_seq(path_id) {
+                Some(dcid_seq) => MpNewPathId::Usable { path_id, dcid_seq },
+                None => MpNewPathId::NoCid { path_id },
+            };
+        }
+
+        MpNewPathId::Exhausted
+    }
+
+    /// Creates a new client-side path by consuming the lowest unused
+    /// multipath path ID and a Connection ID from that path's pool
+    /// (draft-21 §3.1).
+    ///
+    /// When blocked, this queues the corresponding PATHS_BLOCKED or
+    /// PATH_CIDS_BLOCKED frame (§3.2.1) and fails with
+    /// [`PathLimitExceeded`] or [`OutOfIdentifiers`], respectively.
+    ///
+    /// [`PathLimitExceeded`]: enum.Error.html#PathLimitExceeded
+    /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
+    #[cfg(feature = "multipath")]
+    fn mp_create_path_on_client(
+        &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
+    ) -> Result<usize> {
+        let (path_id, dcid_seq) = match self.mp_select_new_path_id() {
+            MpNewPathId::Usable { path_id, dcid_seq } => (path_id, dcid_seq),
+
+            MpNewPathId::NoCid { path_id } => {
+                // No Connection ID is available for the unused path ID:
+                // tell the peer through PATH_CIDS_BLOCKED (§3.2.1).
+                self.mp_path_cids_blocked_pending =
+                    Some((path_id, self.ids.mp_next_expected_dcid_seq(path_id)));
+
+                return Err(Error::OutOfIdentifiers);
+            },
+
+            MpNewPathId::Exhausted => {
+                // Blocked on the peer's Maximum Path Identifier: tell the
+                // peer through PATHS_BLOCKED (§3.2.1). When our own
+                // advertised limit is the binding constraint instead, the
+                // peer cannot help, so no frame is sent.
+                if self.paths.peer_max_path_id <= self.paths.local_max_path_id {
+                    self.mp_paths_blocked_pending =
+                        Some(self.paths.peer_max_path_id);
+                }
+
+                return Err(Error::PathLimitExceeded);
+            },
+        };
+
+        let mut path = path::Path::new(
+            local_addr,
+            peer_addr,
+            &self.recovery_config,
+            self.path_challenge_recv_max_queue_len,
+            false,
+            None,
+        );
+        path.active_dcid_seq = Some(dcid_seq);
+        path.path_id = path_id;
+        path.mp_per_path_cids = true;
+
+        let pid = self
+            .paths
+            .insert_path(path, false)
+            .map_err(|_| Error::OutOfIdentifiers)?;
+        self.ids.mp_link_dcid_to_path_id(path_id, dcid_seq, pid)?;
+
+        // Keep the legacy counter monotonic for non-CID-based fallbacks.
+        if self.paths.next_path_id <= path_id {
+            self.paths.next_path_id = path_id + 1;
+        }
+
+        // When the first additional path is created (transition from 1→2
+        // paths), sync path 0's per-path send counter from the shared
+        // counter so that subsequent per-path pn values don't collide with
+        // pn values already sent using the shared counter.
+        if self.paths.len() == 2 {
+            if let Ok(path0) = self.paths.get_mut(0) {
+                path0.mp_next_pkt_num = self.next_pkt_num;
+            }
+        }
+
+        Ok(pid)
+    }
+
     /// Creates a new client-side path.
     fn create_path_on_client(
         &mut self, local_addr: SocketAddr, peer_addr: SocketAddr,
     ) -> Result<usize> {
         if self.is_server {
             return Err(Error::InvalidState);
+        }
+
+        // With multipath, opening a path consumes an unused path ID and a
+        // Connection ID associated with it (draft-21 §3.1).
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && !self.ids.zero_length_dcid() {
+            return self.mp_create_path_on_client(local_addr, peer_addr);
         }
 
         // If we use zero-length SCID and go over our local active CID limit,
