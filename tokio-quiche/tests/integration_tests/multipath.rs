@@ -149,6 +149,58 @@ async fn exchange_both(
     process_flight(sock2, addr2, conn).await;
 }
 
+/// Emit all pending packets, routing each to the socket matching its
+/// `SendInfo.from` address (defaulting to the first socket), then receive
+/// on every socket.
+async fn exchange_all(
+    socks: &[(&tokio::net::UdpSocket, SocketAddr)], conn: &mut quiche::Connection,
+) {
+    let flight = match quiche::test_utils::emit_flight(conn) {
+        Ok(v) => v,
+        Err(quiche::Error::Done) => vec![],
+        Err(e) => panic!("failed to emit flight: {e:?}"),
+    };
+
+    for (pkt, info) in flight {
+        let (sock, _) = socks
+            .iter()
+            .find(|(_, addr)| *addr == info.from)
+            .unwrap_or(&socks[0]);
+        sock.send_to(&pkt, info.to).await.unwrap();
+    }
+
+    for (sock, addr) in socks {
+        process_flight(sock, *addr, conn).await;
+    }
+}
+
+/// Waits for the tokio-quiche server's proactive per-path CID provisioning
+/// (draft-ietf-quic-multipath-21 §3.2.1) to fund our DCID pool for
+/// `path_id`, then issues one of our own CIDs for that path ID so the
+/// server can send on it too.
+///
+/// No legacy (path ID 0) CIDs are exchanged: opening the path relies
+/// entirely on the per-path pools.
+async fn prepare_path(
+    socket: &tokio::net::UdpSocket, local_addr: SocketAddr,
+    conn: &mut quiche::Connection, path_id: u64,
+) {
+    for _ in 0..20 {
+        if conn.mp_available_dcids(path_id) > 0 {
+            break;
+        }
+        exchange(socket, local_addr, conn).await;
+    }
+    assert!(
+        conn.mp_available_dcids(path_id) > 0,
+        "server should proactively fund our path {path_id} DCID pool"
+    );
+
+    let scid = SimpleConnectionIdGenerator.new_connection_id();
+    conn.new_scid_on_path(path_id, &scid, 0, false).unwrap();
+    exchange(socket, local_addr, conn).await;
+}
+
 fn drain_h3_events(
     h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection,
 ) -> (bool, bool) {
@@ -254,12 +306,9 @@ async fn multipath_two_path_h3_transfer() {
     }
     assert!(conn.is_multipath(), "multipath should be negotiated");
 
-    // Supply extra SCIDs (needed for second path).
-    for _ in 0..3 {
-        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
-        conn.new_scid(&extra_scid, 0, false).unwrap();
-    }
-    exchange(&socket, client_addr, &mut conn).await;
+    // Wait for the server's proactive per-path CIDs and fund the reverse
+    // direction of path 1 (needed for the second path).
+    prepare_path(&socket, client_addr, &mut conn, 1).await;
 
     // Create second path from a new local address.
     let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -391,12 +440,9 @@ async fn multipath_server_dynamic_socket() {
     }
     assert!(conn.is_multipath(), "multipath should be negotiated");
 
-    // Supply extra SCIDs (needed for second path).
-    for _ in 0..3 {
-        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
-        conn.new_scid(&extra_scid, 0, false).unwrap();
-    }
-    exchange(&socket, client_addr, &mut conn).await;
+    // Wait for the server's proactive per-path CIDs and fund the reverse
+    // direction of path 1 (needed for the second path).
+    prepare_path(&socket, client_addr, &mut conn, 1).await;
 
     // Wait for the server to report its new address.
     let server_addr2 = tokio::time::timeout(
@@ -492,12 +538,9 @@ async fn multipath_path_close_failover() {
     }
     assert!(conn.is_multipath(), "multipath should be negotiated");
 
-    // Supply extra SCIDs (needed for second path).
-    for _ in 0..3 {
-        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
-        conn.new_scid(&extra_scid, 0, false).unwrap();
-    }
-    exchange(&socket, client_addr, &mut conn).await;
+    // Wait for the server's proactive per-path CIDs and fund the reverse
+    // direction of path 1 (needed for the second path).
+    prepare_path(&socket, client_addr, &mut conn, 1).await;
 
     // Create second path from a new local address.
     let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -715,11 +758,7 @@ async fn multipath_both_paths_carry_traffic() {
         exchange(&socket, client_addr, &mut conn).await;
     }
 
-    for _ in 0..3 {
-        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
-        conn.new_scid(&extra_scid, 0, false).unwrap();
-    }
-    exchange(&socket, client_addr, &mut conn).await;
+    prepare_path(&socket, client_addr, &mut conn, 1).await;
 
     let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_addr2 = socket2.local_addr().unwrap();
@@ -829,11 +868,7 @@ async fn multipath_mid_transfer_path_close() {
         exchange(&socket, client_addr, &mut conn).await;
     }
 
-    for _ in 0..3 {
-        let extra_scid = SimpleConnectionIdGenerator.new_connection_id();
-        conn.new_scid(&extra_scid, 0, false).unwrap();
-    }
-    exchange(&socket, client_addr, &mut conn).await;
+    prepare_path(&socket, client_addr, &mut conn, 1).await;
 
     let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_addr2 = socket2.local_addr().unwrap();
@@ -896,4 +931,114 @@ async fn multipath_mid_transfer_path_close() {
         got_fin,
         "should receive complete response after mid-transfer path close"
     );
+}
+
+/// Verifies the tokio-quiche worker proactively issues per-path CIDs for
+/// every negotiated path ID (draft-ietf-quic-multipath-21 §3.2.1
+/// RECOMMENDED): after the handshake the client can open path 1 AND path 2
+/// without any manual CID provisioning, with each open consuming a CID
+/// from its own per-path pool (the legacy pool stays untouched).
+#[tokio::test]
+async fn multipath_proactive_per_path_cid_provisioning() {
+    let (url, _) = start_server_with_settings(
+        multipath_server_settings(),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+
+    // The server must fund our per-path DCID pools on its own: this test
+    // performs NO manual CID provisioning before opening paths.
+    for _ in 0..20 {
+        if conn.mp_available_dcids(1) > 0 && conn.mp_available_dcids(2) > 0 {
+            break;
+        }
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(
+        conn.mp_available_dcids(1) > 0,
+        "server should proactively fund the path 1 DCID pool"
+    );
+    assert!(
+        conn.mp_available_dcids(2) > 0,
+        "server should proactively fund the path 2 DCID pool"
+    );
+
+    // Open paths 1 and 2 back-to-back. Both must consume per-path CIDs,
+    // leaving the legacy (path ID 0) pool untouched.
+    let legacy_dcids = conn.available_dcids();
+
+    let socket2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr2 = socket2.local_addr().unwrap();
+    let path_id1 = conn
+        .create_path(client_addr2, server_addr)
+        .expect("opening path 1 should not need manual CID provisioning");
+    assert_eq!(path_id1, 1, "lowest unused path ID is consumed first");
+
+    let socket3 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr3 = socket3.local_addr().unwrap();
+    let path_id2 = conn
+        .create_path(client_addr3, server_addr)
+        .expect("opening path 2 should not need manual CID provisioning");
+    assert_eq!(path_id2, 2, "path IDs are consumed without holes");
+
+    assert_eq!(
+        conn.available_dcids(),
+        legacy_dcids,
+        "new paths must use per-path DCIDs, not legacy pool DCIDs"
+    );
+
+    // The reverse direction is the client application's responsibility
+    // (the client here is a bare quiche connection): issue one CID per
+    // path so the server can send on paths 1 and 2. A tokio-quiche client
+    // endpoint does this automatically in its worker.
+    for path_id in [1u64, 2] {
+        let scid = SimpleConnectionIdGenerator.new_connection_id();
+        conn.new_scid_on_path(path_id, &scid, 0, false).unwrap();
+    }
+
+    // Both paths must reach Validated.
+    let mut validated = std::collections::HashSet::new();
+    for _ in 0..20 {
+        exchange_all(
+            &[
+                (&socket, client_addr),
+                (&socket2, client_addr2),
+                (&socket3, client_addr3),
+            ],
+            &mut conn,
+        )
+        .await;
+        while let Some(ev) = conn.path_event_next() {
+            if let quiche::PathEvent::Validated(local, _) = ev {
+                validated.insert(local);
+            }
+        }
+        if validated.contains(&client_addr2) && validated.contains(&client_addr3)
+        {
+            break;
+        }
+    }
+    assert!(validated.contains(&client_addr2), "path 1 should validate");
+    assert!(validated.contains(&client_addr3), "path 2 should validate");
 }

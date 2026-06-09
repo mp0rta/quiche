@@ -1241,6 +1241,23 @@ impl ConnectionIdentifiers {
             .min()
     }
 
+    /// Returns the number of Destination Connection IDs of the provided
+    /// path ID that have not been assigned to a (4-tuple) path yet.
+    ///
+    /// Path ID 0 delegates to [`available_dcids()`].
+    ///
+    /// [`available_dcids()`]: struct.ConnectionIdentifiers.html#method.available_dcids
+    pub fn mp_available_dcids(&self, path_id: u64) -> usize {
+        if path_id == 0 {
+            return self.available_dcids();
+        }
+
+        self.mp_pools
+            .get(&path_id)
+            .map(|p| p.dcids.iter().filter(|e| e.path_id.is_none()).count())
+            .unwrap_or(0)
+    }
+
     /// Gets the destination Connection ID of the provided path ID associated
     /// with the provided sequence number. Path ID 0 delegates to
     /// [`get_dcid()`].

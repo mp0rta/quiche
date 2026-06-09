@@ -224,6 +224,63 @@ where
         }
     }
 
+    /// Proactively issues source CIDs for every negotiated multipath path
+    /// ID, so the peer can open any path within the negotiated limit
+    /// (draft-ietf-quic-multipath-21 §3.2.1 RECOMMENDED behavior).
+    ///
+    /// This runs on every worker iteration, so the pools self-heal after
+    /// handshake completion, MAX_PATH_ID raises, and peer-initiated
+    /// retirement, without dedicated events.
+    #[cfg(feature = "multipath")]
+    fn fill_available_per_path_scids(&self, qconn: &mut QuicheConnection) {
+        if !qconn.is_multipath() {
+            return;
+        }
+        let Some(cid_generator) = self.cid_generator.as_deref() else {
+            return;
+        };
+
+        // The peer only opens paths with IDs up to the minimum of both
+        // advertised limits (§3.2.1); issuing CIDs beyond that is useless.
+        let max_path_id = qconn.local_max_path_id().min(qconn.peer_max_path_id());
+
+        let current_cid = qconn.source_id().into_owned();
+        // Lowest path ID first: path IDs are consumed without holes
+        // (§3.2.1), so lower IDs are the ones the peer needs first.
+        for path_id in 1..=max_path_id {
+            for _ in 0..qconn.mp_scids_left(path_id) {
+                // We don't emit stateless resets, so any unguessable value
+                // is fine
+                let reset_token = random_u128();
+                let new_cid = cid_generator.new_connection_id();
+
+                // Register the CID with the ingress router first, exactly
+                // like the path-0 fill: packets addressed to it must route
+                // to this connection.
+                if self
+                    .conn_map_cmd_tx
+                    .send(ConnectionMapCommand::MapCid {
+                        existing_cid: current_cid.clone(),
+                        new_cid: new_cid.clone(),
+                    })
+                    .is_err()
+                {
+                    // Can't do anything if the connection map is gone
+                    return;
+                }
+
+                if qconn
+                    .new_scid_on_path(path_id, &new_cid, reset_token, false)
+                    .is_err()
+                {
+                    // This only fails if we have reached the per-path CID
+                    // limit already
+                    return;
+                }
+            }
+        }
+    }
+
     fn unmap_cid(&self, cid: ConnectionId<'static>) {
         // If the connection map is gone, the ID is already "unmapped"
         let _ = self
@@ -234,6 +291,10 @@ where
     fn refresh_connection_ids(&self, qconn: &mut QuicheConnection) {
         // Top up the connection's active CIDs
         self.fill_available_scids(qconn);
+
+        // Top up the per-path CID pools when multipath is negotiated
+        #[cfg(feature = "multipath")]
+        self.fill_available_per_path_scids(qconn);
 
         // Remove retired CIDs from the ingress router
         while let Some(retired_cid) = qconn.retired_scid_next() {

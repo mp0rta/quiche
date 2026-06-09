@@ -6529,6 +6529,22 @@ impl<F: BufFactory> Connection<F> {
         self.ids.available_dcids()
     }
 
+    /// Returns the number of spare Destination Connection IDs for the
+    /// provided multipath path ID, i.e., Destination Connection IDs received
+    /// through PATH_NEW_CONNECTION_ID frames (draft-ietf-quic-multipath-21,
+    /// Section 4.4) that are still unused.
+    ///
+    /// A non-zero value means the peer funded the path ID's CID pool, so the
+    /// path can be opened by consuming one of these Connection IDs (Section
+    /// 3.1). Path ID 0 reports the same value as [`available_dcids()`].
+    ///
+    /// [`available_dcids()`]: struct.Connection.html#method.available_dcids
+    #[cfg(feature = "multipath")]
+    #[inline]
+    pub fn mp_available_dcids(&self, path_id: u64) -> usize {
+        self.ids.mp_available_dcids(path_id)
+    }
+
     /// Returns an iterator over destination `SockAddr`s whose association
     /// with `from` forms a known QUIC path on which packets can be sent to.
     ///
@@ -7001,6 +7017,40 @@ impl<F: BufFactory> Connection<F> {
         self.multipath_enabled
     }
 
+    /// Returns the maximum multipath path ID this endpoint allows the peer
+    /// to use, as advertised through the `initial_max_path_id` transport
+    /// parameter and later raised by MAX_PATH_ID frames
+    /// (draft-ietf-quic-multipath-21, Section 3.2).
+    ///
+    /// This bounds the path IDs for which this endpoint may issue source
+    /// Connection IDs via [`new_scid_on_path()`]. Returns 0 when multipath
+    /// has not been negotiated (check [`is_multipath()`]).
+    ///
+    /// [`new_scid_on_path()`]: struct.Connection.html#method.new_scid_on_path
+    /// [`is_multipath()`]: struct.Connection.html#method.is_multipath
+    #[cfg(feature = "multipath")]
+    #[inline]
+    pub fn local_max_path_id(&self) -> u64 {
+        self.paths.local_max_path_id
+    }
+
+    /// Returns the maximum multipath path ID the peer allows this endpoint
+    /// to use, as advertised through the peer's `initial_max_path_id`
+    /// transport parameter and later raised by its MAX_PATH_ID frames
+    /// (draft-ietf-quic-multipath-21, Section 3.2).
+    ///
+    /// Both endpoints only open paths with IDs up to the minimum of
+    /// [`local_max_path_id()`] and this value (Section 3.2.1). Returns 0
+    /// when multipath has not been negotiated (check [`is_multipath()`]).
+    ///
+    /// [`local_max_path_id()`]: struct.Connection.html#method.local_max_path_id
+    /// [`is_multipath()`]: struct.Connection.html#method.is_multipath
+    #[cfg(feature = "multipath")]
+    #[inline]
+    pub fn peer_max_path_id(&self) -> u64 {
+        self.paths.peer_max_path_id
+    }
+
     /// Sets a QoS hint for the given stream.
     ///
     /// Returns [`Error::MultipathNotNegotiated`] if multipath has not been
@@ -7023,6 +7073,13 @@ impl<F: BufFactory> Connection<F> {
     /// has been negotiated. Returns the multipath path ID assigned to the new
     /// path on success.
     ///
+    /// When the peer funded per-path Connection ID pools through
+    /// PATH_NEW_CONNECTION_ID frames, the new path consumes the lowest
+    /// unused path ID and a Connection ID from that path ID's own pool
+    /// (draft-ietf-quic-multipath-21, Section 3.1). Otherwise it falls back
+    /// to drawing a Connection ID from the legacy (path ID 0) pool, for
+    /// compatibility with peers that do not provision per-path pools.
+    ///
     /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
     /// negotiated, [`Error::InvalidState`] if called on a server, or
     /// [`Error::PathLimitExceeded`] if the peer's path limit has been reached.
@@ -7035,6 +7092,39 @@ impl<F: BufFactory> Connection<F> {
         }
         if self.is_server {
             return Err(Error::InvalidState);
+        }
+
+        // Prefer the spec-compliant route: consume the lowest unused path
+        // ID together with an unused Connection ID from that path ID's own
+        // pool (draft-21 §3.1). Only when no per-path CID has been provided
+        // for the next unused path ID, fall back to the legacy pool below.
+        if !self.ids.zero_length_dcid() &&
+            matches!(self.mp_select_new_path_id(), MpNewPathId::Usable { .. })
+        {
+            let pid = self.mp_create_path_on_client(local, peer)?;
+
+            let path = self.paths.get_mut(pid)?;
+            // New paths start in Validating state (PATH_CHALLENGE will be
+            // sent).
+            path.request_validation();
+            let path_id = path.path_id;
+
+            self.paths.active_path_count += 1;
+
+            self.notify_scheduler_path(
+                multipath::scheduler::SchedulerPathEvent::Activated(path_id),
+            );
+
+            #[cfg(feature = "qlog")]
+            qlog_with_type!(QLOG_MULTIPATH, self.qlog, q, {
+                let ev_data = EventData::Marker {
+                    marker_type: "multipath:path_created".to_string(),
+                    message: Some(format!("path_id={path_id}")),
+                };
+                q.add_event_data_with_instant(ev_data, Instant::now()).ok();
+            });
+
+            return Ok(path_id);
         }
 
         let next_id = self.paths.next_path_id;
