@@ -246,6 +246,14 @@ impl BoundedNonEmptyConnectionIdVecDeque {
             .position(|e| e.seq == seq)
             .and_then(|index| self.inner.remove(index))
     }
+
+    /// Removes all the elements in the collection, allowing it to become
+    /// empty. Used when all the connection IDs of an abandoned path are
+    /// implicitly retired at once (draft-ietf-quic-multipath-21 §3.4).
+    #[cfg(feature = "multipath")]
+    fn clear_allow_empty(&mut self) {
+        self.inner.clear();
+    }
 }
 
 #[derive(Default)]
@@ -1429,6 +1437,68 @@ impl ConnectionIdentifiers {
         self.mp_retire_dcid_seqs.insert((path_id, seq))?;
 
         Ok(e.path_id)
+    }
+
+    /// Treats all the destination Connection IDs the peer issued for the
+    /// provided path ID as immediately retired, without queueing
+    /// PATH_RETIRE_CONNECTION_ID frames: when a PATH_ABANDON frame is sent
+    /// or received for a path, retirement of its connection IDs is
+    /// implicit and no explicit retirement frames are exchanged
+    /// (draft-ietf-quic-multipath-21 §3.4). Any retirement frames already
+    /// queued for that path are dropped as well.
+    ///
+    /// Our own source Connection IDs for the path are intentionally *not*
+    /// touched: knowledge of the connection IDs issued to the peer is
+    /// retained until the retention window expires (§3.4.2), see
+    /// [`mp_remove_path_pools()`].
+    ///
+    /// Path ID 0 draws from the legacy DCID pool, which is shared with
+    /// pre-multipath machinery that assumes it is never empty (e.g.
+    /// fallback Destination Connection ID lookups); for that reason the
+    /// legacy pool is left in place and only its queued retirements are
+    /// dropped. Sending on an abandoned path 0 is prevented by the path
+    /// state (`mp_closing`) instead.
+    ///
+    /// [`mp_remove_path_pools()`]: struct.ConnectionIdentifiers.html#method.mp_remove_path_pools
+    #[cfg(feature = "multipath")]
+    pub fn mp_retire_dcid_pool(&mut self, path_id: u64) {
+        if path_id == 0 {
+            self.retire_dcid_seqs.inner.clear();
+            return;
+        }
+
+        if let Some(pool) = self.mp_pools.get_mut(&path_id) {
+            pool.dcids.clear_allow_empty();
+        }
+
+        self.mp_retire_dcid_seqs
+            .inner
+            .retain(|&(pid, _)| pid != path_id);
+    }
+
+    /// Removes the whole per-path Connection ID pool of the provided path
+    /// ID, both directions, together with any pending advertisements for
+    /// it. Called when all state associated with an abandoned path is
+    /// finally deleted, at the end of the post-abandon retention window
+    /// (draft-ietf-quic-multipath-21 §3.4).
+    ///
+    /// Path ID 0 shares the legacy pools, which are left in place (see
+    /// [`mp_retire_dcid_pool()`]).
+    ///
+    /// [`mp_retire_dcid_pool()`]: struct.ConnectionIdentifiers.html#method.mp_retire_dcid_pool
+    #[cfg(feature = "multipath")]
+    pub fn mp_remove_path_pools(&mut self, path_id: u64) {
+        if path_id == 0 {
+            return;
+        }
+
+        self.mp_pools.remove(&path_id);
+
+        self.mp_advertise_new_scid_seqs
+            .retain(|&(pid, _)| pid != path_id);
+        self.mp_retire_dcid_seqs
+            .inner
+            .retain(|&(pid, _)| pid != path_id);
     }
 
     /// Returns the number of source Connection IDs that can still be issued

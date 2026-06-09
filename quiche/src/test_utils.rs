@@ -589,15 +589,51 @@ pub fn decode_pkt<F: BufFactory>(
 
     packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
 
-    let pn = packet::decode_pkt_num(
-        conn.pkt_num_spaces[epoch].largest_rx_pkt_num,
-        hdr.pkt_num,
-        hdr.pkt_num_len,
-    );
+    // When multipath is active, Short packets use per-path packet numbers
+    // and a path-aware AEAD nonce; identify the path from the packet's
+    // DCID (one of our SCIDs), mirroring the connection's receive path.
+    #[cfg(feature = "multipath")]
+    let mp_path_id: Option<u64> = if conn.multipath_enabled &&
+        hdr.ty == Type::Short &&
+        conn.paths.len() > 1
+    {
+        Some(conn.ids.mp_find_scid_path_id(&hdr.dcid).unwrap_or(0))
+    } else {
+        None
+    };
+    #[cfg(not(feature = "multipath"))]
+    let mp_path_id: Option<u64> = None;
 
-    let mut payload =
-        packet::decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, aead)
-            .unwrap();
+    let largest_rx_pkt_num = match mp_path_id {
+        #[cfg(feature = "multipath")]
+        Some(path_id) => conn
+            .paths
+            .iter()
+            .find(|(_, p)| p.path_id == path_id)
+            .map(|(_, p)| p.app_pkt_num_space.largest_rx_pkt_num)
+            .unwrap_or(conn.pkt_num_spaces[epoch].largest_rx_pkt_num),
+
+        _ => conn.pkt_num_spaces[epoch].largest_rx_pkt_num,
+    };
+
+    let pn =
+        packet::decode_pkt_num(largest_rx_pkt_num, hdr.pkt_num, hdr.pkt_num_len);
+
+    let mut payload = match mp_path_id {
+        #[cfg(feature = "multipath")]
+        Some(path_id) => packet::decrypt_pkt_mp(
+            &mut b,
+            pn,
+            path_id as u32,
+            hdr.pkt_num_len,
+            payload_len,
+            aead,
+        )
+        .unwrap(),
+
+        _ => packet::decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, aead)
+            .unwrap(),
+    };
 
     let mut frames = Vec::new();
 

@@ -43,7 +43,10 @@ impl<F: BufFactory> Connection<F> {
         #[cfg(feature = "multipath")]
         let mut mp_abandon_lost: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
-        let mut mp_status_lost: SmallVec<[u64; 2]> = SmallVec::new();
+        let mut mp_status_lost: SmallVec<[(u64, u64); 2]> = SmallVec::new();
+        #[cfg(feature = "multipath")]
+        let mut mp_retire_dcid_lost: SmallVec<[(u64, u64); 2]> =
+            SmallVec::new();
         #[cfg(feature = "multipath")]
         let mut mp_paths_blocked_lost = false;
         #[cfg(feature = "multipath")]
@@ -172,9 +175,9 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     #[cfg(feature = "multipath")]
-                    frame::Frame::PathStatusAvailable { path_id, .. } |
-                    frame::Frame::PathStatusBackup { path_id, .. } => {
-                        mp_status_lost.push(path_id);
+                    frame::Frame::PathStatusAvailable { path_id, seq_num } |
+                    frame::Frame::PathStatusBackup { path_id, seq_num } => {
+                        mp_status_lost.push((path_id, seq_num));
                     },
 
                     #[cfg(feature = "multipath")]
@@ -231,7 +234,12 @@ impl<F: BufFactory> Connection<F> {
 
                     #[cfg(feature = "multipath")]
                     frame::Frame::PathRetireConnectionId { path_id, seq_num } => {
-                        self.ids.mp_mark_retire_dcid(path_id, seq_num, true)?;
+                        // Deferred below: paths abandoned in the meantime
+                        // have their connection IDs implicitly retired and
+                        // must not emit PATH_RETIRE_CONNECTION_ID frames
+                        // (draft-21 §3.4), but `self.paths` cannot be
+                        // queried from inside this loop.
+                        mp_retire_dcid_lost.push((path_id, seq_num));
                     },
 
                     frame::Frame::Ping {
@@ -252,21 +260,69 @@ impl<F: BufFactory> Connection<F> {
         // self.paths).
         #[cfg(feature = "multipath")]
         for mp_path_id in mp_abandon_lost {
+            // PATH_ABANDON SHOULD be repeated if lost (draft-21 §4.2). If
+            // the path state was already deleted (retention window
+            // expired), the retransmission is carried at the connection
+            // level instead.
+            let mut handled = false;
+
             for (_, p) in self.paths.iter_mut() {
-                if p.path_id == mp_path_id && !p.mp_path_abandon_acked {
-                    p.mp_path_abandon_pending = true;
+                if p.path_id == mp_path_id {
+                    if !p.mp_path_abandon_acked {
+                        p.mp_path_abandon_pending = true;
+                    }
+                    handled = true;
+                    break;
+                }
+            }
+
+            if !handled &&
+                self.paths.is_abandoned_path_id(mp_path_id) &&
+                !self.mp_abandon_queue.iter().any(|&(id, _)| id == mp_path_id)
+            {
+                self.mp_abandon_queue.push((
+                    mp_path_id,
+                    multipath::frames::PATH_ABANDON_NO_ERROR,
+                ));
+            }
+        }
+        #[cfg(feature = "multipath")]
+        for (mp_path_id, seq_num) in mp_status_lost {
+            for (_, p) in self.paths.iter_mut() {
+                if p.path_id == mp_path_id {
+                    // Only re-arm for the loss of the *latest* PATH_STATUS
+                    // frame; a superseded status frame must not be
+                    // retransmitted (the rebuilt frame always carries the
+                    // current status and sequence number anyway).
+                    if seq_num == p.mp_path_status_seq_num &&
+                        !p.mp_path_status_acked
+                    {
+                        p.mp_path_status_pending = true;
+                    }
                     break;
                 }
             }
         }
         #[cfg(feature = "multipath")]
-        for mp_path_id in mp_status_lost {
-            for (_, p) in self.paths.iter_mut() {
-                if p.path_id == mp_path_id && !p.mp_path_status_acked {
-                    p.mp_path_status_pending = true;
-                    break;
-                }
+        for (mp_path_id, seq_num) in mp_retire_dcid_lost {
+            // Abandoned path IDs have their connection IDs implicitly
+            // retired: no PATH_RETIRE_CONNECTION_ID is emitted for them
+            // (draft-21 §3.4).
+            if self.paths.is_abandoned_path_id(mp_path_id) {
+                continue;
             }
+
+            // Skip paths currently in their post-abandon retention window
+            // as well: their DCID pool has already been dropped.
+            if self
+                .paths
+                .iter()
+                .any(|(_, p)| p.path_id == mp_path_id && p.mp_closing)
+            {
+                continue;
+            }
+
+            self.ids.mp_mark_retire_dcid(mp_path_id, seq_num, true)?;
         }
 
         // Re-arm lost PATHS_BLOCKED / PATH_CIDS_BLOCKED frames only if the
@@ -624,10 +680,32 @@ impl<F: BufFactory> Connection<F> {
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    self.paths.get_mut(pid).unwrap().mp_path_abandon_pending =
-                        false;
+                    let p = self.paths.get_mut(pid).unwrap();
+                    p.mp_path_abandon_pending = false;
+                    p.mp_path_abandon_sent = true;
                     ack_eliciting = true;
                     in_flight = true;
+                }
+            }
+
+            // Generate PATH_ABANDON frames queued at the connection level:
+            // echoes for path IDs without a live path and retransmissions
+            // for paths whose state was already deleted (draft-21 §3.4).
+            let mut qi = 0;
+            while qi < self.mp_abandon_queue.len() {
+                let (mp_path_id, mp_error_code) = self.mp_abandon_queue[qi];
+
+                let frame = frame::Frame::PathAbandon {
+                    path_id: mp_path_id,
+                    error_code: mp_error_code,
+                };
+
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    self.mp_abandon_queue.remove(qi);
+                    ack_eliciting = true;
+                    in_flight = true;
+                } else {
+                    qi += 1;
                 }
             }
 

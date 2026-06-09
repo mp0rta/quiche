@@ -14003,9 +14003,8 @@ fn multipath_path0_frames_share_legacy_cid_space() {
     assert_eq!(pipe.server.local_error(), None);
 }
 
-/// Until Task 2.2 lands real abandoned-path tracking, no path ID is
-/// considered abandoned and CID frames for within-limit path IDs are
-/// processed normally.
+/// On a fresh connection no path ID is considered abandoned, so CID
+/// frames for within-limit path IDs are processed normally.
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_no_path_id_is_abandoned_yet() {
@@ -14723,4 +14722,727 @@ fn multipath_unused_path_id_cid_on_new_tuple_opens_path() {
     assert_eq!(active.local_addr(), server_addr);
     assert_eq!(active.peer_addr(), client_addr);
     assert!(active.active());
+}
+
+// ----- draft-ietf-quic-multipath-21 §3.1/§3.4 path teardown tests -----
+
+/// Builds a multipath-negotiated pipe with the provided path IDs funded
+/// with per-path CIDs on both endpoints, then opens and validates a second
+/// client path consuming path ID 1.
+///
+/// Returns the pipe, the client-side slab identifier of the path-ID-1
+/// path, and the (client primary, client secondary, server) addresses.
+#[cfg(feature = "multipath")]
+fn mp_pipe_with_second_path(
+    fund_path_ids: &[u64],
+) -> (test_utils::Pipe, usize, SocketAddr, SocketAddr, SocketAddr) {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, fund_path_ids);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr = test_utils::Pipe::client_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let pid = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_2, server_addr))
+        .unwrap();
+    assert_eq!(pipe.client.paths.get(pid).unwrap().path_id, 1);
+    assert!(pipe.client.paths.get(pid).unwrap().validated());
+
+    (pipe, pid, client_addr, client_addr_2, server_addr)
+}
+
+/// Behaviors 2+3 (§3.4): locally closing a path immediately retires the
+/// peer's CIDs for it without emitting PATH_RETIRE_CONNECTION_ID, stops
+/// sending on it, and the PATH_ABANDON frame is carried by another open
+/// path.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_close_path_emits_abandon_on_other_path() {
+    let (mut pipe, pid, client_addr, _client_addr_2, _server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Fund a spare CID for path 1 so the client has an unused DCID for it.
+    let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.server.new_scid_on_path(1, &s_cid, s_reset_token, false),
+        Ok(1)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.client.ids.mp_lowest_available_dcid_seq(1).is_some());
+
+    assert_eq!(
+        pipe.client
+            .close_path(1, multipath::frames::APPLICATION_ABANDON_PATH),
+        Ok(())
+    );
+
+    // All the CIDs the peer issued for path ID 1 are treated as
+    // immediately retired.
+    assert_eq!(pipe.client.ids.mp_lowest_available_dcid_seq(1), None);
+    assert_eq!(pipe.client.ids.mp_available_dcids(1), 0);
+
+    // No more packets can be sent on the abandoned path.
+    assert!(!pipe.client.paths.get(pid).unwrap().can_send(true));
+    assert!(!pipe
+        .client
+        .active_paths()
+        .iter()
+        .any(|(path_id, _)| *path_id == 1));
+
+    // The PATH_ABANDON frame goes out on the *other* open path, and no
+    // PATH_RETIRE_CONNECTION_ID is emitted for the abandoned path's CIDs.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+
+    let mut abandon_seen = false;
+    for (pkt, si) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.server, &mut pkt).unwrap();
+
+        for frame in frames {
+            match frame {
+                frame::Frame::PathAbandon {
+                    path_id,
+                    error_code,
+                } => {
+                    assert_eq!(path_id, 1);
+                    assert_eq!(
+                        error_code,
+                        multipath::frames::APPLICATION_ABANDON_PATH
+                    );
+                    // RECOMMENDED: sent on another open path.
+                    assert_eq!(si.from, client_addr);
+                    abandon_seen = true;
+                },
+
+                frame::Frame::PathRetireConnectionId { path_id, .. } => {
+                    assert_ne!(
+                        path_id, 1,
+                        "abandoned path CIDs are implicitly retired; no \
+                         PATH_RETIRE_CONNECTION_ID may be sent"
+                    );
+                },
+
+                _ => (),
+            }
+        }
+    }
+
+    assert!(abandon_seen, "PATH_ABANDON should be emitted");
+}
+
+/// Behavior 1+2 (§3.4): an endpoint receiving PATH_ABANDON MUST echo a
+/// corresponding PATH_ABANDON (NO_ERROR) if it has not sent one, and MUST
+/// treat the peer's CIDs for that path as immediately retired.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_receive_echoes_and_retires_cids() {
+    let (mut pipe, _pid, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Fund a spare CID for path 1 so the server has an unused DCID for it.
+    let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &c_cid, c_reset_token, false),
+        Ok(1)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.server.ids.mp_lowest_available_dcid_seq(1).is_some());
+
+    assert_eq!(
+        pipe.client
+            .close_path(1, multipath::frames::APPLICATION_ABANDON_PATH),
+        Ok(())
+    );
+
+    // Deliver the client's PATH_ABANDON to the server.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // The server retired the client's CIDs for path ID 1 immediately.
+    assert_eq!(pipe.server.ids.mp_lowest_available_dcid_seq(1), None);
+
+    let spid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_2))
+        .unwrap();
+    assert!(pipe.server.paths.get(spid).unwrap().mp_closing);
+
+    // The server echoes its own PATH_ABANDON, with NO_ERROR.
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    let mut echo_seen = false;
+    for (pkt, _) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap();
+
+        for frame in frames {
+            if let frame::Frame::PathAbandon {
+                path_id,
+                error_code,
+            } = frame
+            {
+                assert_eq!(path_id, 1);
+                assert_eq!(
+                    error_code,
+                    multipath::frames::PATH_ABANDON_NO_ERROR
+                );
+                echo_seen = true;
+            }
+        }
+    }
+
+    assert!(echo_seen, "PATH_ABANDON echo should be emitted");
+
+    // The initiator does not send a second PATH_ABANDON in response to
+    // the echo: it already sent one.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.client.mp_abandon_queue.is_empty());
+    assert!(!pipe
+        .client
+        .paths
+        .iter()
+        .any(|(_, p)| p.mp_path_abandon_pending));
+}
+
+/// Behavior 1, loss handling (§4.2): PATH_ABANDON SHOULD be repeated if
+/// the packet carrying it is declared lost.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_lost_frame_is_retransmitted() {
+    let (mut pipe, _pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    let mut buf = [0; 65535];
+
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+
+    // The PATH_ABANDON is sent, but the packet is lost.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, frame::Frame::PathAbandon { path_id: 1, .. })));
+
+    // Trigger ack-based loss detection: newer ack-eliciting packets are
+    // delivered and acknowledged, exceeding the packet threshold for the
+    // lost one. Flights are exchanged with their real addresses so the
+    // acknowledgments reach the right path.
+    let pkt_thresh = pipe
+        .client
+        .paths
+        .get_active()
+        .unwrap()
+        .recovery
+        .pkt_thresh()
+        .unwrap();
+
+    for _ in 0..pkt_thresh {
+        pipe.client.send_ack_eliciting().unwrap();
+        let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+        test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    }
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    // The PATH_ABANDON is retransmitted.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathAbandon { path_id: 1, .. }
+        )),
+        "PATH_ABANDON should be retransmitted on loss"
+    );
+}
+
+/// Behavior 4, retention window (§3.4.2/§3.4.3): after receiving a
+/// PATH_ABANDON, the path's packet number space is retained so reordered
+/// packets are still acknowledged, with the PATH_ACK going out on another
+/// path.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_retention_acks_reordered_packets_on_other_path() {
+    let (mut pipe, pid, client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Produce a client packet on path 1 and hold it (it will be delivered
+    // after the abandon, simulating reordering). Requesting validation
+    // again allows directing the send at path 1's 4-tuple.
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    pipe.client.paths.get_mut(pid).unwrap().request_validation();
+    let held_flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    // Client abandons path 1; the server processes the PATH_ABANDON.
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // The reordered packet arrives on the abandoned path: state is still
+    // retained, so it is accepted.
+    test_utils::process_flight(&mut pipe.server, held_flight).unwrap();
+
+    // The server acknowledges it with a PATH_ACK for path ID 1, sent on
+    // the *other* path (the abandoned path is unusable for sending).
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    let mut path_ack_seen = false;
+    for (pkt, si) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap();
+
+        for frame in frames {
+            if let frame::Frame::PathAck { path_id: 1, .. } = frame {
+                assert_eq!(si.from, server_addr);
+                assert_eq!(
+                    si.to, client_addr,
+                    "PATH_ACK for the abandoned path must be sent on \
+                     another path"
+                );
+                path_ack_seen = true;
+            }
+        }
+    }
+
+    assert!(path_ack_seen, "reordered packet should be PATH_ACK'd");
+}
+
+/// Behavior 4, final deletion (§3.4/§3.4.3): when the 3-PTO retention
+/// window expires, the path state is deleted, the path ID is recorded as
+/// consumed and the per-path CID pools are dropped.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_retention_expiry_deletes_path_state() {
+    let (mut pipe, pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The path state is retained during the window.
+    assert!(pipe.client.paths.get(pid).is_ok());
+    assert!(!pipe.client.paths.is_abandoned_path_id(1));
+
+    // The retention deadline is armed and reported through the connection
+    // timer.
+    let deadline = pipe
+        .client
+        .paths
+        .get(pid)
+        .unwrap()
+        .mp_abandon_deadline
+        .expect("retention deadline armed");
+    assert!(pipe.client.timeout_instant().unwrap() <= deadline);
+
+    // Wait for the retention window to expire.
+    let wait = deadline
+        .saturating_duration_since(Instant::now()) +
+        Duration::from_millis(5);
+    std::thread::sleep(wait);
+
+    pipe.client.on_timeout();
+
+    // The path is gone, its ID is consumed and its CID pools are dropped.
+    assert!(!pipe.client.paths.iter().any(|(_, p)| p.path_id == 1));
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+    assert_eq!(pipe.client.ids.mp_lowest_available_dcid_seq(1), None);
+
+    // The connection is still alive on the remaining path.
+    assert!(!pipe.client.is_closed());
+    assert_eq!(pipe.client.stream_send(4, b"after", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+}
+
+/// Behavior 5 (§4): multipath frames referring to an abandoned
+/// (consumed) path ID are silently ignored, including PATH_ACK
+/// (§3.4.3), PATH_STATUS, PATH_NEW_CONNECTION_ID,
+/// PATH_RETIRE_CONNECTION_ID and duplicate PATH_ABANDON frames.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_silent_ignore_frames_for_abandoned_path_id() {
+    let (mut pipe, pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    let mut buf = [0; 65535];
+
+    // Tear path 1 down completely on the client.
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let deadline =
+        pipe.client.paths.get(pid).unwrap().mp_abandon_deadline.unwrap();
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) +
+            Duration::from_millis(5),
+    );
+    pipe.client.on_timeout();
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+
+    // All of these reference the consumed path ID 1 and must be silently
+    // ignored.
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(0..1);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+
+    let frames = [
+        frame::Frame::PathAck {
+            path_id: 1,
+            ack_delay: 0,
+            ranges,
+            ecn_counts: None,
+        },
+        frame::Frame::PathStatusAvailable {
+            path_id: 1,
+            seq_num: 7,
+        },
+        frame::Frame::PathStatusBackup {
+            path_id: 1,
+            seq_num: 8,
+        },
+        frame::Frame::PathNewConnectionId {
+            path_id: 1,
+            seq_num: 9,
+            retire_prior_to: 0,
+            conn_id: cid.to_vec(),
+            reset_token,
+        },
+        frame::Frame::PathRetireConnectionId {
+            path_id: 1,
+            seq_num: 0,
+        },
+        frame::Frame::PathAbandon {
+            path_id: 1,
+            error_code: 0,
+        },
+    ];
+
+    for frame in frames {
+        let dbg = format!("{frame:?}");
+        let len = test_utils::encode_pkt(
+            &mut pipe.server,
+            packet::Type::Short,
+            &[frame],
+            &mut buf,
+        )
+        .unwrap();
+
+        let res = pipe.client_recv(&mut buf[..len]);
+        assert!(
+            res.is_ok(),
+            "frame {dbg} for abandoned path ID must be silently \
+             ignored, got {res:?}"
+        );
+    }
+
+    // No echo is queued for the already-consumed path ID.
+    assert!(pipe.client.mp_abandon_queue.is_empty());
+    assert!(!pipe.client.is_closed());
+}
+
+/// Behavior 6 (§3.4): in-flight data on the abandoned path is evacuated
+/// at abandon time: unacked frames are rescheduled and retransmitted on
+/// the remaining paths.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_evacuates_inflight_data_to_other_path() {
+    let (mut pipe, pid, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Send stream data on path 1, and lose the flight.
+    assert_eq!(pipe.client.stream_send(0, b"evacuate-me", false), Ok(11));
+    pipe.client.paths.get_mut(pid).unwrap().request_validation();
+    let lost_flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr_2),
+        Some(server_addr),
+    )
+    .unwrap();
+    assert!(!lost_flight.is_empty());
+    drop(lost_flight);
+
+    // Abandon path 1: the unacked stream data is rescheduled immediately
+    // and reaches the server through the remaining path.
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let mut b = [0; 32];
+    let (len, fin) = pipe.server.stream_recv(0, &mut b).unwrap();
+    assert_eq!(&b[..len], b"evacuate-me");
+    assert!(!fin);
+}
+
+/// Behavior 7 (§3.4): an abandoned path ID MUST NOT be reused for new
+/// paths.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_path_id_never_reused() {
+    let (mut pipe, pid, _a, _b, server_addr) =
+        mp_pipe_with_second_path(&[1, 2]);
+
+    // Tear path ID 1 down completely.
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let deadline =
+        pipe.client.paths.get(pid).unwrap().mp_abandon_deadline.unwrap();
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) +
+            Duration::from_millis(5),
+    );
+    pipe.client.on_timeout();
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+
+    // A new path skips the consumed path ID 1 and consumes 2 instead,
+    // even though 1 is the lowest numerically unused identifier.
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+    assert_eq!(pipe.client.create_path(client_addr_3, server_addr), Ok(2));
+}
+
+/// Behavior 8 (§3.4): PATH_ABANDON received for the only open path of the
+/// connection: the receiver sends CONNECTION_CLOSE and enters the closing
+/// state.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_last_open_path_closes_connection() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    let mut buf = [0; 65535];
+
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        packet::Type::Short,
+        &[frame::Frame::PathAbandon {
+            path_id: 0,
+            error_code: 0,
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    assert!(pipe.client_recv(&mut buf[..len]).is_ok());
+
+    // The client closes the connection with a transport-level NO_ERROR.
+    let local_error = pipe.client.local_error().unwrap();
+    assert!(!local_error.is_app);
+    assert_eq!(local_error.error_code, 0x0);
+
+    // A CONNECTION_CLOSE goes out and the client enters the closing
+    // state.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(frames
+        .iter()
+        .any(|f| matches!(f, frame::Frame::ConnectionClose { .. })));
+    assert!(pipe.client.is_draining());
+}
+
+/// Behavior 9 (§3.1): if path validation fails, the path ID is consumed
+/// either way, so the endpoint MUST explicitly close the path as
+/// specified in §3.4, including sending a PATH_ABANDON frame.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_on_failed_validation() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    // Open path 1, but never let the PATH_CHALLENGE reach the server.
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+    let pid = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr_2, server_addr))
+        .unwrap();
+
+    for _ in 0..MAX_PROBING_TIMEOUTS {
+        // The PATH_CHALLENGE is always lost.
+        test_utils::emit_flight(&mut pipe.client).unwrap();
+
+        let probe_instant = pipe
+            .client
+            .paths
+            .get(pid)
+            .unwrap()
+            .recovery
+            .loss_detection_timer()
+            .unwrap();
+        let timer = probe_instant.duration_since(Instant::now());
+        std::thread::sleep(timer + Duration::from_millis(1));
+
+        pipe.client.on_timeout();
+    }
+
+    assert_eq!(
+        pipe.client.path_event_next(),
+        Some(PathEvent::FailedValidation(client_addr_2, server_addr)),
+    );
+
+    // Validation failure consumed the path ID: full teardown, including
+    // PATH_ABANDON emission and immediate retirement of the peer's CIDs
+    // for the path.
+    assert!(pipe.client.paths.get(pid).unwrap().mp_closing);
+    assert!(pipe
+        .client
+        .paths
+        .get(pid)
+        .unwrap()
+        .mp_abandon_deadline
+        .is_some());
+    assert_eq!(pipe.client.ids.mp_lowest_available_dcid_seq(1), None);
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    let mut abandon_seen = false;
+    for (pkt, _) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.server, &mut pkt).unwrap();
+        if frames
+            .iter()
+            .any(|f| matches!(f, frame::Frame::PathAbandon { path_id: 1, .. }))
+        {
+            abandon_seen = true;
+        }
+    }
+    assert!(
+        abandon_seen,
+        "failed validation must produce a PATH_ABANDON for the path"
+    );
+}
+
+/// Behavior 10 (§3.4): PATH_ABANDON received for a path ID that never
+/// carried traffic (CIDs issued, path never opened) is not an error: the
+/// DCID pool is retired, the path ID is consumed, and a PATH_ABANDON is
+/// echoed.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_unused_path_id_is_clean() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    let mut buf = [0; 65535];
+
+    assert!(pipe.client.ids.mp_lowest_available_dcid_seq(1).is_some());
+
+    let len = test_utils::encode_pkt(
+        &mut pipe.server,
+        packet::Type::Short,
+        &[frame::Frame::PathAbandon {
+            path_id: 1,
+            error_code: 0,
+        }],
+        &mut buf,
+    )
+    .unwrap();
+    assert!(pipe.client_recv(&mut buf[..len]).is_ok());
+
+    // The path ID is consumed and its DCID pool retired.
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+    assert_eq!(pipe.client.ids.mp_lowest_available_dcid_seq(1), None);
+
+    // The client echoes a PATH_ABANDON for the never-used path ID.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathAbandon {
+                path_id: 1,
+                error_code: multipath::frames::PATH_ABANDON_NO_ERROR,
+            }
+        )),
+        "PATH_ABANDON for an unused path ID must still be echoed"
+    );
+
+    // The connection is unaffected.
+    assert!(!pipe.client.is_closed());
+    assert_eq!(pipe.advance(), Ok(()));
+}
+
+/// Behavior 11 (§4.3): on loss, only the latest PATH_STATUS for a path is
+/// retransmitted, even if an older PATH_STATUS frame was previously
+/// acknowledged.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_status_lost_resends_latest_only() {
+    let (mut pipe, _pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    let mut buf = [0; 65535];
+
+    // First status: delivered and acknowledged.
+    assert_eq!(
+        pipe.client.set_path_status(1, path::PathAppStatus::Backup),
+        Ok(())
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Second status: the packet carrying it is lost.
+    assert_eq!(
+        pipe.client
+            .set_path_status(1, path::PathAppStatus::Available),
+        Ok(())
+    );
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(frames.iter().any(|f| matches!(
+        f,
+        frame::Frame::PathStatusAvailable {
+            path_id: 1,
+            seq_num: 2,
+        }
+    )));
+
+    // Trigger ack-based loss detection with flights delivered to their
+    // real addresses.
+    let pkt_thresh = pipe
+        .client
+        .paths
+        .get_active()
+        .unwrap()
+        .recovery
+        .pkt_thresh()
+        .unwrap();
+
+    for _ in 0..pkt_thresh {
+        for (_, p) in pipe.client.paths.iter_mut() {
+            p.needs_ack_eliciting = true;
+        }
+        let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+        test_utils::process_flight(&mut pipe.server, flight).unwrap();
+    }
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    // The latest status (seq 2, Available) is retransmitted despite the
+    // earlier status having been acknowledged.
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.server, &mut buf[..len]).unwrap();
+    assert!(
+        frames.iter().any(|f| matches!(
+            f,
+            frame::Frame::PathStatusAvailable {
+                path_id: 1,
+                seq_num: 2,
+            }
+        )),
+        "the latest PATH_STATUS must be retransmitted on loss"
+    );
 }

@@ -564,6 +564,33 @@ impl RecoveryOps for LegacyRecovery {
         !self.epochs[epoch].lost_frames.is_empty()
     }
 
+    #[cfg(feature = "multipath")]
+    fn mp_mark_all_unacked_lost(&mut self, epoch: Epoch) {
+        let epoch = &mut self.epochs[epoch];
+
+        let unacked_iter = epoch
+            .sent_packets
+            .iter_mut()
+            // Skip packets that have already been acked or lost.
+            .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
+
+        for unacked in unacked_iter {
+            // Only the frames are rescheduled for retransmission; the
+            // packets are not declared lost towards congestion control,
+            // mirroring the PTO probe behavior. Late acknowledgments
+            // received during the retention window still ack the (now
+            // empty) packets.
+            epoch.lost_frames.extend(unacked.frames.drain(..));
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    fn mp_schedule_lost_frames(
+        &mut self, epoch: Epoch, frames: Vec<frame::Frame>,
+    ) {
+        self.epochs[epoch].lost_frames.extend(frames);
+    }
+
     fn loss_probes(&self, epoch: Epoch) -> usize {
         self.epochs[epoch].loss_probes
     }

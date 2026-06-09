@@ -682,6 +682,29 @@ impl RecoveryOps for GRecovery {
         !self.epochs[epoch].lost_frames.is_empty()
     }
 
+    #[cfg(feature = "multipath")]
+    fn mp_mark_all_unacked_lost(&mut self, epoch: packet::Epoch) {
+        let epoch = &mut self.epochs[epoch];
+
+        for pkt in epoch.sent_packets.iter_mut() {
+            if let SentStatus::Sent { frames, .. } = &mut pkt.status {
+                // Only the frames are rescheduled for retransmission; the
+                // packets are not declared lost towards congestion
+                // control, mirroring the PTO probe behavior. Late
+                // acknowledgments received during the retention window
+                // still ack the (now empty) packets.
+                epoch.lost_frames.extend(frames.drain(..));
+            }
+        }
+    }
+
+    #[cfg(feature = "multipath")]
+    fn mp_schedule_lost_frames(
+        &mut self, epoch: packet::Epoch, frames: Vec<frame::Frame>,
+    ) {
+        self.epochs[epoch].lost_frames.extend(frames);
+    }
+
     fn loss_probes(&self, epoch: packet::Epoch) -> usize {
         self.epochs[epoch].loss_probes
     }

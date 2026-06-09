@@ -272,9 +272,26 @@ pub struct Path {
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_abandon_pending: bool,
 
+    /// True once a PATH_ABANDON frame for this path has been put on the
+    /// wire at least once. Used to satisfy the echo requirement of
+    /// draft-ietf-quic-multipath-21 §3.4: an endpoint receiving a
+    /// PATH_ABANDON MUST send a corresponding PATH_ABANDON, *if it has not
+    /// already done so*.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_path_abandon_sent: bool,
+
     /// True when the PATH_ABANDON frame has been acked.
     #[cfg(feature = "multipath")]
     pub(crate) mp_path_abandon_acked: bool,
+
+    /// When set, the instant at which the retention window of this
+    /// abandoned path expires and its state can be deleted
+    /// (draft-ietf-quic-multipath-21 §3.4: knowledge of the path's packet
+    /// number space and issued connection IDs SHOULD be retained for 3 PTO
+    /// after path abandon). The PTO of the abandoned path at abandon time
+    /// is used; the draft does not pin which path's PTO applies.
+    #[cfg(feature = "multipath")]
+    pub(crate) mp_abandon_deadline: Option<Instant>,
 
     /// Error code to send in the PATH_ABANDON frame.
     #[cfg(feature = "multipath")]
@@ -386,7 +403,11 @@ impl Path {
             #[cfg(feature = "multipath")]
             mp_path_abandon_pending: false,
             #[cfg(feature = "multipath")]
+            mp_path_abandon_sent: false,
+            #[cfg(feature = "multipath")]
             mp_path_abandon_acked: false,
+            #[cfg(feature = "multipath")]
+            mp_abandon_deadline: None,
             #[cfg(feature = "multipath")]
             mp_path_abandon_error_code: 0,
             #[cfg(feature = "multipath")]
@@ -491,7 +512,7 @@ impl Path {
 
     /// Returns whether this path failed its validation.
     #[inline]
-    fn validation_failed(&self) -> bool {
+    pub(crate) fn validation_failed(&self) -> bool {
         self.state == PathState::Failed
     }
 
@@ -778,6 +799,13 @@ pub struct PathMap {
 
     #[cfg(feature = "multipath")]
     pub(crate) peer_max_path_id: u64,
+
+    /// Multipath path IDs that have been abandoned and fully torn down
+    /// (draft-ietf-quic-multipath-21 §3.4). Abandoned path IDs MUST NOT be
+    /// reused for new paths, and frames referring to them are silently
+    /// ignored (§4).
+    #[cfg(feature = "multipath")]
+    pub(crate) abandoned_ids: std::collections::BTreeSet<u64>,
 }
 
 impl PathMap {
@@ -812,6 +840,8 @@ impl PathMap {
             local_max_path_id: 0,
             #[cfg(feature = "multipath")]
             peer_max_path_id: 0,
+            #[cfg(feature = "multipath")]
+            abandoned_ids: std::collections::BTreeSet::new(),
         }
     }
 
@@ -827,12 +857,45 @@ impl PathMap {
 
     /// Returns true if the provided multipath path ID refers to an
     /// abandoned path. Frames referring to abandoned path IDs are silently
-    /// ignored (draft-ietf-quic-multipath-21 §4.4/§4.5).
+    /// ignored (draft-ietf-quic-multipath-21 §4), and abandoned path IDs
+    /// MUST NOT be reused for new paths (§3.4).
+    ///
+    /// Paths that are still in their post-abandon retention window
+    /// (mp_closing, state retained for 3 PTO) are *not* reported here:
+    /// their state is intentionally kept alive to acknowledge reordered
+    /// packets (§3.4.3).
     #[cfg(feature = "multipath")]
-    pub fn is_abandoned_path_id(&self, _path_id: u64) -> bool {
-        // Task 2.2 populates this with real abandoned-path tracking; until
-        // then, no path ID is ever considered abandoned.
-        false
+    pub fn is_abandoned_path_id(&self, path_id: u64) -> bool {
+        self.abandoned_ids.contains(&path_id)
+    }
+
+    /// Records the provided multipath path ID as abandoned without a live
+    /// path to tear down (e.g. PATH_ABANDON received for a never-used path
+    /// ID, draft-ietf-quic-multipath-21 §3.4).
+    #[cfg(feature = "multipath")]
+    pub fn mark_abandoned_id(&mut self, path_id: u64) {
+        self.abandoned_ids.insert(path_id);
+    }
+
+    /// Deletes the path identified by the slab identifier `pid` at the end
+    /// of its post-abandon retention window: removes it from the path
+    /// table, records its multipath path ID as abandoned (so it is never
+    /// reused, draft-ietf-quic-multipath-21 §3.4) and notifies the
+    /// application.
+    #[cfg(feature = "multipath")]
+    pub fn remove_abandoned(&mut self, pid: usize) -> Result<Path> {
+        if !self.paths.contains(pid) {
+            return Err(Error::InvalidState);
+        }
+
+        let path = self.paths.remove(pid);
+        self.addrs_to_paths
+            .remove(&(path.local_addr, path.peer_addr));
+        self.abandoned_ids.insert(path.path_id);
+
+        self.notify_event(PathEvent::Closed(path.local_addr, path.peer_addr));
+
+        Ok(path)
     }
 
     /// Gets a mutable reference to the path identified by `path_id`. If the

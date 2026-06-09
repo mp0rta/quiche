@@ -1633,6 +1633,13 @@ where
     /// one-shot semantics as `mp_paths_blocked_pending`.
     #[cfg(feature = "multipath")]
     mp_path_cids_blocked_pending: Option<(u64, u64)>,
+
+    /// Pending PATH_ABANDON frames, as (path ID, error code) pairs, for
+    /// path IDs that have no live `Path` to hold the pending flag: echoes
+    /// for never-used path IDs and retransmissions for paths whose state
+    /// was already deleted (draft-ietf-quic-multipath-21 §3.4).
+    #[cfg(feature = "multipath")]
+    mp_abandon_queue: Vec<(u64, u64)>,
 }
 
 /// Outcome of selecting the next multipath path ID to consume when opening
@@ -2295,6 +2302,8 @@ impl<F: BufFactory> Connection<F> {
             mp_paths_blocked_pending: None,
             #[cfg(feature = "multipath")]
             mp_path_cids_blocked_pending: None,
+            #[cfg(feature = "multipath")]
+            mp_abandon_queue: Vec::new(),
         };
 
         if let Some(retry_cids) = retry_cids {
@@ -3818,7 +3827,7 @@ impl<F: BufFactory> Connection<F> {
         #[cfg(feature = "multipath")]
         let mut mp_abandon_acked: SmallVec<[u64; 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
-        let mut mp_status_acked: SmallVec<[u64; 2]> = SmallVec::new();
+        let mut mp_status_acked: SmallVec<[(u64, u64); 2]> = SmallVec::new();
         #[cfg(feature = "multipath")]
         let mut mp_path_ack_acked: SmallVec<[(u64, u64); 4]> = SmallVec::new();
 
@@ -3984,9 +3993,9 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     #[cfg(feature = "multipath")]
-                    frame::Frame::PathStatusAvailable { path_id, .. } |
-                    frame::Frame::PathStatusBackup { path_id, .. } => {
-                        mp_status_acked.push(path_id);
+                    frame::Frame::PathStatusAvailable { path_id, seq_num } |
+                    frame::Frame::PathStatusBackup { path_id, seq_num } => {
+                        mp_status_acked.push((path_id, seq_num));
                     },
 
                     frame::Frame::ResetStream { stream_id, .. } => {
@@ -4055,20 +4064,31 @@ impl<F: BufFactory> Connection<F> {
         }
         #[cfg(feature = "multipath")]
         for mp_path_id in mp_abandon_acked {
+            // The peer acknowledged our PATH_ABANDON: no retransmission of
+            // it is needed anymore, whether the abandoned path is still in
+            // its retention window or already deleted.
+            self.mp_abandon_queue.retain(|&(id, _)| id != mp_path_id);
+
             for (_, p) in self.paths.iter_mut() {
                 if p.path_id == mp_path_id {
                     p.mp_path_abandon_pending = false;
+                    p.mp_path_abandon_sent = true;
                     p.mp_path_abandon_acked = true;
                     break;
                 }
             }
         }
         #[cfg(feature = "multipath")]
-        for mp_path_id in mp_status_acked {
+        for (mp_path_id, seq_num) in mp_status_acked {
             for (_, p) in self.paths.iter_mut() {
                 if p.path_id == mp_path_id {
-                    p.mp_path_status_pending = false;
-                    p.mp_path_status_acked = true;
+                    // Only the latest PATH_STATUS matters: an
+                    // acknowledgment for a stale (superseded) status frame
+                    // must not stop the retransmission of the current one.
+                    if seq_num == p.mp_path_status_seq_num {
+                        p.mp_path_status_pending = false;
+                        p.mp_path_status_acked = true;
+                    }
                     break;
                 }
             }
@@ -4076,10 +4096,19 @@ impl<F: BufFactory> Connection<F> {
 
         // Now that we processed all the frames, if there is a path that has no
         // Destination CID, try to allocate one.
-        let no_dcid = self
-            .paths
-            .iter_mut()
-            .filter(|(_, p)| p.active_dcid_seq.is_none());
+        //
+        // Closing (abandoned) paths are skipped: the connection IDs the
+        // peer issued for them are retired and no packets may be sent on
+        // them anymore (draft-ietf-quic-multipath-21 §3.4).
+        let no_dcid =
+            self.paths.iter_mut().filter(|(_, p)| {
+                #[cfg(feature = "multipath")]
+                if p.mp_closing || p.mp_closed {
+                    return false;
+                }
+
+                p.active_dcid_seq.is_none()
+            });
 
         for (pid, p) in no_dcid {
             if self.ids.zero_length_dcid() {
@@ -5998,6 +6027,19 @@ impl<F: BufFactory> Connection<F> {
                 .filter_map(|(_, p)| p.recovery.loss_detection_timer())
                 .min();
 
+            // Expiry of the post-abandon retention window of abandoned
+            // multipath paths (draft-ietf-quic-multipath-21 §3.4).
+            #[cfg(feature = "multipath")]
+            let path_timer = {
+                let abandon_timer = self
+                    .paths
+                    .iter()
+                    .filter_map(|(_, p)| p.mp_abandon_deadline)
+                    .min();
+
+                [path_timer, abandon_timer].iter().filter_map(|&x| x).min()
+            };
+
             let key_update_timer = self.crypto_ctx[packet::Epoch::Application]
                 .key_update
                 .as_ref()
@@ -6113,6 +6155,35 @@ impl<F: BufFactory> Connection<F> {
 
         // Notify timeout events to the application.
         self.paths.notify_failed_validations();
+
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled {
+            // §3.1: if path validation fails, the path ID is consumed
+            // either way, so the path MUST be explicitly closed as
+            // specified in §3.4. This applies to clients and servers
+            // alike. The draft does not assign a specific error code to
+            // validation failure; NO_ERROR is used.
+            let failed: SmallVec<[usize; 2]> = self
+                .paths
+                .iter()
+                .filter(|(_, p)| {
+                    p.validation_failed() && !p.mp_closing && !p.mp_closed
+                })
+                .map(|(pid, _)| pid)
+                .collect();
+
+            for pid in failed {
+                let _ = self.mp_abandon_path(
+                    pid,
+                    multipath::frames::PATH_ABANDON_NO_ERROR,
+                    now,
+                );
+            }
+
+            // Delete the state of abandoned paths whose 3-PTO retention
+            // window has expired (§3.4).
+            self.mp_finalize_abandoned_paths(now);
+        }
 
         // If the active path failed, try to find a new candidate.
         if self.paths.get_active_path_id().is_err() {
@@ -7224,14 +7295,89 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::LastActivePath);
         }
 
-        let path = self.paths.get_mut(idx)?;
+        self.mp_abandon_path(idx, error_code, Instant::now())
+    }
+
+    /// Tears down the path identified by the slab identifier `pid`
+    /// (draft-ietf-quic-multipath-21 §3.1/§3.4). This single routine backs
+    /// the three abandon triggers: a local [`close_path()`] call, the
+    /// receipt of a PATH_ABANDON frame, and path validation failure.
+    ///
+    /// It performs, in order:
+    ///
+    /// - marks the path as closing so no further packets are sent on it;
+    /// - queues a PATH_ABANDON frame with `error_code` unless one was
+    ///   already sent (the echo requirement of §3.4 when triggered by a
+    ///   received PATH_ABANDON);
+    /// - evacuates in-flight data: every unacked frame sent on the path is
+    ///   rescheduled for retransmission, which the scheduler then carries
+    ///   over the remaining paths;
+    /// - treats all connection IDs received from the peer for the path as
+    ///   immediately retired, without sending PATH_RETIRE_CONNECTION_ID
+    ///   frames (§3.4);
+    /// - arms the retention window: the path's packet number space and our
+    ///   issued connection IDs are kept for 3 PTO (of the abandoned path,
+    ///   measured at abandon time) so reordered packets can still be
+    ///   acknowledged (§3.4.2/§3.4.3), after which
+    ///   [`mp_finalize_abandoned_paths()`] deletes the path state.
+    ///
+    /// Calling this on a path that is already closing is a no-op.
+    ///
+    /// [`close_path()`]: struct.Connection.html#method.close_path
+    #[cfg(feature = "multipath")]
+    fn mp_abandon_path(
+        &mut self, pid: usize, error_code: u64, now: Instant,
+    ) -> Result<()> {
+        let path = self.paths.get_mut(pid)?;
+
+        if path.mp_closing || path.mp_closed {
+            return Ok(());
+        }
+
+        let path_id = path.path_id;
+
         path.mp_closing = true;
-        path.mp_path_abandon_pending = true;
-        path.mp_path_abandon_error_code = error_code;
-        self.paths.active_path_count -= 1;
+
+        // Queue a PATH_ABANDON frame, unless we already sent one for this
+        // path (§3.4: send a corresponding PATH_ABANDON "if it has not
+        // already done so").
+        if !path.mp_path_abandon_sent && !path.mp_path_abandon_acked {
+            path.mp_path_abandon_pending = true;
+            path.mp_path_abandon_error_code = error_code;
+        }
+
+        // Retention window: 3 PTO of the abandoned path, measured now.
+        path.mp_abandon_deadline = Some(now + 3 * path.recovery.pto());
+
+        // Evacuate in-flight data: every unacked frame sent on this path
+        // is rescheduled for retransmission. The regular lost-frame
+        // processing re-queues the retransmittable content (stream data,
+        // resets, ...) at the connection level, and the scheduler then
+        // sends it on the remaining paths, as this path stops being
+        // sendable (`can_send()` is false for closing paths).
+        for &epoch in packet::Epoch::epochs(
+            packet::Epoch::Initial..=packet::Epoch::Application,
+        ) {
+            path.recovery.mp_mark_all_unacked_lost(epoch);
+        }
+
+        // All connection IDs received from the peer for this path are
+        // immediately retired, with no PATH_RETIRE_CONNECTION_ID emission
+        // (§3.4).
+        self.ids.mp_retire_dcid_pool(path_id);
+
+        self.paths.active_path_count =
+            self.paths.active_path_count.saturating_sub(1);
 
         self.notify_scheduler_path(
             multipath::scheduler::SchedulerPathEvent::Closed(path_id),
+        );
+
+        trace!(
+            "{} abandoning path_id={} error_code={}",
+            self.trace_id,
+            path_id,
+            error_code,
         );
 
         #[cfg(feature = "qlog")]
@@ -7247,6 +7393,115 @@ impl<F: BufFactory> Connection<F> {
         });
 
         Ok(())
+    }
+
+    /// Deletes the state of abandoned paths whose 3-PTO retention window
+    /// has expired (draft-ietf-quic-multipath-21 §3.4/§3.4.3): packets
+    /// sent over the path and not yet acknowledged are considered lost
+    /// (their frames are transferred to a surviving path for
+    /// retransmission), the per-path connection ID pools are dropped, the
+    /// path ID is recorded as consumed so it is never reused, and the
+    /// `Path` entry is removed.
+    #[cfg(feature = "multipath")]
+    fn mp_finalize_abandoned_paths(&mut self, now: Instant) {
+        loop {
+            let expired = self.paths.iter().find_map(|(pid, p)| {
+                if p.mp_abandon_deadline.is_some_and(|d| d <= now) {
+                    Some(pid)
+                } else {
+                    None
+                }
+            });
+
+            let pid = match expired {
+                Some(pid) => pid,
+                None => break,
+            };
+
+            // Packets sent over the path and not yet acknowledged MUST be
+            // considered lost (§3.4.3): reschedule their frames, then
+            // collect everything still pending so it survives the path
+            // deletion. Per-path probing and PMTUD frames are dropped, as
+            // they are meaningless on another path.
+            let mut orphan_frames: Vec<(packet::Epoch, frame::Frame)> =
+                Vec::new();
+
+            if let Ok(path) = self.paths.get_mut(pid) {
+                for &epoch in packet::Epoch::epochs(
+                    packet::Epoch::Initial..=packet::Epoch::Application,
+                ) {
+                    path.recovery.mp_mark_all_unacked_lost(epoch);
+
+                    while let Some(f) = path.recovery.next_lost_frame(epoch) {
+                        match f {
+                            frame::Frame::Ping {
+                                mtu_probe: Some(..),
+                            } |
+                            frame::Frame::PathChallenge { .. } |
+                            frame::Frame::PathResponse { .. } => (),
+
+                            _ => orphan_frames.push((epoch, f)),
+                        }
+                    }
+                }
+            }
+
+            let path = match self.paths.remove_abandoned(pid) {
+                Ok(path) => path,
+                Err(_) => break,
+            };
+
+            let path_id = path.path_id;
+
+            // If our PATH_ABANDON never made it to the wire, keep it
+            // pending at the connection level.
+            if path.mp_path_abandon_pending &&
+                !self.mp_abandon_queue.iter().any(|&(id, _)| id == path_id)
+            {
+                self.mp_abandon_queue
+                    .push((path_id, path.mp_path_abandon_error_code));
+            }
+
+            // Drop the per-path connection ID pools, both directions.
+            self.ids.mp_remove_path_pools(path_id);
+
+            // Transfer the outstanding frames onto a surviving path for
+            // retransmission.
+            if !orphan_frames.is_empty() {
+                let target = self
+                    .paths
+                    .iter()
+                    .find(|(_, p)| p.can_send(true))
+                    .map(|(tpid, _)| tpid)
+                    .or_else(|| self.paths.get_active_path_id().ok());
+
+                if let Some(tpid) = target {
+                    if let Ok(target_path) = self.paths.get_mut(tpid) {
+                        for &epoch in packet::Epoch::epochs(
+                            packet::Epoch::Initial..=packet::Epoch::Application,
+                        ) {
+                            let frames: Vec<frame::Frame> = orphan_frames
+                                .iter()
+                                .filter(|(e, _)| *e == epoch)
+                                .map(|(_, f)| f.clone())
+                                .collect();
+
+                            if !frames.is_empty() {
+                                target_path
+                                    .recovery
+                                    .mp_schedule_lost_frames(epoch, frames);
+                            }
+                        }
+                    }
+                }
+            }
+
+            trace!(
+                "{} deleted abandoned path state path_id={}",
+                self.trace_id,
+                path_id,
+            );
+        }
     }
 
     /// Replaces the multipath scheduler algorithm at runtime.
@@ -7314,6 +7569,9 @@ impl<F: BufFactory> Connection<F> {
         let path = self.paths.get_mut(idx)?;
         path.app_status = status;
         path.mp_path_status_pending = true;
+        // A new status supersedes any previously acknowledged one: the
+        // acked flag tracks the *latest* sequence number only.
+        path.mp_path_status_acked = false;
         path.mp_path_status_seq_num += 1;
 
         self.notify_scheduler_path(
@@ -7749,12 +8007,17 @@ impl<F: BufFactory> Connection<F> {
 
         // Pending per-path PATH_NEW_CONNECTION_ID /
         // PATH_RETIRE_CONNECTION_ID advertisements also trigger sending, as
-        // do pending PATHS_BLOCKED / PATH_CIDS_BLOCKED frames (§3.2.1).
+        // do pending PATHS_BLOCKED / PATH_CIDS_BLOCKED frames (§3.2.1) and
+        // pending PATH_ABANDON / PATH_STATUS frames (§3.4/§4.3).
         #[cfg(feature = "multipath")]
         let mp_has_cid_frames = self.ids.mp_has_new_scids() ||
             self.ids.mp_has_retire_dcids() ||
             self.mp_paths_blocked_pending.is_some() ||
-            self.mp_path_cids_blocked_pending.is_some();
+            self.mp_path_cids_blocked_pending.is_some() ||
+            !self.mp_abandon_queue.is_empty() ||
+            self.paths.iter().any(|(_, p)| {
+                p.mp_path_abandon_pending || p.mp_path_status_pending
+            });
         #[cfg(not(feature = "multipath"))]
         let mp_has_cid_frames = false;
 
@@ -8419,6 +8682,13 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
+
+                // §3.4.3/§4: PATH_ACK frames received with an abandoned
+                // path ID are silently ignored.
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
                 trace!(
                     "{} received PATH_ACK for path_id={} ack_delay={}",
                     self.trace_id,
@@ -8514,32 +8784,81 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
-                // Mark the path identified by multipath path_id as closing.
-                let mut found = false;
-                for (_, p) in self.paths.iter_mut() {
-                    if p.path_id == path_id && !p.mp_closing {
-                        p.mp_closing = true;
-                        found = true;
-                        trace!(
-                            "{} PATH_ABANDON path_id={} error_code={}",
-                            self.trace_id,
-                            path_id,
-                            error_code,
-                        );
-                        break;
-                    }
-                }
-                if found {
-                    debug_assert!(
-                        self.paths.active_path_count > 0,
-                        "active_path_count underflow on PATH_ABANDON recv"
-                    );
-                    self.paths.active_path_count =
-                        self.paths.active_path_count.saturating_sub(1);
 
-                    self.notify_scheduler_path(
-                        multipath::scheduler::SchedulerPathEvent::Closed(path_id),
-                    );
+                // §4: receiving a path ID greater than the limit we
+                // advertised is a connection error of type
+                // PROTOCOL_VIOLATION.
+                if path_id > self.paths.local_max_path_id {
+                    return Err(Error::InvalidState);
+                }
+
+                // §4: frames referring to an already-consumed path ID are
+                // silently ignored (e.g. a duplicate PATH_ABANDON received
+                // after the path state was deleted).
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
+                trace!(
+                    "{} PATH_ABANDON path_id={} error_code={}",
+                    self.trace_id,
+                    path_id,
+                    error_code,
+                );
+
+                let target_pid = self.paths.iter().find_map(|(i, p)| {
+                    if p.path_id == path_id {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                });
+
+                match target_pid {
+                    Some(pid) => {
+                        // Full teardown, echoing a PATH_ABANDON of our own
+                        // if we have not sent one yet (§3.4). The echo
+                        // carries NO_ERROR: the closure is a response to
+                        // the peer's request, not a local condition.
+                        self.mp_abandon_path(
+                            pid,
+                            multipath::frames::PATH_ABANDON_NO_ERROR,
+                            now,
+                        )?;
+
+                        // §3.4: PATH_ABANDON received for the only open
+                        // path of the connection: close the connection
+                        // with NO_ERROR and enter the closing state.
+                        let any_open = self
+                            .paths
+                            .iter()
+                            .any(|(_, p)| !p.mp_closing && !p.mp_closed);
+
+                        if !any_open {
+                            let _ = self.close(false, 0x0, b"");
+                        }
+                    },
+
+                    None => {
+                        // §3.4: PATH_ABANDON received for a path ID that
+                        // never carried traffic (e.g. CIDs were issued but
+                        // the path was never opened). Not an error: retire
+                        // its DCID pool, consume the path ID and echo a
+                        // PATH_ABANDON.
+                        self.ids.mp_retire_dcid_pool(path_id);
+                        self.paths.mark_abandoned_id(path_id);
+
+                        if !self
+                            .mp_abandon_queue
+                            .iter()
+                            .any(|&(id, _)| id == path_id)
+                        {
+                            self.mp_abandon_queue.push((
+                                path_id,
+                                multipath::frames::PATH_ABANDON_NO_ERROR,
+                            ));
+                        }
+                    },
                 }
             },
 
@@ -8548,6 +8867,13 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
+
+                // §4: frames referring to an abandoned path ID are
+                // silently ignored.
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
                         // Reject stale PATH_STATUS frames.
@@ -8581,6 +8907,13 @@ impl<F: BufFactory> Connection<F> {
                 if !self.multipath_enabled {
                     return Err(Error::InvalidFrame);
                 }
+
+                // §4: frames referring to an abandoned path ID are
+                // silently ignored.
+                if self.paths.is_abandoned_path_id(path_id) {
+                    return Ok(());
+                }
+
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
                         // Reject stale PATH_STATUS frames.
@@ -8661,8 +8994,8 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // Frames referring to an abandoned path ID are silently
-                // ignored. Task 2.2 populates the abandoned-path tracking.
+                // §4: frames referring to an abandoned path ID are silently
+                // ignored.
                 if self.paths.is_abandoned_path_id(path_id) {
                     return Ok(());
                 }
@@ -8769,8 +9102,8 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // Frames referring to an abandoned path ID are silently
-                // ignored. Task 2.2 populates the abandoned-path tracking.
+                // §4: frames referring to an abandoned path ID are silently
+                // ignored.
                 if self.paths.is_abandoned_path_id(path_id) {
                     return Ok(());
                 }

@@ -196,6 +196,25 @@ pub trait RecoveryOps {
 
     fn get_largest_acked_on_epoch(&self, epoch: packet::Epoch) -> Option<u64>;
     fn has_lost_frames(&self, epoch: packet::Epoch) -> bool;
+
+    /// Moves the frames of every sent packet that is neither acked nor
+    /// already declared lost into the lost-frames queue, so they are
+    /// retransmitted. Used when a multipath path is abandoned
+    /// (draft-ietf-quic-multipath-21 §3.4): in-flight data is evacuated to
+    /// the remaining paths, and on final path deletion the packets sent
+    /// over the path and not yet acknowledged MUST be considered lost
+    /// (§3.4.3). Congestion state is not affected.
+    #[cfg(feature = "multipath")]
+    fn mp_mark_all_unacked_lost(&mut self, epoch: packet::Epoch);
+
+    /// Appends the provided frames to the lost-frames queue of the given
+    /// epoch, scheduling them for retransmission from this path. Used to
+    /// transfer the outstanding frames of a deleted (abandoned) multipath
+    /// path onto a surviving path.
+    #[cfg(feature = "multipath")]
+    fn mp_schedule_lost_frames(
+        &mut self, epoch: packet::Epoch, frames: Vec<frame::Frame>,
+    );
     fn loss_probes(&self, epoch: packet::Epoch) -> usize;
     #[cfg(test)]
     fn inc_loss_probes(&mut self, epoch: packet::Epoch);
