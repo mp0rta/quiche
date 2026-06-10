@@ -16263,6 +16263,127 @@ fn multipath_path_status_lost_resends_latest_only() {
     );
 }
 
+/// §4.3: "All path IDs below the maximum path ID limit can be indicated,
+/// even if the path is not in active use yet." A PATH_STATUS received for
+/// a within-limit path ID with no live path is retained (status and
+/// sequence number) and applied when the path is created.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_status_for_unopened_path_id_is_retained() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    // The server receives PATH_STATUS_BACKUP for path ID 1 before any
+    // path with that ID exists. This is not an error.
+    assert!(mp_inject_to_server(&mut pipe, &[frame::Frame::PathStatusBackup {
+        path_id: 1,
+        seq_num: 0,
+    }])
+    .is_ok());
+    assert_eq!(pipe.server.local_error(), None);
+    assert_eq!(
+        pipe.server.paths.pending_path_status.get(&1),
+        Some(&(0, path::PathAppStatus::Backup))
+    );
+
+    // A stale PATH_STATUS for the still-unopened path ID is ignored.
+    assert!(mp_inject_to_server(&mut pipe, &[
+        frame::Frame::PathStatusAvailable {
+            path_id: 1,
+            seq_num: 0,
+        }
+    ])
+    .is_ok());
+    assert_eq!(
+        pipe.server.paths.pending_path_status.get(&1),
+        Some(&(0, path::PathAppStatus::Backup))
+    );
+
+    // The client opens path ID 1; the retained status is carried onto
+    // the new path and the pending entry is consumed. Only the
+    // client-to-server direction is delivered: the forged packets above
+    // desynchronized the reverse direction's ACK state.
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let pid = pipe
+        .server
+        .paths
+        .iter()
+        .find(|(_, p)| p.path_id == 1)
+        .map(|(pid, _)| pid)
+        .expect("server path with path ID 1");
+    let path = pipe.server.paths.get(pid).unwrap();
+    assert_eq!(path.app_status, path::PathAppStatus::Backup);
+    assert_eq!(path.mp_path_status_rx_seq_num, Some(0));
+    assert!(pipe.server.paths.pending_path_status.is_empty());
+
+    // The carried sequence number keeps enforcing the stale rule on the
+    // live path: a duplicate of the pre-open frame is ignored...
+    assert!(mp_inject_to_server(&mut pipe, &[
+        frame::Frame::PathStatusAvailable {
+            path_id: 1,
+            seq_num: 0,
+        }
+    ])
+    .is_ok());
+    assert_eq!(
+        pipe.server.paths.get(pid).unwrap().app_status,
+        path::PathAppStatus::Backup
+    );
+
+    // ...while a newer sequence number is applied.
+    assert!(mp_inject_to_server(&mut pipe, &[
+        frame::Frame::PathStatusAvailable {
+            path_id: 1,
+            seq_num: 1,
+        }
+    ])
+    .is_ok());
+    assert_eq!(
+        pipe.server.paths.get(pid).unwrap().app_status,
+        path::PathAppStatus::Available
+    );
+}
+
+/// §4.3/§3.4: retained PATH_STATUS state for a not-yet-opened path ID is
+/// dropped when the path ID is abandoned before the path was ever
+/// created; later frames for it are silently ignored.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_pending_path_status_dropped_on_abandon_before_open() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[1]);
+
+    assert!(mp_inject_to_server(&mut pipe, &[frame::Frame::PathStatusBackup {
+        path_id: 1,
+        seq_num: 0,
+    }])
+    .is_ok());
+    assert!(pipe.server.paths.pending_path_status.contains_key(&1));
+
+    // The client abandons path ID 1 before it was ever opened.
+    assert!(mp_inject_to_server(&mut pipe, &[frame::Frame::PathAbandon {
+        path_id: 1,
+        error_code: 0,
+    }])
+    .is_ok());
+    assert!(pipe.server.paths.is_abandoned_path_id(1));
+    assert!(pipe.server.paths.pending_path_status.is_empty());
+
+    // Frames for the consumed path ID are silently ignored and leave no
+    // pending state behind.
+    assert!(mp_inject_to_server(&mut pipe, &[frame::Frame::PathStatusBackup {
+        path_id: 1,
+        seq_num: 5,
+    }])
+    .is_ok());
+    assert!(pipe.server.paths.pending_path_status.is_empty());
+    assert!(!pipe.server.is_closed());
+}
+
 // ----- draft-ietf-quic-multipath-21 §4.6 MAX_PATH_ID tests -----
 
 /// §4.6: a Maximum Path Identifier value exceeding 2^32-1 is invalid and

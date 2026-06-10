@@ -822,6 +822,17 @@ pub struct PathMap {
     /// (draft-ietf-quic-multipath-21 §2.2).
     #[cfg(feature = "multipath")]
     handshake_peer_addr: SocketAddr,
+
+    /// PATH_STATUS state received for path IDs that are within the
+    /// advertised limit but have no live `Path` yet
+    /// (draft-ietf-quic-multipath-21 §4.3: "All path IDs below the maximum
+    /// path ID limit can be indicated, even if the path is not in active
+    /// use yet."). Keyed by path ID, each entry holds the highest sequence
+    /// number seen and the corresponding status; it is applied to the
+    /// `Path` when (if ever) the path ID is opened, and dropped if the
+    /// path ID is abandoned first.
+    #[cfg(feature = "multipath")]
+    pub(crate) pending_path_status: BTreeMap<u64, (u64, PathAppStatus)>,
 }
 
 impl PathMap {
@@ -862,6 +873,29 @@ impl PathMap {
             abandoned_ids: std::collections::BTreeSet::new(),
             #[cfg(feature = "multipath")]
             handshake_peer_addr: peer_addr,
+            #[cfg(feature = "multipath")]
+            pending_path_status: BTreeMap::new(),
+        }
+    }
+
+    /// Records a PATH_STATUS received for a within-limit path ID that has
+    /// no live path yet (draft-ietf-quic-multipath-21 §4.3). The status is
+    /// retained and applied when a path with that path ID is created.
+    ///
+    /// Stale frames are subject to the same sequence number rule as live
+    /// paths: returns `false` (and changes nothing) when `seq_num` does
+    /// not exceed the retained one.
+    #[cfg(feature = "multipath")]
+    pub fn record_pending_path_status(
+        &mut self, path_id: u64, seq_num: u64, status: PathAppStatus,
+    ) -> bool {
+        match self.pending_path_status.get(&path_id) {
+            Some(&(prev, _)) if seq_num <= prev => false,
+
+            _ => {
+                self.pending_path_status.insert(path_id, (seq_num, status));
+                true
+            },
         }
     }
 
@@ -903,6 +937,10 @@ impl PathMap {
     #[cfg(feature = "multipath")]
     pub fn mark_abandoned_id(&mut self, path_id: u64) {
         self.abandoned_ids.insert(path_id);
+
+        // §4.3/§3.4: drop any PATH_STATUS retained for the (never-opened)
+        // path ID; later frames referring to it are silently ignored.
+        self.pending_path_status.remove(&path_id);
     }
 
     /// Deletes the path identified by the slab identifier `pid` at the end
@@ -920,6 +958,7 @@ impl PathMap {
         self.addrs_to_paths
             .remove(&(path.local_addr, path.peer_addr));
         self.abandoned_ids.insert(path.path_id);
+        self.pending_path_status.remove(&path.path_id);
 
         self.notify_event(PathEvent::Closed(path.local_addr, path.peer_addr));
 
@@ -1086,8 +1125,23 @@ impl PathMap {
     /// it returns [`Done`].
     ///
     /// [`Done`]: enum.Error.html#variant.Done
-    pub fn insert_path(&mut self, path: Path, is_server: bool) -> Result<usize> {
+    pub fn insert_path(
+        &mut self, #[cfg_attr(not(feature = "multipath"), allow(unused_mut))]
+        mut path: Path,
+        is_server: bool,
+    ) -> Result<usize> {
         self.make_room_for_new_path()?;
+
+        // §4.3: a PATH_STATUS may have been received for this path ID
+        // before the path was opened; carry the retained status and
+        // sequence number onto the new path.
+        #[cfg(feature = "multipath")]
+        if let Some((seq_num, status)) =
+            self.pending_path_status.remove(&path.path_id)
+        {
+            path.mp_path_status_rx_seq_num = Some(seq_num);
+            path.app_status = status;
+        }
 
         let local_addr = path.local_addr;
         let peer_addr = path.peer_addr;

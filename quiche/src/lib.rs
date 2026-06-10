@@ -9117,8 +9117,12 @@ impl<F: BufFactory> Connection<F> {
                     return Ok(());
                 }
 
+                let mut found = false;
+
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
+                        found = true;
+
                         // Reject stale PATH_STATUS frames.
                         if let Some(prev) = p.mp_path_status_rx_seq_num {
                             if seq_num <= prev {
@@ -9143,6 +9147,25 @@ impl<F: BufFactory> Connection<F> {
                         break;
                     }
                 }
+
+                // §4.3: a within-limit path ID can be indicated even if
+                // the path is not in active use yet; retain the status
+                // until the path is opened.
+                if !found &&
+                    self.paths.record_pending_path_status(
+                        path_id,
+                        seq_num,
+                        path::PathAppStatus::Available,
+                    )
+                {
+                    trace!(
+                        "{} PATH_STATUS Available retained for unopened \
+                         path_id={} seq={}",
+                        self.trace_id,
+                        path_id,
+                        seq_num,
+                    );
+                }
             },
 
             #[cfg(feature = "multipath")]
@@ -9160,8 +9183,12 @@ impl<F: BufFactory> Connection<F> {
                     return Ok(());
                 }
 
+                let mut found = false;
+
                 for (_, p) in self.paths.iter_mut() {
                     if p.path_id == path_id {
+                        found = true;
+
                         // Reject stale PATH_STATUS frames.
                         if let Some(prev) = p.mp_path_status_rx_seq_num {
                             if seq_num <= prev {
@@ -9185,6 +9212,25 @@ impl<F: BufFactory> Connection<F> {
                         );
                         break;
                     }
+                }
+
+                // §4.3: a within-limit path ID can be indicated even if
+                // the path is not in active use yet; retain the status
+                // until the path is opened.
+                if !found &&
+                    self.paths.record_pending_path_status(
+                        path_id,
+                        seq_num,
+                        path::PathAppStatus::Backup,
+                    )
+                {
+                    trace!(
+                        "{} PATH_STATUS Backup retained for unopened \
+                         path_id={} seq={}",
+                        self.trace_id,
+                        path_id,
+                        seq_num,
+                    );
                 }
             },
 
