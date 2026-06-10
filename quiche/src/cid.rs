@@ -1520,6 +1520,13 @@ impl ConnectionIdentifiers {
     ///
     /// Path ID 0 reports the legacy space's accounting.
     ///
+    /// This accounting is pool-state-only: it knows nothing about
+    /// abandoned path IDs, so a path ID whose pool was dropped reports
+    /// full headroom here. Abandoned path IDs must never be re-funded
+    /// (draft-ietf-quic-multipath-21, Section 3.4); that state lives on
+    /// the path table, and `Connection::mp_scids_left()` layers the
+    /// corresponding guard on top of this method.
+    ///
     /// [`mp_new_scid()`]: struct.ConnectionIdentifiers.html#method.mp_new_scid
     pub fn mp_scids_left(&self, path_id: u64) -> usize {
         let active = if path_id == 0 {
@@ -1618,6 +1625,24 @@ impl ConnectionIdentifiers {
         {
             self.mp_advertise_new_scid_seqs.remove(index);
         }
+    }
+
+    /// Drops every queued PATH_NEW_CONNECTION_ID advertisement for the
+    /// provided path ID. Used when the path is abandoned
+    /// (draft-ietf-quic-multipath-21, Section 3.4): its connection IDs
+    /// are implicitly retired, so advertisements queued before the
+    /// abandon must never reach the wire.
+    pub fn mp_clear_advertise_new_scids(&mut self, path_id: u64) {
+        self.mp_advertise_new_scid_seqs
+            .retain(|&(pid, _)| pid != path_id);
+    }
+
+    /// Returns an iterator over the path IDs having queued
+    /// PATH_NEW_CONNECTION_ID advertisements (with repetitions).
+    pub fn mp_advertise_new_scid_path_ids(
+        &self,
+    ) -> impl Iterator<Item = u64> + '_ {
+        self.mp_advertise_new_scid_seqs.iter().map(|&(pid, _)| pid)
     }
 
     /// Gets a (path ID, sequence number) pair requiring advertising it to

@@ -15319,6 +15319,188 @@ fn multipath_migration_port_only_keeps_congestion_state() {
     assert_eq!(migrated.recovery.rtt(), rtt_before);
 }
 
+/// draft-21 §3.1.2 / §5.1: a NAT rebinding "does not change the path ID,
+/// and does not affect the packet number space". A packet arriving on a
+/// NEW 4-tuple carrying a CID from the legacy pool — owned by path ID 0 —
+/// while path 0 is active is therefore a MIGRATION of path 0, exactly
+/// like the non-zero path ID case: no new path (and no new path ID) may
+/// be created.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_zero_cid_on_new_tuple_is_nat_rebind_migration() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Same IP, different port: a port-only rebinding.
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    let n_paths_before = pipe.server.paths.len();
+
+    // Server-side slab identifier of path 0.
+    let spid0 = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr))
+        .unwrap();
+    assert_eq!(pipe.server.paths.get(spid0).unwrap().path_id, 0);
+
+    let rtt_before = pipe.server.paths.get(spid0).unwrap().recovery.rtt();
+
+    // Pre-rebind receive state of path 0's packet number space.
+    let largest_rx_before = pipe
+        .server
+        .paths
+        .get(spid0)
+        .unwrap()
+        .app_pkt_num_space
+        .largest_rx_pkt_num;
+
+    // Elicit fresh (non-probing) client packets on path 0, then deliver
+    // them from a DIFFERENT client source address (NAT rebinding).
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.client,
+        Some(client_addr),
+        Some(server_addr),
+    )
+    .unwrap();
+
+    for (mut pkt, si) in flight {
+        let info = RecvInfo {
+            to: si.to,
+            from: client_addr_3,
+        };
+        pipe.server.recv(&mut pkt, info).unwrap();
+    }
+
+    // No new path was created: path 0 migrated to the new 4-tuple,
+    // keeping its path ID.
+    assert_eq!(pipe.server.paths.len(), n_paths_before);
+    assert!(
+        !pipe.server.paths.iter().any(|(_, p)| p.path_id > 1),
+        "NAT rebinding must not consume a new path ID"
+    );
+
+    let mpid = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr_3))
+        .unwrap();
+    assert_eq!(mpid, spid0);
+
+    let migrated = pipe.server.paths.get(mpid).unwrap();
+    assert_eq!(migrated.path_id, 0);
+    assert_eq!(migrated.peer_addr(), client_addr_3);
+
+    // The packet number space was kept across the rebinding: the
+    // pre-rebind receive state is still there and grew with the newly
+    // delivered packets.
+    assert!(
+        migrated.app_pkt_num_space.largest_rx_pkt_num >= largest_rx_before
+    );
+
+    // Port-only change: the congestion state is kept (RFC 9000 §9.4).
+    assert_eq!(migrated.recovery.rtt(), rtt_before);
+
+    // The old 4-tuple is no longer attributed to any path.
+    assert!(pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr))
+        .is_none());
+
+    // The new address is under (re)validation.
+    assert!(pipe.server.paths.get(mpid).unwrap().probing_required());
+
+    // The stream data was received, and is acknowledged with a PATH_ACK
+    // for path ID 0: the same packet number space as before the rebind.
+    assert!(pipe.server.stream_readable(0));
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    let mut path_ack_seen = false;
+    for (pkt, _si) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap();
+
+        for frame in frames {
+            if let frame::Frame::PathAck { path_id: 0, .. } = frame {
+                path_ack_seen = true;
+            }
+        }
+    }
+
+    assert!(
+        path_ack_seen,
+        "packets received after the rebind should be PATH_ACK'd on path \
+         ID 0"
+    );
+}
+
+/// RFC 9000 §9.4 via draft-21 §3.1.2: when a NAT rebinding of path 0
+/// changes the peer's address beyond just the port, the congestion
+/// controller and RTT estimator of path 0 are reset to initial values —
+/// the same handling as non-zero path ID migrations. Exercised without a
+/// second path: multipath negotiated, single active path.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_zero_rebind_to_new_ip_resets_congestion_state() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr = test_utils::Pipe::client_addr();
+    // A different IP address: NOT a port-only change.
+    let client_addr_3 = "127.0.0.2:5678".parse().unwrap();
+
+    let spid0 = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr))
+        .unwrap();
+    assert_eq!(pipe.server.paths.get(spid0).unwrap().path_id, 0);
+
+    // The handshake produced an RTT sample on path 0, so its estimator
+    // moved away from the initial value.
+    assert_ne!(
+        pipe.server.paths.get(spid0).unwrap().recovery.rtt(),
+        DEFAULT_INITIAL_RTT
+    );
+
+    let n_paths_before = pipe.server.paths.len();
+
+    // Elicit fresh client packets on path 0, then deliver them from a
+    // different client IP address.
+    assert_eq!(pipe.client.stream_send(0, b"hello", false), Ok(5));
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+
+    for (mut pkt, si) in flight {
+        let info = RecvInfo {
+            to: si.to,
+            from: client_addr_3,
+        };
+        pipe.server.recv(&mut pkt, info).unwrap();
+    }
+
+    // No new path was created: path 0 migrated, and its congestion
+    // state is back to initial values.
+    assert_eq!(pipe.server.paths.len(), n_paths_before);
+
+    let migrated = pipe.server.paths.get(spid0).unwrap();
+    assert_eq!(migrated.path_id, 0);
+    assert_eq!(migrated.peer_addr(), client_addr_3);
+    assert_eq!(migrated.recovery.rtt(), DEFAULT_INITIAL_RTT);
+
+    let config = test_utils::Pipe::default_config("cubic").unwrap();
+    let initial_cwnd = recovery::Recovery::new(&config).cwnd();
+    assert_eq!(migrated.recovery.cwnd(), initial_cwnd);
+    assert_eq!(migrated.recovery.bytes_in_flight(), 0);
+
+    // The connection keeps working after the reset.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.server.local_error(), None);
+}
+
 #[cfg(feature = "multipath")]
 #[test]
 fn multipath_unused_path_id_cid_on_new_tuple_opens_path() {
@@ -15698,6 +15880,126 @@ fn multipath_abandon_retention_expiry_deletes_path_state() {
     // The connection is still alive on the remaining path.
     assert!(!pipe.client.is_closed());
     assert_eq!(pipe.client.stream_send(4, b"after", false), Ok(5));
+    assert_eq!(pipe.advance(), Ok(()));
+}
+
+/// §3.4: an abandoned path ID is consumed and must never be re-funded.
+/// Re-creating its CID pool would restart the per-path sequence numbers
+/// at 0, so the peer would see a sequence number reused with a different
+/// CID — a PROTOCOL_VIOLATION. `new_scid_on_path()` must reject the path
+/// ID, `mp_scids_left()` must report no headroom (so drivers like
+/// tokio-quiche skip the path ID before registering router state), and no
+/// PATH_NEW_CONNECTION_ID for it may reach the wire.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandoned_path_id_is_never_refunded() {
+    let (mut pipe, pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    // Before the abandon, path ID 1 has CID headroom.
+    assert!(pipe.client.mp_scids_left(1) > 0);
+
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Already during the retention window the path ID is not issuable:
+    // its CIDs are implicitly retired and the ID is consumed.
+    assert_eq!(pipe.client.mp_scids_left(1), 0);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Err(Error::InvalidState)
+    );
+
+    // Wait for the retention window to expire so the path state (and
+    // its CID pools) are fully deleted; our PATH_ABANDON may be assumed
+    // lost past this point.
+    let deadline = pipe
+        .client
+        .paths
+        .get(pid)
+        .unwrap()
+        .mp_abandon_deadline
+        .expect("retention deadline armed");
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) +
+            Duration::from_millis(5),
+    );
+    pipe.client.on_timeout();
+    assert!(pipe.client.paths.is_abandoned_path_id(1));
+
+    // The dropped pool must not be reported as full headroom, and
+    // re-funding it must be rejected.
+    assert_eq!(pipe.client.mp_scids_left(1), 0);
+
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Err(Error::InvalidState)
+    );
+
+    // No PATH_NEW_CONNECTION_ID for path ID 1 goes out in subsequent
+    // flights.
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    pipe.client.send_ack_eliciting().unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    for (pkt, _si) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.server, &mut pkt).unwrap();
+
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                frame::Frame::PathNewConnectionId { path_id: 1, .. }
+            )),
+            "no PATH_NEW_CONNECTION_ID may be sent for an abandoned path \
+             ID, got {frames:?}"
+        );
+    }
+}
+
+/// §3.4: a PATH_NEW_CONNECTION_ID advertisement queued BEFORE the path is
+/// abandoned must never reach the wire once the abandon happens — the
+/// path's CIDs are implicitly retired and the path ID is consumed.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_abandon_drops_queued_cid_advertisements() {
+    let (mut pipe, _pid, _a, _b, _c) = mp_pipe_with_second_path(&[1]);
+
+    // Queue an advertisement for path ID 1, but do NOT send it yet.
+    let (cid, reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &cid, reset_token, false),
+        Ok(1)
+    );
+    assert!(pipe.client.ids.mp_has_new_scids());
+
+    // Abandon the path before the advertisement goes out.
+    assert_eq!(pipe.client.close_path(1, 0), Ok(()));
+
+    // The queued advertisement is dropped...
+    assert!(!pipe.client.ids.mp_has_new_scids());
+
+    // ...and the frame never reaches the wire.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    for (pkt, _si) in flight {
+        let mut pkt = pkt.clone();
+        let frames =
+            test_utils::decode_pkt(&mut pipe.server, &mut pkt).unwrap();
+
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f,
+                frame::Frame::PathNewConnectionId { path_id: 1, .. }
+            )),
+            "a CID advertisement queued before the abandon must not be \
+             sent, got {frames:?}"
+        );
+    }
+
+    // The connection keeps working.
     assert_eq!(pipe.advance(), Ok(()));
 }
 

@@ -6611,10 +6611,21 @@ impl<F: BufFactory> Connection<F> {
     ///
     /// Path ID 0 reports the same value as [`scids_left()`].
     ///
+    /// An abandoned path ID is consumed (Section 3.4) and must never be
+    /// re-funded: it reports 0 regardless of its pool state, including
+    /// while the path is still in its post-abandon retention window.
+    ///
     /// [`scids_left()`]: struct.Connection.html#method.scids_left
     #[cfg(feature = "multipath")]
     #[inline]
     pub fn mp_scids_left(&self, path_id: u64) -> usize {
+        // §3.4: a consumed path ID has no headroom, so callers never mint
+        // Connection IDs that `new_scid_on_path()` would reject (drivers
+        // typically register routing state for a CID before issuing it).
+        if self.multipath_enabled && self.mp_path_id_consumed(path_id) {
+            return 0;
+        }
+
         if path_id == 0 {
             return self.scids_left();
         }
@@ -6654,6 +6665,13 @@ impl<F: BufFactory> Connection<F> {
     /// be unique across all paths and both directions (Section 3.2.1), and
     /// a duplicate raises an [`InvalidState`].
     ///
+    /// An abandoned path ID is consumed (Section 3.4) and must never be
+    /// re-funded: providing Connection IDs for it — including while the
+    /// path is still in its post-abandon retention window — returns an
+    /// [`InvalidState`]. Re-creating the pool would restart its per-path
+    /// sequence numbers at 0, making the peer see a sequence number
+    /// reused with a different Connection ID (a PROTOCOL_VIOLATION).
+    ///
     /// Returns the sequence number associated to the provided Connection
     /// ID in the path's own sequence number space.
     ///
@@ -6665,6 +6683,12 @@ impl<F: BufFactory> Connection<F> {
         &mut self, path_id: u64, scid: &ConnectionId, reset_token: u128,
         retire_if_needed: bool,
     ) -> Result<u64> {
+        // §3.4: abandoned (and closing) path IDs are consumed and must
+        // never be re-funded.
+        if self.multipath_enabled && self.mp_path_id_consumed(path_id) {
+            return Err(Error::InvalidState);
+        }
+
         if path_id == 0 {
             return self.new_scid(scid, reset_token, retire_if_needed);
         }
@@ -7480,15 +7504,8 @@ impl<F: BufFactory> Connection<F> {
 
             // When the first additional path is created (transition from
             // 1→2 paths), sync path 0's per-path send counter from the
-            // shared counter so that subsequent per-path pn values don't
-            // collide with pn values already sent (and seen by the peer)
-            // using the shared counter during handshake / single-path
-            // phase.
-            if self.paths.len() == 2 {
-                if let Ok(path0) = self.paths.get_mut(0) {
-                    path0.mp_next_pkt_num = self.next_pkt_num;
-                }
-            }
+            // shared counter.
+            self.mp_sync_path_zero_pkt_num_on_second_path();
 
             pid
         };
@@ -7515,6 +7532,37 @@ impl<F: BufFactory> Connection<F> {
         });
 
         Ok(path_id)
+    }
+
+    /// On the 1→2 path transition, seeds path 0's per-path send packet
+    /// number counter from the shared connection-level counter, so that
+    /// subsequent per-path packet numbers don't collide with packet
+    /// numbers already sent (and seen by the peer) using the shared
+    /// counter during the handshake / single-path phase.
+    ///
+    /// Path 0 is looked up by its multipath path ID: its slab index is
+    /// not guaranteed to be 0 after migrations or abandons. It may also
+    /// legitimately be absent, when it was abandoned and torn down before
+    /// a second path was created; the seeding is then a no-op.
+    #[cfg(feature = "multipath")]
+    fn mp_sync_path_zero_pkt_num_on_second_path(&mut self) {
+        if self.paths.len() != 2 {
+            return;
+        }
+
+        debug_assert!(
+            self.paths.iter().any(|(_, p)| p.path_id == 0) ||
+                self.paths.is_abandoned_path_id(0),
+            "two paths but neither a live nor an abandoned path 0"
+        );
+
+        let next_pkt_num = self.next_pkt_num;
+
+        if let Some((_, path0)) =
+            self.paths.iter_mut().find(|(_, p)| p.path_id == 0)
+        {
+            path0.mp_next_pkt_num = next_pkt_num;
+        }
     }
 
     /// Closes the multipath path identified by `path_id`.
@@ -7617,6 +7665,11 @@ impl<F: BufFactory> Connection<F> {
         // immediately retired, with no PATH_RETIRE_CONNECTION_ID emission
         // (§3.4).
         self.ids.mp_retire_dcid_pool(path_id);
+
+        // The path ID is consumed (§3.4): drop any PATH_NEW_CONNECTION_ID
+        // advertisement queued before the abandon, so no connection ID for
+        // it ever reaches the wire.
+        self.ids.mp_clear_advertise_new_scids(path_id);
 
         self.paths.active_path_count =
             self.paths.active_path_count.saturating_sub(1);
@@ -8419,6 +8472,24 @@ impl<F: BufFactory> Connection<F> {
         new_dcid_res
     }
 
+    /// Returns true if the provided multipath path ID is consumed
+    /// (draft-ietf-quic-multipath-21 §3.4): either fully abandoned and
+    /// torn down, or belonging to a path that is in its post-abandon
+    /// retention window (mp_closing) / already closed.
+    ///
+    /// A consumed path ID must never be re-funded with connection IDs:
+    /// its CIDs are implicitly retired, and re-creating its pool would
+    /// restart the per-path sequence numbers at 0, making the peer see a
+    /// sequence number reused with a different CID — a
+    /// PROTOCOL_VIOLATION.
+    #[cfg(feature = "multipath")]
+    pub(crate) fn mp_path_id_consumed(&self, path_id: u64) -> bool {
+        self.paths.is_abandoned_path_id(path_id) ||
+            self.paths.iter().any(|(_, p)| {
+                p.path_id == path_id && (p.mp_closing || p.mp_closed)
+            })
+    }
+
     /// Returns true if multipath path 0 — the owner of the legacy
     /// connection ID space (NEW_CONNECTION_ID / RETIRE_CONNECTION_ID
     /// frames) — has been abandoned: either still in its post-abandon
@@ -8429,14 +8500,7 @@ impl<F: BufFactory> Connection<F> {
     /// (draft-ietf-quic-multipath-21 §3.4).
     #[cfg(feature = "multipath")]
     pub(crate) fn mp_path_zero_abandoned(&self) -> bool {
-        if !self.multipath_enabled {
-            return false;
-        }
-
-        self.paths.is_abandoned_path_id(0) ||
-            self.paths
-                .iter()
-                .any(|(_, p)| p.path_id == 0 && (p.mp_closing || p.mp_closed))
+        self.multipath_enabled && self.mp_path_id_consumed(0)
     }
 
     /// Applies the draft-ietf-quic-multipath-21 §4 generic rules to a
@@ -9934,7 +9998,11 @@ impl<F: BufFactory> Connection<F> {
 
         // The path ID is unused: any packet (probing or not) arriving on a
         // new 4-tuple with a CID of an unused path ID opens that path ID,
-        // without affecting other paths (§3.1.2).
+        // without affecting other paths (§3.1.2). Path ID 0 always has a
+        // live path while it can be reached here (the caller guards the
+        // abandoned case), so only non-zero path IDs may be opened.
+        debug_assert!(mp_path_id > 0);
+
         let mut path = path::Path::new(
             info.to,
             info.from,
@@ -9961,11 +10029,7 @@ impl<F: BufFactory> Connection<F> {
 
         // When the first additional path is created, sync path 0's
         // per-path send counter from the shared counter.
-        if self.paths.len() == 2 {
-            if let Ok(path0) = self.paths.get_mut(0) {
-                path0.mp_next_pkt_num = self.next_pkt_num;
-            }
-        }
+        self.mp_sync_path_zero_pkt_num_on_second_path();
 
         Ok(pid)
     }
@@ -9979,20 +10043,54 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<usize> {
         // With multipath, path attribution is CID-based (draft-21 §3.1.2):
         // CIDs from a non-zero path ID's pool attribute the packet to that
-        // path ID. CIDs from the legacy pool belong to path ID 0 and follow
-        // the pre-multipath flow below.
+        // path ID. CIDs from the legacy pool belong to path ID 0: on a
+        // known 4-tuple they follow the pre-multipath flow below, while on
+        // a new 4-tuple they are a NAT rebinding of path 0 (§3.1.2/§5.1),
+        // which "does not change the path ID, and does not affect the
+        // packet number space" — a migration of path 0, never a new path.
         #[cfg(feature = "multipath")]
-        if self.multipath_enabled && !self.ids.zero_length_scid() {
-            if let Some((mp_path_id, in_scid_seq)) = self.ids.mp_find_scid(dcid) {
-                if mp_path_id > 0 {
-                    return self.mp_get_or_create_recv_path_id(
-                        recv_pid,
-                        mp_path_id,
-                        in_scid_seq,
-                        buf_len,
-                        info,
-                        now,
-                    );
+        if self.multipath_enabled {
+            // Multipath cannot be negotiated when either endpoint uses
+            // zero-length connection IDs (§2.1 guard at parameter
+            // processing), so incoming DCIDs always resolve below.
+            debug_assert!(!self.ids.zero_length_scid());
+
+            if !self.ids.zero_length_scid() {
+                if let Some((mp_path_id, in_scid_seq)) =
+                    self.ids.mp_find_scid(dcid)
+                {
+                    if mp_path_id > 0 {
+                        return self.mp_get_or_create_recv_path_id(
+                            recv_pid,
+                            mp_path_id,
+                            in_scid_seq,
+                            buf_len,
+                            info,
+                            now,
+                        );
+                    }
+
+                    if recv_pid.is_none() {
+                        // A path-0 CID on a NEW 4-tuple: route it through
+                        // the same §3.1.2 migration handling as non-zero
+                        // path IDs, keeping path 0's `Path` (and thus its
+                        // packet number space).
+                        if self.paths.iter().any(|(_, p)| p.path_id == 0) {
+                            return self.mp_get_or_create_recv_path_id(
+                                recv_pid,
+                                0,
+                                in_scid_seq,
+                                buf_len,
+                                info,
+                                now,
+                            );
+                        }
+
+                        // Path 0 has been abandoned and torn down (§3.4):
+                        // its CIDs are implicitly retired, and its path ID
+                        // must not be revived. Drop the packet.
+                        return Err(Error::InvalidState);
+                    }
                 }
             }
         }
@@ -10111,10 +10209,8 @@ impl<F: BufFactory> Connection<F> {
         // When the first additional path is created on the server side,
         // sync path 0's per-path send counter from the shared counter.
         #[cfg(feature = "multipath")]
-        if self.multipath_enabled && self.paths.len() == 2 {
-            if let Ok(path0) = self.paths.get_mut(0) {
-                path0.mp_next_pkt_num = self.next_pkt_num;
-            }
+        if self.multipath_enabled {
+            self.mp_sync_path_zero_pkt_num_on_second_path();
         }
 
         Ok(pid)
@@ -10347,13 +10443,8 @@ impl<F: BufFactory> Connection<F> {
 
         // When the first additional path is created (transition from 1→2
         // paths), sync path 0's per-path send counter from the shared
-        // counter so that subsequent per-path pn values don't collide with
-        // pn values already sent using the shared counter.
-        if self.paths.len() == 2 {
-            if let Ok(path0) = self.paths.get_mut(0) {
-                path0.mp_next_pkt_num = self.next_pkt_num;
-            }
-        }
+        // counter.
+        self.mp_sync_path_zero_pkt_num_on_second_path();
 
         Ok(pid)
     }

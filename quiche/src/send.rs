@@ -959,6 +959,35 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Abandoned path IDs are consumed (draft-21 §3.4): never advertise
+        // connection IDs for them. Purge any PATH_NEW_CONNECTION_ID
+        // advertisement queued before the abandon (mirroring the
+        // PATH_RETIRE_CONNECTION_ID gate on loss), so the emission loop
+        // below never puts one on the wire. Done before `path` mutably
+        // borrows the path table.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled && pkt_type == Type::Short && !is_closing {
+            // Same check as `Connection::mp_path_id_consumed()`, inlined
+            // on the disjoint `paths`/`ids` fields: a whole-`self` borrow
+            // would conflict with the `flow_control` borrow above.
+            let paths = &self.paths;
+            let consumed: Vec<u64> = self
+                .ids
+                .mp_advertise_new_scid_path_ids()
+                .filter(|&path_id| {
+                    paths.is_abandoned_path_id(path_id) ||
+                        paths.iter().any(|(_, p)| {
+                            p.path_id == path_id &&
+                                (p.mp_closing || p.mp_closed)
+                        })
+                })
+                .collect();
+
+            for path_id in consumed {
+                self.ids.mp_clear_advertise_new_scids(path_id);
+            }
+        }
+
         let path = self.paths.get_mut(send_pid)?;
 
         if pkt_type == Type::Short && !is_closing {

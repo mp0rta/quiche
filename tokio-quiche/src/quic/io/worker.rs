@@ -248,6 +248,11 @@ where
         // Lowest path ID first: path IDs are consumed without holes
         // (§3.2.1), so lower IDs are the ones the peer needs first.
         for path_id in 1..=max_path_id {
+            // `mp_scids_left()` reports 0 for abandoned path IDs (§3.4:
+            // they are consumed and must never be re-funded), so those
+            // are skipped here BEFORE any `MapCid` registration: a
+            // core-side `new_scid_on_path()` rejection after the router
+            // mapping would leak one router entry per iteration.
             for _ in 0..qconn.mp_scids_left(path_id) {
                 // We don't emit stateless resets, so any unguessable value
                 // is fine
