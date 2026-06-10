@@ -897,6 +897,18 @@ pub struct KeyUpdate {
     /// Incoming packets with lower pn should use this (prev) crypto key.
     pub pn_on_update: u64,
 
+    /// Per-path key-phase watermarks (draft-ietf-quic-multipath-21 §2.5).
+    ///
+    /// With per-path packet number spaces, packet numbers of different
+    /// paths are not comparable, so `pn_on_update` cannot decide whether
+    /// a packet predates the key update for every path. This maps a path
+    /// ID to the lowest packet number of the new key phase observed on
+    /// that path; packets of that path with a lower pn use the previous
+    /// key. Paths with no entry have not seen the new phase yet, so
+    /// their old-phase packets always use the previous key.
+    #[cfg(feature = "multipath")]
+    pub mp_pn_on_update: std::collections::BTreeMap<u64, u64>,
+
     /// Whether ACK frame for key-update has been sent.
     pub update_acked: bool,
 

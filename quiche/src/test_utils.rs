@@ -405,6 +405,8 @@ impl<F: BufFactory> Pipe<F> {
         crypto_ctx.key_update = Some(packet::KeyUpdate {
             crypto_open: open_prev.unwrap(),
             pn_on_update: self.client.next_pkt_num,
+            #[cfg(feature = "multipath")]
+            mp_pn_on_update: Default::default(),
             update_acked: true,
             timer: Instant::now(),
         });

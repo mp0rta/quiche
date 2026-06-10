@@ -3443,11 +3443,35 @@ impl<F: BufFactory> Connection<F> {
             hdr.key_phase != self.key_phase
         {
             // Check if this packet arrived before key update.
+            //
+            // With multipath per-path packet number spaces the comparison
+            // is made against the watermark of the packet's path
+            // (draft-ietf-quic-multipath-21 §2.5): packet numbers of
+            // different paths are not comparable, so a connection-wide
+            // watermark would misread an old-phase packet on another path
+            // as a new key update. A path with no recorded watermark has
+            // not seen the new phase yet, so its old-phase packets always
+            // predate the update.
+            let arrived_before_update = |key_update: &packet::KeyUpdate| {
+                #[cfg(feature = "multipath")]
+                if let Some((_, mp_path_id)) = mp_recv_ctx {
+                    return match key_update
+                        .mp_pn_on_update
+                        .get(&u64::from(mp_path_id))
+                    {
+                        Some(watermark) => pn < *watermark,
+                        None => true,
+                    };
+                }
+
+                pn < key_update.pn_on_update
+            };
+
             if let Some(key_update) = self.crypto_ctx[epoch]
                 .key_update
                 .as_ref()
                 .and_then(|key_update| {
-                    (pn < key_update.pn_on_update).then_some(key_update)
+                    arrived_before_update(key_update).then_some(key_update)
                 })
             {
                 aead = &key_update.crypto_open;
@@ -3697,6 +3721,28 @@ impl<F: BufFactory> Connection<F> {
             self.paths.get_active_path_id()?
         };
 
+        // Track the per-path key-phase watermark while the previous keys
+        // are retained (draft-ietf-quic-multipath-21 §2.5): the lowest
+        // packet number of the current key phase seen on each path. The
+        // packet that triggered the update records its path's watermark
+        // when the `KeyUpdate` state is created below.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled &&
+            hdr.ty == Type::Short &&
+            aead_next.is_none() &&
+            hdr.key_phase == self.key_phase
+        {
+            if let Some(key_update) = self.crypto_ctx[epoch].key_update.as_mut()
+            {
+                let mp_path_id = self.paths.get(recv_pid)?.path_id;
+                let watermark = key_update
+                    .mp_pn_on_update
+                    .entry(mp_path_id)
+                    .or_insert(pn);
+                *watermark = cmp::min(*watermark, pn);
+            }
+        }
+
         // The key update is verified once a packet is successfully decrypted
         // using the new keys.
         if let Some((open_next, seal_next)) = aead_next {
@@ -3718,13 +3764,38 @@ impl<F: BufFactory> Connection<F> {
                 .replace(open_next)
                 .unwrap();
 
-            let recv_path = self.paths.get_mut(recv_pid)?;
+            let recv_path = self.paths.get(recv_pid)?;
+
+            // draft-ietf-quic-multipath-21 §2.5: wait for at least three
+            // times the largest PTO among all the paths before discarding
+            // the previous keys.
+            #[cfg(feature = "multipath")]
+            let key_update_pto = if self.multipath_enabled {
+                self.paths.max_pto()
+            } else {
+                recv_path.recovery.pto()
+            };
+
+            #[cfg(not(feature = "multipath"))]
+            let key_update_pto = recv_path.recovery.pto();
+
+            // The packet triggering the update sets this path's key-phase
+            // watermark; other paths get theirs from the first new-phase
+            // packet they carry.
+            #[cfg(feature = "multipath")]
+            let mp_pn_on_update = {
+                let mut watermarks = std::collections::BTreeMap::new();
+                watermarks.insert(recv_path.path_id, pn);
+                watermarks
+            };
 
             self.crypto_ctx[epoch].key_update = Some(packet::KeyUpdate {
                 crypto_open: open_prev,
                 pn_on_update: pn,
+                #[cfg(feature = "multipath")]
+                mp_pn_on_update,
                 update_acked: false,
-                timer: now + (recv_path.recovery.pto() * 3),
+                timer: now + (key_update_pto * 3),
             });
 
             self.key_phase = !self.key_phase;
@@ -7099,6 +7170,21 @@ impl<F: BufFactory> Connection<F> {
         self.timed_out
     }
 
+    /// Returns the PTO that scales the closing/draining period.
+    ///
+    /// draft-ietf-quic-multipath-21 §2.6: with multiple paths, the
+    /// closing and draining states SHOULD persist for at least three
+    /// times the largest PTO among all paths. Without multipath this is
+    /// the active path's PTO (RFC 9000 §10.2).
+    fn draining_pto(&self) -> Result<Duration> {
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled {
+            return Ok(self.paths.max_pto());
+        }
+
+        Ok(self.paths.get_active()?.recovery.pto())
+    }
+
     /// Returns the error received from the peer, if any.
     ///
     /// Note that a `Some` return value does not necessarily imply
@@ -8900,8 +8986,7 @@ impl<F: BufFactory> Connection<F> {
                     reason,
                 });
 
-                let path = self.paths.get_active()?;
-                self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                self.draining_timer = Some(now + (self.draining_pto()? * 3));
             },
 
             frame::Frame::ApplicationClose { error_code, reason } => {
@@ -8911,8 +8996,7 @@ impl<F: BufFactory> Connection<F> {
                     reason,
                 });
 
-                let path = self.paths.get_active()?;
-                self.draining_timer = Some(now + (path.recovery.pto() * 3));
+                self.draining_timer = Some(now + (self.draining_pto()? * 3));
             },
 
             frame::Frame::HandshakeDone => {

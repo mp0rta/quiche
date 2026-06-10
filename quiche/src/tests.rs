@@ -17269,3 +17269,315 @@ fn multipath_established_acks_via_path_ack_not_plain_ack() {
         "1-RTT acknowledgments must be sent as PATH_ACK with path ID 0"
     );
 }
+
+/// Replaces the recovery state of the given path with a freshly
+/// initialized one whose initial RTT is `rtt`, giving the path a PTO of
+/// `rtt + 4 * (rtt / 2)` (no RTT samples taken yet). Used to drive the
+/// PTOs of two paths far apart.
+#[cfg(feature = "multipath")]
+fn mp_inflate_path_pto(path: &mut path::Path, rtt: Duration) {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_rtt(rtt);
+    let recovery_config = recovery::RecoveryConfig::from_config(&config);
+    path.recovery = recovery::Recovery::new_with_config(&recovery_config);
+}
+
+/// Encodes a 1-RTT packet on the given (multipath) path of `conn`, using
+/// the path's DCID, its per-path packet number counter, the multipath
+/// AEAD nonce and the connection's current key phase.
+#[cfg(feature = "multipath")]
+fn mp_encode_pkt_on_path(
+    conn: &mut Connection, pid: usize, frames: &[frame::Frame],
+    buf: &mut [u8],
+) -> Result<usize> {
+    let mut b = octets::OctetsMut::with_slice(buf);
+
+    let path = conn.paths.get(pid)?;
+    let path_id = path.path_id;
+    let pn = path.mp_next_pkt_num;
+    let pn_len = 4;
+
+    let dcid_seq = path.active_dcid_seq.ok_or(Error::InvalidState)?;
+    let dcid = if path.mp_per_path_cids {
+        ConnectionId::from_ref(
+            conn.ids.mp_get_dcid(path_id, dcid_seq)?.cid.as_ref(),
+        )
+    } else {
+        ConnectionId::from_ref(conn.ids.get_dcid(dcid_seq)?.cid.as_ref())
+    };
+
+    let hdr = Header {
+        ty: Type::Short,
+        version: conn.version,
+        dcid,
+        scid: ConnectionId::default(),
+        pkt_num: pn,
+        pkt_num_len: pn_len,
+        token: None,
+        versions: None,
+        key_phase: conn.key_phase,
+    };
+
+    hdr.to_bytes(&mut b)?;
+
+    let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
+
+    // Always encode the packet number in 4 bytes (mirrors
+    // test_utils::encode_pkt).
+    b.put_u32(pn as u32)?;
+
+    let payload_offset = b.off();
+
+    for frame in frames {
+        frame.to_bytes(&mut b)?;
+    }
+
+    let crypto_ctx = &mut conn.crypto_ctx[packet::Epoch::Application];
+    let aead = match crypto_ctx.crypto_seal {
+        Some(ref mut v) => v,
+        None => return Err(Error::InvalidState),
+    };
+
+    let written = packet::encrypt_pkt_mp(
+        &mut b,
+        pn,
+        path_id as u32,
+        pn_len,
+        payload_len,
+        payload_offset,
+        None,
+        aead,
+    )?;
+
+    conn.paths.get_mut(pid)?.mp_next_pkt_num = pn + 1;
+
+    Ok(written)
+}
+
+/// draft-21 §2.6: when a connection with multiple paths enters the
+/// closing or draining state, "these states SHOULD instead persist for at
+/// least three times the largest PTO among all paths". Receive side:
+/// entering draining on receipt of a CONNECTION_CLOSE.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_draining_uses_max_pto_across_paths() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Drive the PTO of the server's path 1 far above path 0's.
+    let spid1 = pipe
+        .server
+        .paths
+        .iter()
+        .find(|(_, p)| p.path_id == 1)
+        .map(|(pid, _)| pid)
+        .unwrap();
+    mp_inflate_path_pto(
+        pipe.server.paths.get_mut(spid1).unwrap(),
+        Duration::from_secs(10),
+    );
+
+    // The largest PTO among all paths is now path 1's, not the active
+    // path's.
+    assert!(pipe.server.paths.max_pto() >= Duration::from_secs(25));
+
+    pipe.client.close(false, 0x01, b"failure").unwrap();
+
+    // Emit the CONNECTION_CLOSE on the initial (active) path explicitly:
+    // CONNECTION_CLOSE frames are only generated on the active path.
+    let mut buf = [0u8; 65535];
+    let (len, info) = pipe
+        .client
+        .send_on_path(&mut buf, Some(client_addr), Some(server_addr))
+        .unwrap();
+
+    let before = Instant::now();
+    pipe.server
+        .recv(&mut buf[..len], RecvInfo {
+            to: info.to,
+            from: info.from,
+        })
+        .unwrap();
+
+    let timer = pipe
+        .server
+        .draining_timer
+        .expect("server must enter draining on CONNECTION_CLOSE");
+
+    // 3 x path-1 PTO (30s) dwarfs 3 x path-0 PTO (sub-second).
+    assert!(
+        timer.duration_since(before) >= Duration::from_secs(60),
+        "draining must persist for 3x the largest PTO among all paths"
+    );
+}
+
+/// draft-21 §2.6, send side: entering the closing state when sending a
+/// CONNECTION_CLOSE frame.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_closing_uses_max_pto_across_paths() {
+    let (mut pipe, pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    mp_inflate_path_pto(
+        pipe.client.paths.get_mut(pid1).unwrap(),
+        Duration::from_secs(10),
+    );
+
+    pipe.client.close(true, 0x01, b"done").unwrap();
+
+    let before = Instant::now();
+    let mut buf = [0u8; 65535];
+    // CONNECTION_CLOSE frames are only generated on the active path.
+    pipe.client
+        .send_on_path(&mut buf, Some(client_addr), Some(server_addr))
+        .unwrap();
+
+    let timer = pipe
+        .client
+        .draining_timer
+        .expect("client must arm the closing timer on CONNECTION_CLOSE");
+
+    assert!(
+        timer.duration_since(before) >= Duration::from_secs(60),
+        "closing must persist for 3x the largest PTO among all paths"
+    );
+}
+
+/// draft-21 §2.5: "endpoints SHOULD wait for at least three times the
+/// largest Probe Timeout (PTO) among all the paths" for key update
+/// timing. quiche never initiates key updates, so this governs the
+/// previous-key discard window after a peer-initiated update.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_key_update_old_key_discard_uses_max_pto() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    let spid1 = pipe
+        .server
+        .paths
+        .iter()
+        .find(|(_, p)| p.path_id == 1)
+        .map(|(pid, _)| pid)
+        .unwrap();
+    mp_inflate_path_pto(
+        pipe.server.paths.get_mut(spid1).unwrap(),
+        Duration::from_secs(10),
+    );
+
+    // The client updates its keys and sends new-phase 1-RTT data on
+    // path 0.
+    pipe.client_update_key().unwrap();
+    pipe.client.stream_send(0, b"new", false).unwrap();
+
+    let before = Instant::now();
+
+    let mut buf = [0u8; 65535];
+    loop {
+        match pipe.client.send_on_path(
+            &mut buf,
+            Some(client_addr),
+            Some(server_addr),
+        ) {
+            Ok((len, info)) => {
+                let recv_info = RecvInfo {
+                    to: info.to,
+                    from: info.from,
+                };
+                pipe.server.recv(&mut buf[..len], recv_info).unwrap();
+            },
+            Err(Error::Done) => break,
+            Err(e) => panic!("send_on_path error: {e:?}"),
+        }
+    }
+
+    let key_update = pipe.server.crypto_ctx[packet::Epoch::Application]
+        .key_update
+        .as_ref()
+        .expect("server must have verified the key update");
+
+    assert!(
+        key_update.timer.duration_since(before) >= Duration::from_secs(60),
+        "previous keys must be retained for 3x the largest PTO among all \
+         paths"
+    );
+}
+
+/// draft-21 §2.5 + per-path packet number spaces: packet numbers of
+/// different paths are not comparable, so the "arrived before the key
+/// update" watermark must be tracked per path. An old-phase 1-RTT packet
+/// arriving on path B with a packet number greater than the watermark
+/// established on path A must still be decrypted with the previous keys
+/// (and must not be treated as yet another key update).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_key_update_old_phase_packet_on_other_path_uses_old_keys() {
+    let (mut pipe, pid1, client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Pre-build an OLD-phase packet on path 1 whose per-path packet
+    // number is far above the watermark that the key update will
+    // establish on path 0.
+    pipe.client.paths.get_mut(pid1).unwrap().mp_next_pkt_num += 200;
+
+    let frames = [frame::Frame::Stream {
+        stream_id: 0,
+        data: <RangeBuf>::from(b"old", 0, false),
+    }];
+
+    let mut old_pkt = [0u8; 1500];
+    let old_written =
+        mp_encode_pkt_on_path(&mut pipe.client, pid1, &frames, &mut old_pkt)
+            .unwrap();
+
+    // The client updates its keys and sends new-phase data on path 0;
+    // the server verifies the update there.
+    pipe.client_update_key().unwrap();
+    pipe.client.stream_send(4, b"new", false).unwrap();
+
+    let mut buf = [0u8; 65535];
+    loop {
+        match pipe.client.send_on_path(
+            &mut buf,
+            Some(client_addr),
+            Some(server_addr),
+        ) {
+            Ok((len, info)) => {
+                let recv_info = RecvInfo {
+                    to: info.to,
+                    from: info.from,
+                };
+                pipe.server.recv(&mut buf[..len], recv_info).unwrap();
+            },
+            Err(Error::Done) => break,
+            Err(e) => panic!("send_on_path error: {e:?}"),
+        }
+    }
+
+    assert!(
+        pipe.server.crypto_ctx[packet::Epoch::Application]
+            .key_update
+            .is_some(),
+        "server must have processed the key update via path 0"
+    );
+
+    // Deliver the old-phase packet on path 1. It must be decrypted with
+    // the previous keys, not mistaken for another key update.
+    let info = RecvInfo {
+        to: server_addr,
+        from: client_addr_2,
+    };
+    let res = pipe.server.recv(&mut old_pkt[..old_written], info);
+    assert!(
+        res.is_ok(),
+        "old-phase packet on another path must decrypt with old keys: {res:?}"
+    );
+
+    let mut rb = [0u8; 16];
+    assert_eq!(pipe.server.stream_recv(0, &mut rb), Ok((3, false)));
+    assert_eq!(&rb[..3], b"old");
+
+    assert_eq!(pipe.server.local_error(), None);
+    assert!(!pipe.server.is_closed());
+}

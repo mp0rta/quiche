@@ -1014,6 +1014,20 @@ impl PathMap {
             .ok_or(Error::InvalidState)
     }
 
+    /// Returns the largest Probe Timeout (PTO) among all the paths.
+    ///
+    /// draft-ietf-quic-multipath-21 §2.5/§2.6: the closing and draining
+    /// states SHOULD persist for at least three times the largest PTO
+    /// among all paths, and the same window governs key update timing.
+    #[cfg(feature = "multipath")]
+    pub fn max_pto(&self) -> Duration {
+        self.paths
+            .iter()
+            .map(|(_, p)| p.recovery.pto())
+            .max()
+            .unwrap_or_default()
+    }
+
     /// Gets the lowest active path identifier. If there is no active path,
     /// returns an [`InvalidState`].
     ///

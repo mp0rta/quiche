@@ -382,6 +382,21 @@ impl<F: BufFactory> Connection<F> {
 
         self.check_tx_buffered_invariant();
 
+        // PTO scaling the closing period armed when a CONNECTION_CLOSE /
+        // APPLICATION_CLOSE frame is sent below. Computed up front (the
+        // sending path is mutably borrowed at that point): the largest
+        // PTO among all paths with multipath (draft-21 §2.6), the
+        // sending path's PTO otherwise.
+        #[cfg(feature = "multipath")]
+        let mp_closing_pto = if is_closing && self.multipath_enabled {
+            Some(self.paths.max_pto())
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "multipath"))]
+        let mp_closing_pto: Option<Duration> = None;
+
         let is_app_limited = self.delivery_rate_check_if_app_limited();
         let n_paths = self.paths.len();
         let path = self.paths.get_mut(send_pid)?;
@@ -1282,7 +1297,8 @@ impl<F: BufFactory> Connection<F> {
                         };
 
                         if push_frame_to_pkt!(b, frames, frame, left) {
-                            let pto = path.recovery.pto();
+                            let pto = mp_closing_pto
+                                .unwrap_or_else(|| path.recovery.pto());
                             self.draining_timer = Some(now + (pto * 3));
 
                             ack_eliciting = true;
@@ -1298,7 +1314,8 @@ impl<F: BufFactory> Connection<F> {
                     };
 
                     if push_frame_to_pkt!(b, frames, frame, left) {
-                        let pto = path.recovery.pto();
+                        let pto = mp_closing_pto
+                            .unwrap_or_else(|| path.recovery.pto());
                         self.draining_timer = Some(now + (pto * 3));
 
                         ack_eliciting = true;
