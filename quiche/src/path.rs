@@ -814,6 +814,14 @@ pub struct PathMap {
     /// ignored (§4).
     #[cfg(feature = "multipath")]
     pub(crate) abandoned_ids: std::collections::BTreeSet<u64>,
+
+    /// The peer address of the initial path at connection creation, i.e.
+    /// the peer's handshake address. When the peer advertised the
+    /// disable_active_migration transport parameter, establishing new
+    /// paths to this address is forbidden
+    /// (draft-ietf-quic-multipath-21 §2.2).
+    #[cfg(feature = "multipath")]
+    handshake_peer_addr: SocketAddr,
 }
 
 impl PathMap {
@@ -852,7 +860,17 @@ impl PathMap {
             peer_initial_max_path_id: 0,
             #[cfg(feature = "multipath")]
             abandoned_ids: std::collections::BTreeSet::new(),
+            #[cfg(feature = "multipath")]
+            handshake_peer_addr: peer_addr,
         }
+    }
+
+    /// Returns the peer address of the initial path at connection
+    /// creation, i.e. the peer's handshake address
+    /// (draft-ietf-quic-multipath-21 §2.2).
+    #[cfg(feature = "multipath")]
+    pub fn handshake_peer_addr(&self) -> SocketAddr {
+        self.handshake_peer_addr
     }
 
     /// Gets an immutable reference to the path identified by `path_id`. If the

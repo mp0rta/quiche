@@ -244,6 +244,32 @@ fn multipath_transport_param_absent_means_disabled() {
     assert_eq!(tp.initial_max_path_id, None);
 }
 
+/// draft-ietf-quic-multipath-21 §2.1: an initial_max_path_id value larger
+/// than 2^32-1 MUST be rejected with a connection error of type
+/// TRANSPORT_PARAMETER_ERROR (0x8).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_transport_param_too_large_is_transport_parameter_error() {
+    // Hand-rolled initial_max_path_id (0x3e) transport parameter carrying
+    // 2^32 as an 8-byte varint, one above the allowed maximum.
+    let raw_params = [
+        0x3e, // initial_max_path_id
+        0x08, // length
+        0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, // 2^32
+    ];
+
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), true, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The decode error must reach the wire as TRANSPORT_PARAMETER_ERROR.
+    assert_eq!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::TransportParameterError as u64
+    );
+}
+
 #[test]
 fn unknown_version() {
     let mut config = Config::new(0xbabababa).unwrap();
@@ -12193,6 +12219,115 @@ fn multipath_negotiation_one_side_disabled() {
     );
 }
 
+/// draft-ietf-quic-multipath-21 §2.1: receiving an initial_max_path_id
+/// transport parameter while the carrying packets use a zero-length
+/// connection ID is a connection error of type PROTOCOL_VIOLATION (0xa).
+/// Here the client uses a zero-length SCID, so the server's transport
+/// parameters arrive in packets with a zero-length Destination CID.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_tp_with_zero_length_client_scid_is_protocol_violation() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(2);
+
+    let mut pipe =
+        test_utils::Pipe::with_config_and_scid_lengths(&mut config, 0, 16)
+            .unwrap();
+
+    // The client errors out when it receives the server's
+    // initial_max_path_id transport parameter.
+    assert_eq!(pipe.handshake(), Err(Error::InvalidState));
+
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// draft-ietf-quic-multipath-21 §2.1: same as above, with the zero-length
+/// SCID on the server side. The client's transport parameters arrive at
+/// the server in packets whose Destination CID is the server's
+/// zero-length SCID.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_tp_with_zero_length_server_scid_is_protocol_violation() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.set_initial_max_path_id(2);
+
+    let mut pipe =
+        test_utils::Pipe::with_config_and_scid_lengths(&mut config, 16, 0)
+            .unwrap();
+
+    // The server errors out when it receives the client's
+    // initial_max_path_id transport parameter.
+    assert_eq!(pipe.handshake(), Err(Error::InvalidState));
+
+    assert_eq!(
+        pipe.server.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::ProtocolViolation as u64,
+            reason: vec![],
+        })
+    );
+}
+
+/// draft-ietf-quic-multipath-21 §2.1: an endpoint configured with a
+/// zero-length SCID MUST NOT advertise initial_max_path_id. quiche
+/// suppresses the transport parameter instead, so the handshake succeeds
+/// without multipath.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_tp_suppressed_with_zero_length_scid() {
+    // Only the client requests multipath, and it uses a zero-length SCID.
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(2);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+
+    let client_scid = ConnectionId::from_ref(&[]);
+    let client_addr = test_utils::Pipe::client_addr();
+
+    let mut server_scid = [0; 16];
+    rand::rand_bytes(&mut server_scid[..]);
+    let server_scid = ConnectionId::from_ref(&server_scid);
+    let server_addr = test_utils::Pipe::server_addr();
+
+    let mut pipe = test_utils::Pipe {
+        client: connect(
+            Some("quic.tech"),
+            &client_scid,
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .unwrap(),
+        server: accept(
+            &server_scid,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .unwrap(),
+    };
+
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // The parameter was never advertised: multipath stays off and the
+    // server saw no initial_max_path_id from the client.
+    assert!(!pipe.client.is_multipath());
+    assert!(!pipe.server.is_multipath());
+    assert_eq!(
+        pipe.server.peer_transport_params.initial_max_path_id,
+        None
+    );
+}
+
 #[cfg(feature = "multipath")]
 #[test]
 fn create_path_client_only() {
@@ -14557,6 +14692,87 @@ fn mp_pipe_with_per_path_cids(
     assert_eq!(pipe.advance(), Ok(()));
 
     pipe
+}
+
+/// Builds a multipath-negotiated pipe where the server advertised the
+/// disable_active_migration transport parameter, with path ID 1 funded
+/// with per-path CIDs on both endpoints.
+#[cfg(feature = "multipath")]
+fn mp_pipe_with_disable_active_migration() -> test_utils::Pipe {
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_initial_max_path_id(4);
+    client_config.set_active_connection_id_limit(4);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.set_initial_max_path_id(4);
+    server_config.set_active_connection_id_limit(4);
+    server_config.set_disable_active_migration(true);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert!(pipe.client.is_multipath());
+    assert!(pipe.server.is_multipath());
+
+    let (c_cid, c_reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid_on_path(1, &c_cid, c_reset_token, false),
+        Ok(0)
+    );
+
+    let (s_cid, s_reset_token) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.server.new_scid_on_path(1, &s_cid, s_reset_token, false),
+        Ok(0)
+    );
+
+    assert_eq!(pipe.advance(), Ok(()));
+
+    pipe
+}
+
+/// draft-ietf-quic-multipath-21 §2.2: an endpoint that received the
+/// disable_active_migration transport parameter is forbidden to establish
+/// new paths to the peer's handshake address.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_path_to_handshake_address_forbidden_when_migration_disabled()
+{
+    let mut pipe = mp_pipe_with_disable_active_migration();
+
+    let server_addr = test_utils::Pipe::server_addr(); // handshake address
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(
+        pipe.client.create_path(client_addr_2, server_addr),
+        Err(Error::InvalidState)
+    );
+    assert_eq!(
+        pipe.client.probe_path(client_addr_2, server_addr),
+        Err(Error::InvalidState)
+    );
+
+    // This is a local prohibition, not a connection error.
+    assert!(!pipe.client.is_closed());
+    assert_eq!(pipe.client.local_error(), None);
+}
+
+/// draft-ietf-quic-multipath-21 §2.2: disable_active_migration only
+/// forbids new paths to the peer's *handshake* address; paths to other
+/// peer addresses can still be established.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_new_path_to_other_address_allowed_when_migration_disabled() {
+    let mut pipe = mp_pipe_with_disable_active_migration();
+
+    let server_addr_2: SocketAddr = "127.0.0.1:9876".parse().unwrap();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr_2), Ok(1));
 }
 
 #[cfg(feature = "multipath")]

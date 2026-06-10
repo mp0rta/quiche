@@ -1256,6 +1256,11 @@ impl Config {
     /// Advertising this transport parameter with any value (including 0)
     /// enables multipath negotiation; the value bounds how many extra paths
     /// the peer may open initially (draft-ietf-quic-multipath-21 §2.1).
+    ///
+    /// Endpoints advertising this parameter MUST use connection IDs with
+    /// non-zero lengths (Section 2.1). If the connection is created with a
+    /// zero-length source connection ID, the parameter is quietly *not*
+    /// advertised and multipath stays disabled for the connection.
     pub fn set_initial_max_path_id(&mut self, max_path_id: u32) {
         self.initial_max_path_id = Some(max_path_id);
     }
@@ -2361,8 +2366,24 @@ impl<F: BufFactory> Connection<F> {
 
         #[cfg(feature = "multipath")]
         {
-            conn.local_transport_params.initial_max_path_id =
-                config.initial_max_path_id;
+            // draft-ietf-quic-multipath-21 §2.1: endpoints advertising the
+            // initial_max_path_id transport parameter MUST use Source and
+            // Destination Connection IDs with non-zero lengths. A
+            // zero-length SCID is a local configuration choice, so the
+            // parameter is quietly suppressed instead of being advertised
+            // in violation of that requirement.
+            if conn.ids.zero_length_scid() &&
+                config.initial_max_path_id.is_some()
+            {
+                debug!(
+                    "{} zero-length SCID in use; suppressing the \
+                     initial_max_path_id transport parameter (draft-21 §2.1)",
+                    conn.trace_id
+                );
+            } else {
+                conn.local_transport_params.initial_max_path_id =
+                    config.initial_max_path_id;
+            }
         }
 
         conn.handshake.init(is_server)?;
@@ -7278,7 +7299,10 @@ impl<F: BufFactory> Connection<F> {
     /// packets dropped on nonce mismatch.
     ///
     /// Returns [`Error::MultipathNotNegotiated`] if multipath was not
-    /// negotiated, or [`Error::InvalidState`] if called on a server.
+    /// negotiated, or [`Error::InvalidState`] if called on a server or if
+    /// the peer advertised the disable_active_migration transport
+    /// parameter and `peer` is the peer's handshake address
+    /// (draft-ietf-quic-multipath-21 Section 2.2).
     ///
     /// If every path ID allowed by the *peer* is consumed, this raises a
     /// [`Error::PathLimitExceeded`] and queues a PATHS_BLOCKED frame; if no
@@ -7301,6 +7325,10 @@ impl<F: BufFactory> Connection<F> {
         if self.is_server {
             return Err(Error::InvalidState);
         }
+
+        // §2.2: disable_active_migration forbids new paths to the peer's
+        // handshake address.
+        self.mp_check_new_path_addr_allowed(peer)?;
 
         let pid = if !self.ids.zero_length_dcid() {
             // Consume the lowest unused path ID together with an unused
@@ -7837,6 +7865,26 @@ impl<F: BufFactory> Connection<F> {
 
         #[cfg(feature = "multipath")]
         {
+            // draft-ietf-quic-multipath-21 §2.1: "If an initial_max_path_id
+            // transport parameter is received and the carrying packet
+            // contains a zero-length connection ID, the receiver MUST treat
+            // this as a connection error of type PROTOCOL_VIOLATION." The
+            // packets carrying the peer's transport parameters use our SCID
+            // as Destination CID and the peer's SCID (our DCID) as Source
+            // CID, so a zero-length connection ID on either side of the
+            // connection trips the check. `Error::InvalidState` reaches the
+            // wire as PROTOCOL_VIOLATION (0xa).
+            if peer_params.initial_max_path_id.is_some() &&
+                (self.ids.zero_length_scid() || self.ids.zero_length_dcid())
+            {
+                error!(
+                    "{} received initial_max_path_id with a zero-length \
+                     connection ID in use (draft-21 §2.1)",
+                    self.trace_id
+                );
+                return Err(Error::InvalidState);
+            }
+
             // Per draft-ietf-quic-multipath §2.1: advertising
             // initial_max_path_id with *any* value (including 0) enables the
             // multipath extension. Value 0 means "multipath enabled but no
@@ -7846,6 +7894,18 @@ impl<F: BufFactory> Connection<F> {
                 self.local_transport_params.initial_max_path_id,
                 peer_params.initial_max_path_id,
             ) {
+                // draft-ietf-quic-multipath-21 §2.1: enabling multipath
+                // with an AEAD whose nonce is shorter than 12 bytes must
+                // abort the handshake with TRANSPORT_PARAMETER_ERROR.
+                // Every AEAD currently negotiable through quiche uses a
+                // 12-byte IV, so this is a defensive, normally unreachable
+                // check.
+                if let Some(alg) = self.handshake.cipher() {
+                    if alg.nonce_len() < 12 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+                }
+
                 self.multipath_enabled = true;
                 self.paths.peer_max_path_id = peer_max as u64;
                 // §4.6: a MAX_PATH_ID value lower than the peer's
@@ -10011,6 +10071,27 @@ impl<F: BufFactory> Connection<F> {
         }
     }
 
+    /// Checks that a new path towards `peer_addr` may be established.
+    ///
+    /// draft-ietf-quic-multipath-21 §2.2: an endpoint that received the
+    /// disable_active_migration transport parameter is forbidden to
+    /// establish new paths to the peer's *handshake* address; paths to
+    /// other peer addresses remain allowed. Returns
+    /// [`Error::InvalidState`]: this is a local prohibition, not a
+    /// connection error.
+    #[cfg(feature = "multipath")]
+    fn mp_check_new_path_addr_allowed(
+        &self, peer_addr: SocketAddr,
+    ) -> Result<()> {
+        if self.peer_transport_params.disable_active_migration &&
+            peer_addr == self.paths.handshake_peer_addr()
+        {
+            return Err(Error::InvalidState);
+        }
+
+        Ok(())
+    }
+
     /// Creates a new client-side path by consuming the lowest unused
     /// multipath path ID and a Connection ID from that path's pool
     /// (draft-21 §3.1).
@@ -10105,6 +10186,13 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<usize> {
         if self.is_server {
             return Err(Error::InvalidState);
+        }
+
+        // §2.2: with multipath negotiated, disable_active_migration
+        // forbids new paths to the peer's handshake address.
+        #[cfg(feature = "multipath")]
+        if self.multipath_enabled {
+            self.mp_check_new_path_addr_allowed(peer_addr)?;
         }
 
         // With multipath, opening a path consumes an unused path ID and a
