@@ -4220,16 +4220,45 @@ impl<F: BufFactory> Connection<F> {
         // When per-path packet numbers are used, the per-path space is updated
         // in the multipath block below instead.
         if !used_per_path_pn {
-            if self.pkt_num_spaces[epoch].recv_pkt_need_ack.last() < Some(pn) {
-                self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
+            // draft-ietf-quic-multipath-21 §2.3: once multipath is
+            // negotiated, endpoints SHOULD use PATH_ACK frames instead of
+            // ACK frames for 1-RTT packets (including for so far
+            // unacknowledged 0-RTT packets, using path ID 0). Application
+            // epoch packets are therefore only queued for acknowledgment
+            // in the per-path packet number space below, which feeds the
+            // PATH_ACK generation; the shared space still tracks the
+            // largest received packet number (used by the shared-counter
+            // packet number decode) and the received-packet window (used
+            // for duplicate detection while a single path exists).
+            //
+            // Multipath negotiation happens during transport parameter
+            // exchange, before any Application epoch packet can be
+            // decrypted, so no 0-RTT/1-RTT packet is ever registered for
+            // acknowledgment in the shared space on a multipath
+            // connection.
+            #[cfg(feature = "multipath")]
+            let mp_per_path_acks = self.multipath_enabled &&
+                epoch == packet::Epoch::Application;
+
+            #[cfg(not(feature = "multipath"))]
+            let mp_per_path_acks = false;
+
+            if !mp_per_path_acks {
+                if self.pkt_num_spaces[epoch].recv_pkt_need_ack.last() <
+                    Some(pn)
+                {
+                    self.pkt_num_spaces[epoch].largest_rx_pkt_time = now;
+                }
+
+                self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
+
+                self.pkt_num_spaces[epoch].ack_elicited = cmp::max(
+                    self.pkt_num_spaces[epoch].ack_elicited,
+                    ack_elicited,
+                );
             }
 
             self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
-
-            self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
-
-            self.pkt_num_spaces[epoch].ack_elicited =
-                cmp::max(self.pkt_num_spaces[epoch].ack_elicited, ack_elicited);
 
             self.pkt_num_spaces[epoch].largest_rx_pkt_num =
                 cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
@@ -8385,6 +8414,25 @@ impl<F: BufFactory> Connection<F> {
                 );
 
                 for (_, p) in self.paths.iter_mut() {
+                    // draft-ietf-quic-multipath-21 §2.3: ACK frames, when
+                    // used with the multipath extension, acknowledge
+                    // packets for the path with path ID 0 only. Once
+                    // multipath is negotiated, 1-RTT packets are numbered
+                    // in per-path packet number spaces, so feeding the ACK
+                    // ranges into another path's recovery would spuriously
+                    // acknowledge unrelated packets.
+                    //
+                    // Handshake epochs (and non-multipath connections)
+                    // keep the existing behavior: a single shared packet
+                    // number space across all paths.
+                    #[cfg(feature = "multipath")]
+                    if self.multipath_enabled &&
+                        epoch == packet::Epoch::Application &&
+                        p.path_id != 0
+                    {
+                        continue;
+                    }
+
                     if self.pkt_num_spaces[epoch]
                         .largest_tx_pkt_num
                         .is_some_and(|largest_sent| largest_sent < largest_acked)

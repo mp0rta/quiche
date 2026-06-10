@@ -16989,3 +16989,283 @@ fn multipath_abandon_never_used_path_id_frees_both_cid_pools() {
     assert_eq!(pipe.client.local_error(), None);
     assert!(!pipe.client.is_closed());
 }
+
+/// Sends `data` on stream 0 over the given 4-tuple and delivers the
+/// resulting packets to the server, returning the per-path packet number
+/// range `[first, last)` the client consumed on that path.
+#[cfg(feature = "multipath")]
+fn mp_send_stream_data_on_path(
+    pipe: &mut test_utils::Pipe, from: SocketAddr, to: SocketAddr, data: &[u8],
+) -> (usize, u64, u64) {
+    let pid = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(from, to))
+        .expect("path exists");
+
+    let pn_first = pipe.client.paths.get(pid).unwrap().mp_next_pkt_num;
+
+    pipe.client.stream_send(0, data, false).unwrap();
+
+    let mut buf = [0u8; 65535];
+    loop {
+        match pipe.client.send_on_path(&mut buf, Some(from), Some(to)) {
+            Ok((len, info)) => {
+                let recv_info = RecvInfo {
+                    to: info.to,
+                    from: info.from,
+                };
+                pipe.server.recv(&mut buf[..len], recv_info).unwrap();
+            },
+            Err(Error::Done) => break,
+            Err(e) => panic!("send_on_path error: {e:?}"),
+        }
+    }
+
+    let pn_last = pipe.client.paths.get(pid).unwrap().mp_next_pkt_num;
+
+    (pid, pn_first, pn_last)
+}
+
+/// Forges a 1-RTT packet from the server carrying `frames` and delivers it
+/// to the client on the initial path. The server's shared packet number
+/// counter is synced with its path-0 per-path counter so the forged packet
+/// is accepted by the client's per-path decode.
+#[cfg(feature = "multipath")]
+fn mp_forge_server_pkt_to_client(
+    pipe: &mut test_utils::Pipe, frames: &[frame::Frame],
+) -> Result<usize> {
+    let mut buf = [0u8; 65535];
+
+    // Sync the shared counter used by encode_pkt with the server's path-0
+    // per-path counter (post 1->2 path transition the per-path counter is
+    // authoritative for path 0; the multipath nonce with path ID 0 equals
+    // the standard nonce).
+    let path0_next = pipe
+        .server
+        .paths
+        .iter()
+        .find(|(_, p)| p.path_id == 0)
+        .map(|(_, p)| p.mp_next_pkt_num)
+        .unwrap_or(0);
+    pipe.server.next_pkt_num = pipe.server.next_pkt_num.max(path0_next);
+
+    let written =
+        test_utils::encode_pkt(&mut pipe.server, Type::Short, frames, &mut buf)?;
+
+    // Keep the per-path counter consistent for any later server sends.
+    if let Some((spid, _)) =
+        pipe.server.paths.iter().find(|(_, p)| p.path_id == 0)
+    {
+        let next = pipe.server.next_pkt_num;
+        let p = pipe.server.paths.get_mut(spid).unwrap();
+        p.mp_next_pkt_num = p.mp_next_pkt_num.max(next);
+    }
+
+    let info = RecvInfo {
+        to: test_utils::Pipe::client_addr(),
+        from: test_utils::Pipe::server_addr(),
+    };
+    pipe.client.recv(&mut buf[..written], info)
+}
+
+/// draft-21 §2.3: "ACK frames when used with the multipath extension
+/// acknowledge packets for the path with path ID 0" and "Endpoints MUST
+/// still process ACK frames that acknowledge ... 1-RTT packets."
+///
+/// A plain 1-RTT ACK received on a multipath connection must acknowledge
+/// path-0 packets (routed to path 0's recovery).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_plain_ack_acks_path_zero_space() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    let (pid0, pn_first, pn_last) = mp_send_stream_data_on_path(
+        &mut pipe,
+        client_addr,
+        server_addr,
+        b"hello",
+    );
+    assert!(pn_last > pn_first);
+
+    let in_flight_before = pipe
+        .client
+        .paths
+        .get(pid0)
+        .unwrap()
+        .recovery
+        .in_flight_count(packet::Epoch::Application);
+    assert!(in_flight_before > 0);
+
+    // Forge a plain ACK covering the path-0 packet numbers.
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(pn_first..pn_last);
+
+    let frames = [frame::Frame::ACK {
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+
+    mp_forge_server_pkt_to_client(&mut pipe, &frames).unwrap();
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get(pid0)
+            .unwrap()
+            .recovery
+            .in_flight_count(packet::Epoch::Application),
+        0,
+        "plain ACK must acknowledge path-0 1-RTT packets"
+    );
+}
+
+/// draft-21 §2.3: a PATH_ACK frame with path ID 0 is equivalent to a plain
+/// ACK frame: both acknowledge packets of the path-0 packet number space.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_ack_zero_equivalent_to_plain_ack() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    let (pid0, pn_first, pn_last) = mp_send_stream_data_on_path(
+        &mut pipe,
+        client_addr,
+        server_addr,
+        b"hello",
+    );
+    assert!(pn_last > pn_first);
+
+    assert!(
+        pipe.client
+            .paths
+            .get(pid0)
+            .unwrap()
+            .recovery
+            .in_flight_count(packet::Epoch::Application) >
+            0
+    );
+
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(pn_first..pn_last);
+
+    let frames = [frame::Frame::PathAck {
+        path_id: 0,
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+
+    mp_forge_server_pkt_to_client(&mut pipe, &frames).unwrap();
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get(pid0)
+            .unwrap()
+            .recovery
+            .in_flight_count(packet::Epoch::Application),
+        0,
+        "PATH_ACK with path ID 0 must have the same effect as a plain ACK"
+    );
+}
+
+/// draft-21 §2.3: plain ACK frames acknowledge packets for path ID 0
+/// *only*. An ACK whose ranges happen to match packet numbers of another
+/// path's packet number space must not acknowledge that path's packets.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_plain_ack_does_not_ack_other_path_packets() {
+    let (mut pipe, _pid1, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Send data on path 1; its per-path packet numbers are small and
+    // distinct from path 0's (which continues the shared counter).
+    let (pid1, pn_first, pn_last) = mp_send_stream_data_on_path(
+        &mut pipe,
+        client_addr_2,
+        server_addr,
+        b"hello",
+    );
+    assert!(pn_last > pn_first);
+
+    let in_flight_before = pipe
+        .client
+        .paths
+        .get(pid1)
+        .unwrap()
+        .recovery
+        .in_flight_count(packet::Epoch::Application);
+    assert!(in_flight_before > 0);
+
+    // Forge a plain ACK whose ranges only make sense in path 1's packet
+    // number space.
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(pn_first..pn_last);
+
+    let frames = [frame::Frame::ACK {
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+
+    mp_forge_server_pkt_to_client(&mut pipe, &frames).unwrap();
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get(pid1)
+            .unwrap()
+            .recovery
+            .in_flight_count(packet::Epoch::Application),
+        in_flight_before,
+        "a plain ACK must not acknowledge packets of paths other than \
+         path ID 0"
+    );
+}
+
+/// draft-21 §2.3: "endpoints SHOULD use PATH_ACK frames instead of ACK
+/// frames" once the handshake with multipath support is established. 1-RTT
+/// acknowledgments must go out as PATH_ACK (including for path ID 0).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_established_acks_via_path_ack_not_plain_ack() {
+    let mut pipe = mp_pipe_with_per_path_cids(4, 4, &[]);
+
+    assert!(pipe.client.is_established());
+    assert!(pipe.server.is_established());
+
+    // Client sends ack-eliciting 1-RTT data to the server.
+    pipe.client.stream_send(0, b"hello", false).unwrap();
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    // The server's acknowledgment flight must carry PATH_ACK (path ID 0),
+    // not a plain ACK frame.
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    let mut saw_path_ack_zero = false;
+    for (mut pkt, _si) in flight {
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap();
+
+        for frame in frames {
+            match frame {
+                frame::Frame::ACK { .. } => panic!(
+                    "established multipath connection must not send plain \
+                     ACK frames for 1-RTT packets"
+                ),
+                frame::Frame::PathAck { path_id: 0, .. } =>
+                    saw_path_ack_zero = true,
+                _ => (),
+            }
+        }
+    }
+
+    assert!(
+        saw_path_ack_zero,
+        "1-RTT acknowledgments must be sent as PATH_ACK with path ID 0"
+    );
+}
