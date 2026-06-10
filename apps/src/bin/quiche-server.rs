@@ -824,6 +824,15 @@ fn handle_path_events(client: &mut Client) {
                     peer_addr
                 );
             },
+
+            #[cfg(feature = "multipath")]
+            quiche::PathEvent::PeerPathsBlocked(max_path_id) => {
+                info!(
+                    "{} Peer is blocked at maximum path ID {}",
+                    client.conn.trace_id(),
+                    max_path_id
+                );
+            },
         }
     }
 }

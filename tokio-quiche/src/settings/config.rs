@@ -53,6 +53,15 @@ pub(crate) struct Config {
     pub handshake_timeout: Option<Duration>,
     pub has_ippktinfo: bool,
     pub has_ipv6pktinfo: bool,
+    /// Lifetime ceiling for the automatic MAX_PATH_ID raise policy
+    /// (`None` = policy disabled). See
+    /// [`MultipathSettings::auto_raise_max_path_id`](crate::settings::MultipathSettings::auto_raise_max_path_id).
+    #[cfg(feature = "multipath")]
+    pub multipath_auto_raise_max_path_id: Option<u64>,
+    /// Amount each automatic raise adds to the advertised maximum path
+    /// ID; equals the configured initial limit (`max_active_paths`).
+    #[cfg(feature = "multipath")]
+    pub multipath_max_path_id_step: u64,
 }
 
 impl AsMut<quiche::Config> for Config {
@@ -104,6 +113,22 @@ impl Config {
             handshake_timeout: quic_settings.handshake_timeout,
             has_ippktinfo,
             has_ipv6pktinfo,
+            #[cfg(feature = "multipath")]
+            multipath_auto_raise_max_path_id: if quic_settings.multipath.enabled
+            {
+                quic_settings.multipath.auto_raise_max_path_id
+            } else {
+                None
+            },
+            // The grant window grows by the initially advertised limit:
+            // every raise re-grants the same number of openable path IDs
+            // the connection started with, independent of how many were
+            // consumed in the meantime.
+            #[cfg(feature = "multipath")]
+            multipath_max_path_id_step: quic_settings
+                .multipath
+                .max_active_paths
+                .unwrap_or(4) as u64,
         })
     }
 }
@@ -209,6 +234,18 @@ fn make_quiche_config(
         }
         if matches!(quic_settings.multipath.max_active_paths, Some(0 | 1)) {
             return Err("multipath max_active_paths must be >= 2".into());
+        }
+        // §4.6: the Maximum Path Identifier on the wire MUST NOT exceed
+        // 2^32-1, so a ceiling above that could never be advertised.
+        if quic_settings
+            .multipath
+            .auto_raise_max_path_id
+            .is_some_and(|v| v > u32::MAX as u64)
+        {
+            return Err(
+                "multipath auto_raise_max_path_id must not exceed 2^32-1"
+                    .into(),
+            );
         }
 
         let max_paths = quic_settings.multipath.max_active_paths.unwrap_or(4);

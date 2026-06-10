@@ -17128,6 +17128,151 @@ fn multipath_blocked_frames_valid_values_are_informational() {
     assert!(!pipe.server.is_closed());
 }
 
+/// §4.7: a PATHS_BLOCKED frame carrying exactly the local maximum path ID
+/// means the peer is genuinely blocked at our current limit: it is
+/// surfaced to the application as a `PeerPathsBlocked` event so the
+/// application MAY respond with `set_max_path_id()`.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_at_local_max_yields_event() {
+    let mut pipe = mp_cid_pipe(2);
+
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 2,
+    }])
+    .unwrap();
+    assert_eq!(pipe.server.local_error(), None);
+
+    assert_eq!(
+        pipe.server.path_event_next(),
+        Some(PathEvent::PeerPathsBlocked(2))
+    );
+    assert_eq!(pipe.server.path_event_next(), None);
+}
+
+/// §4.7: "If the received value is lower than the currently allowed
+/// maximum value, this frame can be ignored." A stale PATHS_BLOCKED (e.g.
+/// one sent before our MAX_PATH_ID raise was delivered) must not be
+/// surfaced to the application.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_stale_value_yields_no_event() {
+    let mut pipe = mp_cid_pipe(2);
+
+    // Below the advertised limit from the start: stale.
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 0,
+    }])
+    .unwrap();
+    assert_eq!(pipe.server.path_event_next(), None);
+
+    // The server raises its limit; a PATHS_BLOCKED carrying the old limit
+    // crosses the MAX_PATH_ID in flight and is stale on arrival.
+    assert_eq!(pipe.server.set_max_path_id(4), Ok(()));
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 2,
+    }])
+    .unwrap();
+
+    assert_eq!(pipe.server.local_error(), None);
+    assert_eq!(pipe.server.path_event_next(), None);
+}
+
+/// PATHS_BLOCKED frames are retransmitted while the peer stays blocked
+/// (§3.2.1): duplicates must collapse into a single `PeerPathsBlocked`
+/// event until the limit is raised, after which a peer blocked at the new
+/// limit is notified again.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_duplicates_yield_single_event() {
+    let mut pipe = mp_cid_pipe(2);
+
+    for _ in 0..3 {
+        mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+            path_id: 2,
+        }])
+        .unwrap();
+    }
+
+    assert_eq!(
+        pipe.server.path_event_next(),
+        Some(PathEvent::PeerPathsBlocked(2))
+    );
+    assert_eq!(pipe.server.path_event_next(), None);
+
+    // Still blocked at the same limit: no new event, even after the
+    // previous one was consumed.
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 2,
+    }])
+    .unwrap();
+    assert_eq!(pipe.server.path_event_next(), None);
+
+    // The limit is raised; the peer blocking at the new limit is a new
+    // condition and must be notified again.
+    assert_eq!(pipe.server.set_max_path_id(3), Ok(()));
+    mp_inject_to_server(&mut pipe, &[frame::Frame::PathsBlocked {
+        path_id: 3,
+    }])
+    .unwrap();
+    assert_eq!(
+        pipe.server.path_event_next(),
+        Some(PathEvent::PeerPathsBlocked(3))
+    );
+    assert_eq!(pipe.server.path_event_next(), None);
+}
+
+/// Full §3.2.1/§4.7 loop: the client consumes every path ID the server
+/// allows and gets blocked (sending PATHS_BLOCKED); the server application
+/// observes `PeerPathsBlocked` and responds with `set_max_path_id()`; the
+/// client's peer limit is raised and it can open the next path ID.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_paths_blocked_event_set_max_path_id_unblocks_peer() {
+    // The server initially allows a single extra path (path ID 1).
+    let mut pipe = mp_pipe_with_per_path_cids(4, 1, &[1]);
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr_2 = "127.0.0.1:5678".parse().unwrap();
+    let client_addr_3 = "127.0.0.1:9012".parse().unwrap();
+
+    assert_eq!(pipe.client.create_path(client_addr_2, server_addr), Ok(1));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Path ID 1 was the last one the server allows: the client is
+    // peer-limited and queues PATHS_BLOCKED(1).
+    assert_eq!(
+        pipe.client.create_path(client_addr_3, server_addr),
+        Err(Error::PathLimitExceeded)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // The server application is notified that the peer is blocked at the
+    // currently advertised limit (other path events may precede it).
+    let mut blocked_at = None;
+    while let Some(ev) = pipe.server.path_event_next() {
+        if let PathEvent::PeerPathsBlocked(v) = ev {
+            blocked_at = Some(v);
+        }
+    }
+    assert_eq!(blocked_at, Some(1));
+
+    // It responds with a MAX_PATH_ID raise, which reaches the client.
+    assert_eq!(pipe.server.set_max_path_id(2), Ok(()));
+    assert_eq!(pipe.advance(), Ok(()));
+    assert_eq!(pipe.client.peer_max_path_id(), 2);
+
+    // Fund path ID 2 on both sides, then the client can open it.
+    let (c_cid, c_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.client.new_scid_on_path(2, &c_cid, c_tok, false), Ok(0));
+    let (s_cid, s_tok) = test_utils::create_cid_and_reset_token(16);
+    assert_eq!(pipe.server.new_scid_on_path(2, &s_cid, s_tok, false), Ok(0));
+    assert_eq!(pipe.advance(), Ok(()));
+
+    assert_eq!(pipe.client.create_path(client_addr_3, server_addr), Ok(2));
+    assert_eq!(pipe.advance(), Ok(()));
+}
+
 /// §3.4: a legacy NEW_CONNECTION_ID frame arriving after path 0 was
 /// abandoned must be silently ignored: the legacy CID space belongs to
 /// path 0, whose connection IDs are implicitly retired, so no legacy

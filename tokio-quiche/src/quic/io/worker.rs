@@ -84,6 +84,14 @@ pub struct WriterConfig {
     pub with_gso: bool,
     pub pacing_offload: bool,
     pub with_pktinfo: bool,
+    /// Lifetime ceiling for the automatic MAX_PATH_ID raise policy
+    /// (`None` = policy disabled). See
+    /// [`MultipathSettings::auto_raise_max_path_id`](crate::settings::MultipathSettings::auto_raise_max_path_id).
+    #[cfg(feature = "multipath")]
+    pub mp_auto_raise_max_path_id: Option<u64>,
+    /// Amount each automatic raise adds to the advertised maximum path ID.
+    #[cfg(feature = "multipath")]
+    pub mp_max_path_id_step: u64,
 }
 
 #[derive(Default)]
@@ -343,6 +351,10 @@ where
                 #[cfg(feature = "multipath")]
                 while let Some(ev) = qconn.path_event_next() {
                     self.handle_path_event_cleanup(&ev);
+                    if let quiche::PathEvent::PeerPathsBlocked(blocked_at) = ev {
+                        self.maybe_auto_raise_max_path_id(qconn, blocked_at);
+                    }
+                    // The event is forwarded to the application either way.
                     self.conn_stage.on_path_event(qconn, ev, ctx)?;
                 }
 
@@ -519,6 +531,46 @@ where
                     .map_err(|e| -> crate::BoxError { Box::new(e) });
                 let _ = reply.send(result);
             },
+        }
+    }
+
+    /// Opt-in policy for [`quiche::PathEvent::PeerPathsBlocked`]: when
+    /// `mp_auto_raise_max_path_id` is configured and the current limit is
+    /// below that ceiling, raise the advertised maximum path ID by
+    /// `mp_max_path_id_step` (the initially configured limit, so every
+    /// grant re-opens a window of the same size), capped at the ceiling.
+    ///
+    /// Path IDs are never reused once abandoned
+    /// (draft-ietf-quic-multipath-21 §3.4), so peers with mobile handover
+    /// patterns drain the path-ID space over time and block on any fixed
+    /// limit; this keeps long-lived connections usable up to the
+    /// configured ceiling without application involvement. Errors are
+    /// logged, not fatal: PATHS_BLOCKED is informational (§4.7) and not
+    /// granting more path IDs is always spec-legal.
+    #[cfg(feature = "multipath")]
+    fn maybe_auto_raise_max_path_id(
+        &self, qconn: &mut QuicheConnection, blocked_at: u64,
+    ) {
+        let Some(ceiling) = self.cfg.mp_auto_raise_max_path_id else {
+            return;
+        };
+
+        let local_max = qconn.local_max_path_id();
+        if local_max >= ceiling {
+            return;
+        }
+
+        let new_limit = local_max
+            .saturating_add(self.cfg.mp_max_path_id_step)
+            .min(ceiling);
+
+        if let Err(e) = qconn.set_max_path_id(new_limit) {
+            log::warn!(
+                "failed to auto-raise max path ID";
+                "blocked_at" => blocked_at,
+                "new_limit" => new_limit,
+                "error" => ?e,
+            );
         }
     }
 

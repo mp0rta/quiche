@@ -60,8 +60,192 @@ fn multipath_server_settings() -> QuicSettings {
         scheduler: tokio_quiche::MultipathScheduler::MinRtt,
         max_active_paths: Some(4),
         reinjection_mode: tokio_quiche::ReinjectionMode::default(),
+        auto_raise_max_path_id: None,
     };
     settings
+}
+
+/// Server settings with a small initial path-ID limit (2) and the given
+/// auto-raise ceiling, for exercising the PATHS_BLOCKED → MAX_PATH_ID
+/// extension loop.
+fn small_limit_server_settings(
+    auto_raise_max_path_id: Option<u64>,
+) -> QuicSettings {
+    let mut settings = multipath_server_settings();
+    settings.multipath.max_active_paths = Some(2);
+    settings.multipath.auto_raise_max_path_id = auto_raise_max_path_id;
+    settings
+}
+
+/// Drives a bare-quiche client against a small-limit tokio-quiche server
+/// until every path ID the server allows (1 and 2) is consumed and the
+/// client is blocked, returning the sockets backing the consumed paths.
+///
+/// On return the client has a PATHS_BLOCKED(2) frame queued for the
+/// server (draft-ietf-quic-multipath-21 §3.2.1).
+async fn consume_all_path_ids(
+    socket: &tokio::net::UdpSocket, client_addr: SocketAddr,
+    server_addr: SocketAddr, conn: &mut quiche::Connection,
+) -> Vec<(tokio::net::UdpSocket, SocketAddr)> {
+    // Wait for the server's proactive per-path CID provisioning to fund
+    // path IDs 1 and 2, then consume both.
+    for _ in 0..20 {
+        if conn.mp_available_dcids(1) > 0 && conn.mp_available_dcids(2) > 0 {
+            break;
+        }
+        exchange(socket, client_addr, conn).await;
+    }
+
+    let mut extra_sockets = Vec::new();
+    for expected_id in [1u64, 2] {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        assert_eq!(conn.create_path(addr, server_addr), Ok(expected_id));
+        extra_sockets.push((sock, addr));
+    }
+
+    // Every path ID the server allows is consumed: the next attempt is
+    // peer-limited and queues PATHS_BLOCKED carrying the limit (2).
+    let blocked_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let blocked_addr = blocked_sock.local_addr().unwrap();
+    assert_eq!(
+        conn.create_path(blocked_addr, server_addr),
+        Err(quiche::Error::PathLimitExceeded)
+    );
+
+    extra_sockets
+}
+
+/// With `auto_raise_max_path_id` set on the server, a bare-quiche client
+/// that consumes every allowed path ID and sends PATHS_BLOCKED gets a
+/// MAX_PATH_ID raise from the server worker — with no server-application
+/// intervention — and can open another path.
+#[tokio::test]
+async fn multipath_paths_blocked_auto_raise_unblocks_client() {
+    let (url, _) = start_server_with_settings(
+        small_limit_server_settings(Some(4)),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+    assert_eq!(conn.peer_max_path_id(), 2);
+
+    let extra =
+        consume_all_path_ids(&socket, client_addr, server_addr, &mut conn)
+            .await;
+    let socks: Vec<_> = std::iter::once((&socket, client_addr))
+        .chain(extra.iter().map(|(s, a)| (s, *a)))
+        .collect();
+
+    // The queued PATHS_BLOCKED reaches the server; its worker auto-raises
+    // the limit and the MAX_PATH_ID raise comes back, without any
+    // server-application involvement.
+    for _ in 0..20 {
+        if conn.peer_max_path_id() > 2 {
+            break;
+        }
+        exchange_all(&socks, &mut conn).await;
+    }
+    assert_eq!(
+        conn.peer_max_path_id(),
+        4,
+        "the server should auto-raise its limit to the ceiling"
+    );
+
+    // The worker's proactive CID provisioning self-heals for the newly
+    // permitted path IDs; the client can then open path ID 3.
+    for _ in 0..20 {
+        if conn.mp_available_dcids(3) > 0 {
+            break;
+        }
+        exchange_all(&socks, &mut conn).await;
+    }
+    let sock4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr4 = sock4.local_addr().unwrap();
+    assert_eq!(
+        conn.create_path(addr4, server_addr),
+        Ok(3),
+        "the client should be unblocked after the auto-raise"
+    );
+}
+
+/// Without `auto_raise_max_path_id`, the server worker performs no
+/// MAX_PATH_ID raise on PATHS_BLOCKED: the limit is application policy
+/// and ignoring the report is spec-legal (§4.7).
+#[tokio::test]
+async fn multipath_paths_blocked_no_auto_raise_by_default() {
+    let (url, _) = start_server_with_settings(
+        small_limit_server_settings(None),
+        Http3Settings::default(),
+        TestConnectionHook::new(),
+        handle_connection,
+    );
+    let server_addr = extract_host_ipv4(&url);
+    let mut client_config = multipath_client_config();
+
+    let client_scid = SimpleConnectionIdGenerator.new_connection_id();
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = socket.local_addr().unwrap();
+
+    let mut conn = quiche::connect(
+        Some("test.com"),
+        &client_scid,
+        client_addr,
+        server_addr,
+        &mut client_config,
+    )
+    .unwrap();
+
+    while !conn.is_established() {
+        exchange(&socket, client_addr, &mut conn).await;
+    }
+    assert!(conn.is_multipath(), "multipath should be negotiated");
+    assert_eq!(conn.peer_max_path_id(), 2);
+
+    let extra =
+        consume_all_path_ids(&socket, client_addr, server_addr, &mut conn)
+            .await;
+    let socks: Vec<_> = std::iter::once((&socket, client_addr))
+        .chain(extra.iter().map(|(s, a)| (s, *a)))
+        .collect();
+
+    // The PATHS_BLOCKED reaches the server, but no raise must come back.
+    for _ in 0..10 {
+        exchange_all(&socks, &mut conn).await;
+    }
+    assert_eq!(
+        conn.peer_max_path_id(),
+        2,
+        "the server must not raise its limit without the opt-in knob"
+    );
+
+    let sock4 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr4 = sock4.local_addr().unwrap();
+    assert_eq!(
+        conn.create_path(addr4, server_addr),
+        Err(quiche::Error::PathLimitExceeded),
+        "the client must remain blocked"
+    );
 }
 
 /// Emit all pending packets from a connection on a single socket (single-path).

@@ -128,6 +128,25 @@ pub enum PathEvent {
     ///
     /// Note that this event is only raised if the path has been validated.
     PeerMigrated(SocketAddr, SocketAddr),
+
+    /// The peer reported through a PATHS_BLOCKED frame that it wishes to
+    /// open a new path but is blocked by this endpoint's Maximum Path
+    /// Identifier limit (draft-ietf-quic-multipath-21, Section 4.7). The
+    /// value is the limit the peer was blocked at, i.e. this endpoint's
+    /// currently advertised maximum path ID.
+    ///
+    /// Abandoned path IDs are consumed forever (Section 3.4: they must
+    /// never be reused, for nonce uniqueness), so mobile handover patterns
+    /// — abandon the old path and open a new one on every network change —
+    /// monotonically drain the path-ID space. Without raising the limit, a
+    /// long-lived connection eventually runs out of path IDs. Respond with
+    /// [`set_max_path_id()`] to grant the peer more path IDs; ignoring the
+    /// event is spec-legal (Section 4.7: the frame is informational and
+    /// the receiver MAY respond with MAX_PATH_ID, no action is implied).
+    ///
+    /// [`set_max_path_id()`]: struct.Connection.html#method.set_max_path_id
+    #[cfg(feature = "multipath")]
+    PeerPathsBlocked(u64),
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -823,6 +842,18 @@ pub struct PathMap {
     #[cfg(feature = "multipath")]
     handshake_peer_addr: SocketAddr,
 
+    /// The PATHS_BLOCKED value most recently surfaced to the application
+    /// as a [`PathEvent::PeerPathsBlocked`] event. PATHS_BLOCKED frames
+    /// are retransmitted for as long as the peer stays blocked
+    /// (draft-ietf-quic-multipath-21 §3.2.1), so without deduplication the
+    /// application would receive one event per retransmission. The field
+    /// never needs resetting: an event only fires when the frame's value
+    /// equals the current `local_max_path_id`, and that limit only moves
+    /// up, so a previously recorded value can never suppress a
+    /// notification for a *new* (necessarily higher) limit.
+    #[cfg(feature = "multipath")]
+    pub(crate) last_paths_blocked_notified: Option<u64>,
+
     /// PATH_STATUS state received for path IDs that are within the
     /// advertised limit but have no live `Path` yet
     /// (draft-ietf-quic-multipath-21 §4.3: "All path IDs below the maximum
@@ -873,6 +904,8 @@ impl PathMap {
             abandoned_ids: std::collections::BTreeSet::new(),
             #[cfg(feature = "multipath")]
             handshake_peer_addr: peer_addr,
+            #[cfg(feature = "multipath")]
+            last_paths_blocked_notified: None,
             #[cfg(feature = "multipath")]
             pending_path_status: BTreeMap::new(),
         }

@@ -498,6 +498,13 @@ pub fn connect(
                 },
 
                 quiche::PathEvent::PeerMigrated(..) => unreachable!(),
+
+                #[cfg(feature = "multipath")]
+                quiche::PathEvent::PeerPathsBlocked(max_path_id) => {
+                    info!(
+                        "Peer is blocked at maximum path ID {max_path_id}"
+                    );
+                },
             }
         }
 

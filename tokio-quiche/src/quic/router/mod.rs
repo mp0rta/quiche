@@ -325,6 +325,12 @@ where
             } else {
                 self.config.has_ipv6pktinfo
             },
+            #[cfg(feature = "multipath")]
+            mp_auto_raise_max_path_id: self
+                .config
+                .multipath_auto_raise_max_path_id,
+            #[cfg(feature = "multipath")]
+            mp_max_path_id_step: self.config.multipath_max_path_id_step,
         };
 
         let handshake_info = HandshakeInfo::new(

@@ -1835,6 +1835,26 @@ pub extern "C" fn quiche_path_event_type(ev: &PathEvent) -> u32 {
         PathEvent::ReusedSourceConnectionId { .. } => 4,
 
         PathEvent::PeerMigrated { .. } => 5,
+
+        #[cfg(feature = "multipath")]
+        PathEvent::PeerPathsBlocked { .. } => 6,
+    }
+}
+
+/// Returns the Maximum Path Identifier the peer reported being blocked at
+/// in a PATHS_BLOCKED frame (draft-ietf-quic-multipath-21, Section 4.7),
+/// i.e. this endpoint's currently advertised maximum path ID. The
+/// application may respond by raising the limit with
+/// `Connection::set_max_path_id()`; ignoring the event is spec-legal.
+#[cfg(feature = "multipath")]
+#[no_mangle]
+pub extern "C" fn quiche_path_event_peer_paths_blocked(
+    ev: &PathEvent, max_path_id: &mut u64,
+) {
+    match ev {
+        PathEvent::PeerPathsBlocked(v) => *max_path_id = *v,
+
+        _ => unreachable!(),
     }
 }
 

@@ -9479,14 +9479,39 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::InvalidState);
                 }
 
-                // Peer cannot open more paths beyond path_id. The frame
-                // is informational (§4.7): no local action required; just
-                // acknowledge receipt.
                 trace!(
                     "{} PATHS_BLOCKED path_id={}",
                     self.trace_id,
                     path_id,
                 );
+
+                // §4.7: "If the received value is lower than the currently
+                // allowed maximum value, this frame can be ignored": the
+                // frame is stale, e.g. sent before our MAX_PATH_ID raise
+                // was delivered. A value equal to the local limit means
+                // the peer is genuinely blocked at our current limit (a
+                // higher value was already rejected above): surface it to
+                // the application, which MAY respond with a
+                // `set_max_path_id()` raise — the frame itself implies no
+                // action (§4.7), so ignoring the event is spec-legal.
+                //
+                // This matters for mobile handover patterns: abandoned
+                // path IDs are never reused (§3.4), so abandon-old +
+                // open-new per network change monotonically drains the
+                // path-ID space and a long-lived connection eventually
+                // blocks on any fixed limit.
+                //
+                // PATHS_BLOCKED is retransmitted while the peer stays
+                // blocked (§3.2.1): deduplicate so the application sees
+                // one event per blocked-at limit rather than one per
+                // retransmission.
+                if path_id == self.paths.local_max_path_id &&
+                    self.paths.last_paths_blocked_notified != Some(path_id)
+                {
+                    self.paths.last_paths_blocked_notified = Some(path_id);
+                    self.paths
+                        .notify_event(PathEvent::PeerPathsBlocked(path_id));
+                }
             },
 
             #[cfg(feature = "multipath")]

@@ -62,6 +62,26 @@ pub struct MultipathSettings {
     /// re-sent on an alternate path.
     #[serde(default)]
     pub reinjection_mode: ReinjectionMode,
+    /// Opt-in automatic MAX_PATH_ID extension: the absolute maximum path
+    /// ID this endpoint is willing to advertise over the connection's
+    /// lifetime. `None` (the default) disables the policy.
+    ///
+    /// Multipath path IDs are never reused once abandoned
+    /// (draft-ietf-quic-multipath-21 §3.4: nonce uniqueness), so mobile
+    /// handover patterns — abandon the old path and open a new one on
+    /// every network change — monotonically drain the path-ID space and a
+    /// long-lived connection eventually blocks on any fixed limit. When
+    /// the peer reports being blocked via PATHS_BLOCKED (§4.7), the
+    /// worker automatically raises the advertised limit by `max_active_paths`
+    /// (the initially advertised window) per report, capped at this
+    /// ceiling. The `PeerPathsBlocked` path event is still forwarded to
+    /// the application either way.
+    ///
+    /// Values above 2^32-1 (the wire maximum, §4.6) are rejected at
+    /// config build time. A ceiling at or below the initial limit never
+    /// triggers a raise.
+    #[serde(default)]
+    pub auto_raise_max_path_id: Option<u64>,
 }
 
 /// QUIC configuration parameters.

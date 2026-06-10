@@ -113,6 +113,13 @@ where
         with_gso: false,
         pacing_offload: false,
         with_pktinfo: false,
+        // Raw connections bypass the settings-derived `Config`, so the
+        // auto MAX_PATH_ID raise policy stays off; the wrapping
+        // application observes `PeerPathsBlocked` events itself.
+        #[cfg(feature = "multipath")]
+        mp_auto_raise_max_path_id: None,
+        #[cfg(feature = "multipath")]
+        mp_max_path_id_step: 1,
     };
 
     let conn_params = QuicConnectionParams {
