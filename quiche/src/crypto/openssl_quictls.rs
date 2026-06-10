@@ -186,10 +186,12 @@ impl PacketKey {
         Ok(plaintext_len + olen as usize)
     }
 
+    #[cfg(feature = "multipath")]
     pub fn nonce(&self) -> &[u8] {
         &self.nonce
     }
 
+    #[cfg(feature = "multipath")]
     pub fn open_with_nonce(
         &self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -402,6 +404,7 @@ impl PacketKey {
         Ok(in_len + tag_len)
     }
 
+    #[cfg(feature = "multipath")]
     pub fn seal_with_nonce(
         &mut self, nonce: &[u8; 12], ad: &[u8], buf: &mut [u8],
         in_len: usize, _extra_in: Option<&[u8]>,

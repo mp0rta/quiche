@@ -172,6 +172,7 @@ impl BoundedNonEmptyConnectionIdVecDeque {
     }
 
     /// Returns true when the `VecDeque` holds no element.
+    #[cfg(feature = "multipath")]
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
