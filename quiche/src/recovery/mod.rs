@@ -227,11 +227,17 @@ pub trait RecoveryOps {
     );
     fn get_packet_send_time(&self, now: Instant) -> Instant;
 
+    /// `rtt_sample_allowed` controls whether this acknowledgment may
+    /// produce an RTT sample. It is `false` only for a multipath
+    /// PATH_ACK that arrived on a different path than the one it
+    /// acknowledges (draft-ietf-quic-multipath-21 §5.4): such an
+    /// acknowledgment still acks packets and drives loss detection, but
+    /// its delay does not measure this path's RTT.
     #[allow(clippy::too_many_arguments)]
     fn on_ack_received(
         &mut self, ranges: &RangeSet, ack_delay: u64, epoch: packet::Epoch,
         handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
-        trace_id: &str,
+        rtt_sample_allowed: bool, trace_id: &str,
     ) -> Result<OnAckReceivedOutcome>;
 
     fn on_loss_detection_timeout(
@@ -1038,6 +1044,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1139,6 +1146,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1323,6 +1331,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1415,6 +1424,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1445,6 +1455,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1562,6 +1573,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1589,6 +1601,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1620,6 +1633,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1649,6 +1663,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1737,6 +1752,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1765,6 +1781,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1804,6 +1821,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1836,6 +1854,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -1937,6 +1956,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2107,6 +2127,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2136,6 +2157,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2178,6 +2200,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2286,6 +2309,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2349,6 +2373,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2377,6 +2402,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2515,6 +2541,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2604,6 +2631,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now + interval,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2683,6 +2711,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now,
                 None,
+                true,
                 "",
             )
             .unwrap(),
@@ -2738,6 +2767,7 @@ mod tests {
                     HandshakeStatus::default(),
                     now,
                     None,
+                    true,
                     "",
                 )
                 .unwrap(),

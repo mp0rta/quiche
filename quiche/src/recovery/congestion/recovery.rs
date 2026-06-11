@@ -662,7 +662,7 @@ impl RecoveryOps for LegacyRecovery {
     fn on_ack_received(
         &mut self, peer_sent_ack_ranges: &RangeSet, ack_delay: u64, epoch: Epoch,
         handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
-        trace_id: &str,
+        rtt_sample_allowed: bool, trace_id: &str,
     ) -> Result<OnAckReceivedOutcome> {
         let AckedDetectionResult {
             acked_bytes,
@@ -705,9 +705,13 @@ impl RecoveryOps for LegacyRecovery {
             .max(largest_newly_acked.pkt_num);
         self.epochs[epoch].largest_acked_packet = Some(largest_acked_pkt_num);
 
-        // Check if largest packet is newly acked.
+        // Check if largest packet is newly acked, and whether the caller
+        // allows taking an RTT sample from this acknowledgment (e.g. a
+        // multipath PATH_ACK received on another path does not measure
+        // this path's RTT, draft-ietf-quic-multipath-21 §5.4).
         if largest_newly_acked.pkt_num == largest_acked_pkt_num &&
-            has_ack_eliciting
+            has_ack_eliciting &&
+            rtt_sample_allowed
         {
             let latest_rtt = now - largest_newly_acked.time_sent;
             self.rtt_stats.update_rtt(

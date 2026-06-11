@@ -4612,7 +4612,42 @@ impl<F: BufFactory> Connection<F> {
                             None
                         };
 
+                        // Same-path PATH_ACK placement (draft-21
+                        // §3.1/§5.4): a sendable path whose own PATH_ACK
+                        // is pending must be visited by the send loop
+                        // even when path selection (the scheduler or the
+                        // active path) would never pick it for data —
+                        // otherwise its acknowledgments would be
+                        // stranded. Mirrors the probing-path priority
+                        // above, but defers to data-driven selection
+                        // while there is app data to send so packet
+                        // scheduling is not distorted: the pending
+                        // PATH_ACK then goes out right after the data
+                        // drains, within the same flight.
+                        let ack_pid = if self.is_established() &&
+                            probing_pid.is_none() &&
+                            self.dgram_send_queue.is_empty() &&
+                            !self.streams.has_flushable()
+                        {
+                            self.paths
+                                .iter()
+                                .filter(|(_, p)| p.can_send(true))
+                                .filter(|(_, p)| {
+                                    p.app_pkt_num_space.ack_elicited &&
+                                        p.app_pkt_num_space
+                                            .recv_pkt_need_ack
+                                            .len() >
+                                            0
+                                })
+                                .map(|(pid, _)| pid)
+                                .next()
+                        } else {
+                            None
+                        };
+
                         if let Some(pid) = probing_pid {
+                            pid
+                        } else if let Some(pid) = ack_pid {
                             pid
                         } else if let Some(scheduler) = &mut self.scheduler {
                             let mut path_infos =
@@ -8610,6 +8645,7 @@ impl<F: BufFactory> Connection<F> {
                         handshake_status,
                         now,
                         self.pkt_num_manager.skip_pn(),
+                        true,
                         &self.trace_id,
                     )?;
 
@@ -9153,8 +9189,51 @@ impl<F: BufFactory> Connection<F> {
                         self.delivery_rate_check_if_app_limited();
                     let trace_id = self.trace_id.clone();
 
+                    // Cross-path RTT sample suppression (draft-21 §5.4):
+                    // a PATH_ACK for path A that travelled back over
+                    // path B measures A's forward delay plus B's return
+                    // delay, not A's RTT. Feeding it to the RTT
+                    // estimator skews smoothed RTT and permanently
+                    // poisons min_rtt (which only ever shrinks). The ACK
+                    // ranges are still processed normally (loss
+                    // detection, congestion control), but the RTT sample
+                    // is skipped when the arrival path differs from the
+                    // acknowledged path.
+                    //
+                    // Bootstrap exception: while the acknowledged path
+                    // has no RTT sample at all, a cross-path sample is
+                    // accepted anyway. Against a peer that never pins
+                    // its acknowledgments to the acknowledged path, the
+                    // path's RTT estimate would otherwise sit at the
+                    // initial default forever, leaving PTO and loss
+                    // detection blind; a skewed sample (an upper bound
+                    // of the path RTT) beats none.
+                    //
+                    // §5.4 also suggests remembering the path over which
+                    // the PATH_ACK that produced the minimum RTT was
+                    // received, and restarting the min-RTT computation
+                    // when that acknowledgment path changes or is
+                    // abandoned. No such provenance tracking is needed
+                    // here: with the suppression above, every RTT sample
+                    // (modulo the single bootstrap sample, which can
+                    // only over- not under-estimate, and is washed out
+                    // of min_rtt by the first same-path sample) comes
+                    // from a PATH_ACK received on the measured path
+                    // itself, so the "acknowledgment path" is invariably
+                    // the path and can neither change nor be abandoned
+                    // while the path is alive. The related §5.4 concern
+                    // of underlying route changes is covered by the
+                    // existing migration handling, which reinitializes
+                    // the path's recovery state (including min_rtt) when
+                    // a path's addresses change.
+                    let arrival_path_id =
+                        self.paths.get(recv_path_id)?.path_id;
+
                     let p = self.paths.get_mut(pid)?;
                     let skip_pn = p.mp_pkt_num_manager.skip_pn();
+
+                    let rtt_sample_allowed = arrival_path_id == path_id ||
+                        p.recovery.min_rtt().is_none();
 
                     if is_app_limited {
                         p.recovery.delivery_rate_update_app_limited(true);
@@ -9172,6 +9251,7 @@ impl<F: BufFactory> Connection<F> {
                         handshake_status,
                         now,
                         skip_pn,
+                        rtt_sample_allowed,
                         &trace_id,
                     )?;
 

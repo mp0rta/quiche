@@ -500,6 +500,7 @@ mod tests {
                 HandshakeStatus::default(),
                 now + rtt,
                 None,
+                true,
                 "",
             )
             .unwrap();

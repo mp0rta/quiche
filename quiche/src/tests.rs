@@ -17717,6 +17717,278 @@ fn multipath_established_acks_via_path_ack_not_plain_ack() {
     );
 }
 
+/// draft-21 §5.4/§3.1: PATH_ACK frames for a path SHOULD be sent on that
+/// same path, so the RTT measured from them reflects that path. With
+/// traffic flowing both ways on two sendable paths, every packet sent on
+/// path P must carry PATH_ACK frames for P only.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_ack_same_path_placement() {
+    let (mut pipe, _pid1, client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Client sends ack-eliciting data on both paths.
+    mp_send_stream_data_on_path(&mut pipe, client_addr, server_addr, b"p0");
+    mp_send_stream_data_on_path(&mut pipe, client_addr_2, server_addr, b"p1");
+
+    // The server has app data of its own (traffic both ways).
+    pipe.server.stream_send(0, b"server data", false).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+
+    let mut saw_path_ack = [false, false];
+    for (mut pkt, si) in flight {
+        let pkt_path_id = if si.to == client_addr { 0 } else { 1 };
+
+        let frames =
+            test_utils::decode_pkt(&mut pipe.client, &mut pkt).unwrap();
+
+        for frame in frames {
+            if let frame::Frame::PathAck { path_id, .. } = frame {
+                assert_eq!(
+                    path_id, pkt_path_id,
+                    "a packet sent on a sendable path must only carry \
+                     PATH_ACK frames for that path"
+                );
+                saw_path_ack[path_id as usize] = true;
+            }
+        }
+    }
+
+    assert!(saw_path_ack[0], "path 0 packets must be PATH_ACK'd");
+    assert!(saw_path_ack[1], "path 1 packets must be PATH_ACK'd");
+}
+
+/// Same-path PATH_ACK placement must not strand acknowledgments: even
+/// when all of our app data flows on one path (so the send loop would
+/// never pick the other path for data), pending acknowledgments for
+/// traffic received on the other path must still be emitted — on that
+/// path.
+///
+/// Exercised on the client side: the client's active path is path 1 (the
+/// most recently created), so without an ack-aware path selection the
+/// send loop would only ever visit path 1 here and path 0's PATH_ACK
+/// would be stranded (or, pre-pinning, leak onto path 1).
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_path_ack_not_stranded_on_unscheduled_path() {
+    let (mut pipe, _pid1, client_addr, _client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Open the stream first so the server may send on it.
+    mp_send_stream_data_on_path(&mut pipe, client_addr, server_addr, b"go");
+    assert_eq!(pipe.advance(), Ok(()));
+
+    // Peer traffic arrives on path 0 only.
+    pipe.server.stream_send(0, b"from server", false).unwrap();
+    let flight = test_utils::emit_flight_on_path(
+        &mut pipe.server,
+        Some(server_addr),
+        Some(client_addr),
+    )
+    .unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    // Our app data flows only on path 1 (the client's active path).
+    pipe.client.stream_send(0, b"client data", false).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+
+    let mut path_ack_zero_seen = false;
+    for (mut pkt, si) in flight {
+        let frames =
+            test_utils::decode_pkt(&mut pipe.server, &mut pkt).unwrap();
+
+        for frame in frames {
+            if let frame::Frame::PathAck { path_id: 0, .. } = frame {
+                assert_eq!(
+                    si.from, client_addr,
+                    "PATH_ACK for path 0 must be sent on path 0"
+                );
+                path_ack_zero_seen = true;
+            }
+        }
+    }
+
+    assert!(
+        path_ack_zero_seen,
+        "PATH_ACK for path 0 must not be stranded when data only flows \
+         on path 1"
+    );
+}
+
+/// draft-21 §5.4: a PATH_ACK received on a different path than the one it
+/// acknowledges measures the sum of the two paths' one-way delays, not
+/// the acknowledged path's RTT. The ACK ranges must still be processed
+/// (packets leave the in-flight set), but no RTT sample may be taken.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_cross_path_path_ack_suppresses_rtt_sample() {
+    let (mut pipe, pid1, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Warm path 1 up so it has an RTT sample already (the bootstrap
+    // exception must not apply).
+    mp_send_stream_data_on_path(&mut pipe, client_addr_2, server_addr, b"w");
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe
+        .client
+        .paths
+        .get(pid1)
+        .unwrap()
+        .recovery
+        .min_rtt()
+        .is_some());
+
+    // Client sends data on path 1.
+    let (_, pn_first, pn_last) = mp_send_stream_data_on_path(
+        &mut pipe,
+        client_addr_2,
+        server_addr,
+        b"hello",
+    );
+    assert!(pn_last > pn_first);
+
+    let path1 = pipe.client.paths.get(pid1).unwrap();
+    assert!(path1.recovery.in_flight_count(packet::Epoch::Application) > 0);
+    let rtt_before = path1.recovery.rtt();
+    let min_rtt_before = path1.recovery.min_rtt();
+
+    // Forge a PATH_ACK for path 1's packet numbers and deliver it on
+    // path 0.
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(pn_first..pn_last);
+
+    let frames = [frame::Frame::PathAck {
+        path_id: 1,
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+
+    mp_forge_server_pkt_to_client(&mut pipe, &frames).unwrap();
+
+    let path1 = pipe.client.paths.get(pid1).unwrap();
+
+    // The ACK ranges were processed: path 1's packets are no longer in
+    // flight...
+    assert_eq!(
+        path1.recovery.in_flight_count(packet::Epoch::Application),
+        0,
+        "cross-path PATH_ACK must still acknowledge packets"
+    );
+
+    // ...but no RTT sample was taken from the cross-path arrival.
+    assert_eq!(
+        path1.recovery.rtt(),
+        rtt_before,
+        "cross-path PATH_ACK must not produce an RTT sample"
+    );
+    assert_eq!(
+        path1.recovery.min_rtt(),
+        min_rtt_before,
+        "cross-path PATH_ACK must not update min_rtt"
+    );
+}
+
+/// A PATH_ACK received on the path it acknowledges is a valid RTT sample
+/// and must update the path's RTT estimator.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_same_path_path_ack_updates_rtt() {
+    let (mut pipe, pid1, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Reset path 1's recovery so it has no RTT sample yet.
+    mp_inflate_path_pto(
+        pipe.client.paths.get_mut(pid1).unwrap(),
+        Duration::from_millis(100),
+    );
+    assert!(pipe
+        .client
+        .paths
+        .get(pid1)
+        .unwrap()
+        .recovery
+        .min_rtt()
+        .is_none());
+
+    // Client sends data on path 1; the server acknowledges it (with
+    // same-path placement, the PATH_ACK arrives on path 1).
+    mp_send_stream_data_on_path(&mut pipe, client_addr_2, server_addr, b"hi");
+    let flight = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, flight).unwrap();
+
+    assert!(
+        pipe.client
+            .paths
+            .get(pid1)
+            .unwrap()
+            .recovery
+            .min_rtt()
+            .is_some(),
+        "a same-path PATH_ACK must produce an RTT sample"
+    );
+}
+
+/// Bootstrap exception to cross-path RTT suppression: when the
+/// acknowledged path has no RTT sample at all, a cross-path PATH_ACK is
+/// accepted as a (skewed) first sample so the path's PTO does not sit at
+/// the initial default against peers that never pin acknowledgments to
+/// the acknowledged path.
+#[cfg(feature = "multipath")]
+#[test]
+fn multipath_cross_path_path_ack_bootstraps_rtt() {
+    let (mut pipe, pid1, _client_addr, client_addr_2, server_addr) =
+        mp_pipe_with_second_path(&[1]);
+
+    // Reset path 1's recovery so it has no RTT sample yet.
+    mp_inflate_path_pto(
+        pipe.client.paths.get_mut(pid1).unwrap(),
+        Duration::from_millis(100),
+    );
+    assert!(pipe
+        .client
+        .paths
+        .get(pid1)
+        .unwrap()
+        .recovery
+        .min_rtt()
+        .is_none());
+
+    // Client sends data on path 1.
+    let (_, pn_first, pn_last) = mp_send_stream_data_on_path(
+        &mut pipe,
+        client_addr_2,
+        server_addr,
+        b"hello",
+    );
+
+    // Forge a PATH_ACK for path 1's packets, delivered on path 0.
+    let mut ranges = ranges::RangeSet::default();
+    ranges.insert(pn_first..pn_last);
+
+    let frames = [frame::Frame::PathAck {
+        path_id: 1,
+        ack_delay: 0,
+        ranges,
+        ecn_counts: None,
+    }];
+
+    mp_forge_server_pkt_to_client(&mut pipe, &frames).unwrap();
+
+    assert!(
+        pipe.client
+            .paths
+            .get(pid1)
+            .unwrap()
+            .recovery
+            .min_rtt()
+            .is_some(),
+        "a cross-path PATH_ACK must bootstrap the first RTT sample"
+    );
+}
+
 /// Replaces the recovery state of the given path with a freshly
 /// initialized one whose initial RTT is `rtt`, giving the path a PTO of
 /// `rtt + 4 * (rtt / 2)` (no RTT samples taken yet). Used to drive the

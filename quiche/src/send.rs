@@ -649,8 +649,26 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        // Generate PATH_ACK frames for all paths when multipath is enabled.
-        // PATH_ACK frames for any path can be sent on any path.
+        // Generate PATH_ACK frames when multipath is enabled.
+        //
+        // While PATH_ACK frames for any path MAY be sent on any path,
+        // draft-ietf-quic-multipath-21 §3.1 prefers and §5.4 strongly
+        // motivates sending them on the path they acknowledge: a PATH_ACK
+        // for path A travelling back over path B makes the measured RTT
+        // the sum of A's forward delay and B's return delay, skewing
+        // smoothed RTT and permanently poisoning min_rtt (which only ever
+        // shrinks). So a path's acknowledgments are bundled only into
+        // packets sent on that same path, with one fallback: when the
+        // acked path cannot carry its own acks (closing/closed/abandoned,
+        // not validated, or without a usable destination CID — all
+        // covered by `can_send`), they ride whatever path is being sent
+        // on so they are never stranded (§3.4.3 requires acks for an
+        // abandoned path's packets to be delivered on other paths).
+        //
+        // No config knob is offered for the unconditional any-path
+        // behavior (cf. xquic's `mp_ack_on_any_path`): the fallback above
+        // already covers every case where the same-path preference would
+        // strand acknowledgments.
         #[cfg(feature = "multipath")]
         if self.multipath_enabled && pkt_type == Type::Short {
             // Collect per-path ACK info into locals to avoid borrow
@@ -665,9 +683,10 @@ impl<F: BufFactory> Connection<F> {
             > = self
                 .paths
                 .iter()
-                .filter(|(_, p)| {
+                .filter(|(pid, p)| {
                     p.app_pkt_num_space.recv_pkt_need_ack.len() > 0 &&
-                        p.app_pkt_num_space.ack_elicited
+                        p.app_pkt_num_space.ack_elicited &&
+                        (*pid == send_pid || !p.can_send(mp))
                 })
                 .map(|(pid, p)| {
                     #[cfg(not(feature = "fuzzing"))]
